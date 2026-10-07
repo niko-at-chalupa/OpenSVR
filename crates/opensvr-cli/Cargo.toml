@@ -1,0 +1,26 @@
+[package]
+name = "opensvr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The opensvr command-line tool"
+publish.workspace = true
+
+[[bin]]
+name = "opensvr"
+path = "src/main.rs"
+
+[dependencies]
+opensvr-core.workspace = true
+opensvr-svp.workspace = true
+opensvr-midi.workspace = true
+opensvr-audio.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
+
+[lints]
+workspace = true

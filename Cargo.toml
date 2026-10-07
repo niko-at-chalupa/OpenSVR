@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A minimal Rust port of the OpenSV singing-voice synthesis tools"
+publish = false
+
+[workspace.dependencies]
+opensvr-core = { path = "crates/opensvr-core" }
+opensvr-svp = { path = "crates/opensvr-svp" }
+opensvr-midi = { path = "crates/opensvr-midi" }
+opensvr-audio = { path = "crates/opensvr-audio" }
+
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+# "OpenSV" is a project name, and the tests deliberately compare exact float values.
+doc_markdown = "allow"
+float_cmp = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

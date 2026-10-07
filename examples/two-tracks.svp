@@ -1,0 +1,137 @@
+{
+  "version": 153,
+  "time": {
+    "tempo": [
+      {
+        "position": 0,
+        "bpm": 120.0
+      }
+    ],
+    "meter": [
+      {
+        "index": 0,
+        "numerator": 4,
+        "denominator": 4
+      }
+    ]
+  },
+  "library": [
+    {
+      "uuid": "11111111-1111-1111-1111-111111111111",
+      "name": "motif",
+      "notes": [
+        {
+          "onset": 0,
+          "duration": 705600000,
+          "pitch": 60,
+          "lyrics": "la",
+          "phonemes": "",
+          "detune": 0.0
+        },
+        {
+          "onset": 705600000,
+          "duration": 1411200000,
+          "pitch": 64,
+          "lyrics": "la",
+          "phonemes": "",
+          "detune": 0.0
+        }
+      ]
+    }
+  ],
+  "tracks": [
+    {
+      "name": "Lead",
+      "mainGroup": {
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "name": "Main",
+        "notes": [
+          {
+            "onset": 0,
+            "duration": 705600000,
+            "pitch": 60,
+            "lyrics": "do",
+            "phonemes": "",
+            "detune": 0.0
+          },
+          {
+            "onset": 705600000,
+            "duration": 705600000,
+            "pitch": 64,
+            "lyrics": "mi",
+            "phonemes": "",
+            "detune": 0.0
+          },
+          {
+            "onset": 1411200000,
+            "duration": 705600000,
+            "pitch": 67,
+            "lyrics": "sol",
+            "phonemes": "",
+            "detune": 0.0
+          },
+          {
+            "onset": 2116800000,
+            "duration": 705600000,
+            "pitch": 72,
+            "lyrics": "do",
+            "phonemes": "",
+            "detune": 0.0
+          }
+        ]
+      },
+      "mainRef": {
+        "groupID": "22222222-2222-2222-2222-222222222222",
+        "blickOffset": 0,
+        "pitchOffset": 0,
+        "blickAbsoluteBegin": 0,
+        "blickAbsoluteEnd": -1,
+        "isInstrumental": false
+      },
+      "groups": [],
+      "mixer": {
+        "gainDecibel": -6.0,
+        "pan": -0.4,
+        "mute": false,
+        "solo": false
+      },
+      "svVoice": {
+        "databasePath": "voices/example/voice.nofs",
+        "language": "japanese",
+        "dictionaryDirectory": "clf-data"
+      }
+    },
+    {
+      "name": "Harmony",
+      "mainGroup": {
+        "uuid": "33333333-3333-3333-3333-333333333333",
+        "name": "Main",
+        "notes": []
+      },
+      "mainRef": {
+        "groupID": "33333333-3333-3333-3333-333333333333",
+        "blickOffset": 0,
+        "pitchOffset": 0,
+        "blickAbsoluteBegin": 0,
+        "blickAbsoluteEnd": -1,
+        "isInstrumental": false
+      },
+      "groups": [
+        {
+          "groupID": "11111111-1111-1111-1111-111111111111",
+          "blickOffset": 2822400000,
+          "pitchOffset": 7,
+          "blickAbsoluteBegin": 0,
+          "blickAbsoluteEnd": -1,
+          "isInstrumental": false
+        }
+      ],
+      "mixer": {
+        "gainDecibel": -9.0,
+        "pan": 0.4,
+        "mute": false,
+        "solo": false
+      }
+    }
+  ]
+}

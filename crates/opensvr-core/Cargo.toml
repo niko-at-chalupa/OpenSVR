@@ -1,0 +1,13 @@
+[package]
+name = "opensvr-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Project model, tempo map and note placement for opensvr"
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

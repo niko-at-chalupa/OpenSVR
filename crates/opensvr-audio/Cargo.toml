@@ -1,0 +1,15 @@
+[package]
+name = "opensvr-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Offline mixer, voice backend trait and WAV output"
+publish.workspace = true
+
+[dependencies]
+opensvr-core.workspace = true
+hound.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
