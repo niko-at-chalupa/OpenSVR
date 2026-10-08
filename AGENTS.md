@@ -1,0 +1,7 @@
+When porting from OpenSV, almost _never_ guess how something works or reverse engineer something yourself unless told otherwise. You may always find OpenSV's original source (must be niko-at-chalupa's fork) at the [public GitHub repo](https://github.com/niko-at-chalupa/opensv); a local clone path, if any, is listed in `AGENTS.local.md`.
+
+If an `AGENTS.local.md` file is present alongside this file, read it as well and follow it. It holds machine-specific directions (local checkout paths, local test-data locations) that override the generic defaults here. `AGENTS.local.md` is gitignored and never committed.
+
+Place things that must not be publicly distributed in do-not-distribute/, unless told otherwise. That covers (a) things that may be underneath copyright protections (like NOFS files from SV, or even the `clf-data` arpabet dictionaries from SV), and (b) internal working files not meant for outside readers — e.g. timestamped `next-steps-*.md` planning files that command the reader to do something, local dump tools, golden outputs derived from proprietary voices. Reason: a public reader stumbling across such files would be confused by out-of-context orders and dates. (You should always ask for confirmation after you're done with everything else.) If you need such, ask the user. They'll probably have it.
+
+Commit code atomically: one logical change per commit, with a short imperative message (e.g. `Add opensvr-dnni reader`). Do not bundle unrelated work, and do not leave the tree in a half-finished state across commits.
