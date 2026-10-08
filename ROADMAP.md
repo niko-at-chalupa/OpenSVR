@@ -14,7 +14,7 @@ Line counts are the C++ sizes (`.cpp` + `.h`) and only indicate effort.
 | Mixer, pan law, solo/mute | `ProjectRenderer::mixPhrase` | `opensvr-audio::render` | done |
 | WAV output | `audio/WaveFile.cpp` | `opensvr-audio::wav` | done |
 | CLI | `cli/Main.cpp` | `opensvr-cli` | done, with subcommands instead of flat flags |
-| Voice synthesis | `synthesis/*` (10.4k lines) | `VoiceBackend` trait + `ToneBackend`, `opensvr-nofs` (NOFS + voice config) | **partial: database reads, neural engine still placeholder** |
+| Voice synthesis | `synthesis/*` (10.4k lines) | `VoiceBackend` trait + `ToneBackend`, `opensvr-nofs` (NOFS + voice config), `opensvr-dnni` (DNNI reader) | **partial: database and model-file reads done, neural inference still placeholder** |
 | Phrase building, pitch/vibrato, caching | `ProjectRenderer.cpp` (1.6k lines) | one phrase per track | **simplified** |
 | Editor GUI | `ui/*`, `app/*`, `audio/PreviewEngine.*` (5.6k lines) | none | out of scope |
 
@@ -24,13 +24,11 @@ so every step below replaces a stub with the real thing without changing the CLI
 ## What to do next
 
 Phase 2 (NOFS + voice config) is done and `opensvr info` shows singer metadata.
+The `opensvr-dnni` reader is also done and parses all 4 real model entries
+(a `prim0` matrix matches an independent decode exactly).
 The next PRs, in order:
 
-1. **`opensvr-dnni` reader** (`DnniReader.*`, ~590 lines). Self-contained, no
-   dependencies on other unported code, and a prerequisite for everything
-   downstream: model payloads come out of NOFS entries, and `PhoneSet`/`PhonemeTiming`
-   loads read DNNI nodes. Test against the real model entries in a local voice
-   (parse must succeed; spot-check one `prim0` matrix against an independent decode).
+1. ~~**`opensvr-dnni` reader**~~ done (see above).
 2. **Dictionary + `resolvePhonemes`** (the DNNI-free half of Phase 3). Pure functions
    over the `clf-data` text files; table-driven tests per rule in `BUILD_AND_USAGE.md`.
    Ends with `opensvr info --phonemes`.
