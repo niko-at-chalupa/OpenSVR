@@ -15,6 +15,7 @@ Line counts are the C++ sizes (`.cpp` + `.h`) and only indicate effort.
 | WAV output | `audio/WaveFile.cpp` | `opensvr-audio::wav` | done |
 | CLI | `cli/Main.cpp` | `opensvr-cli` | done, with subcommands instead of flat flags |
 | Voice synthesis | `synthesis/*` (10.4k lines) | `VoiceBackend` trait + `ToneBackend`, `opensvr-nofs` (NOFS + voice config), `opensvr-dnni` (DNNI reader) | **partial: database and model-file reads done, neural inference still placeholder** |
+| Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done (dictionary + resolution + `info --phonemes`; timing model types only) |
 | Phrase building, pitch/vibrato, caching | `ProjectRenderer.cpp` (1.6k lines) | one phrase per track | **simplified** |
 | Editor GUI | `ui/*`, `app/*`, `audio/PreviewEngine.*` (5.6k lines) | none | out of scope |
 
@@ -26,12 +27,14 @@ so every step below replaces a stub with the real thing without changing the CLI
 Phase 2 (NOFS + voice config) is done and `opensvr info` shows singer metadata.
 The `opensvr-dnni` reader is also done and parses all 4 real model entries
 (a `prim0` matrix matches an independent decode exactly).
+The dictionary + `resolvePhonemes` half of Phase 3 is done too: `opensvr-g2p`
+ports `PhoneSet` (DNNI `_psv2`), `PhonemeDictionary` (all five language
+pipelines) and `resolvePhonemes` with the `+`/`-` sequencing around it, and
+`opensvr info --phonemes` prints resolved phonemes per note.
 The next PRs, in order:
 
 1. ~~**`opensvr-dnni` reader**~~ done (see above).
-2. **Dictionary + `resolvePhonemes`** (the DNNI-free half of Phase 3). Pure functions
-   over the `clf-data` text files; table-driven tests per rule in `BUILD_AND_USAGE.md`.
-   Ends with `opensvr info --phonemes`.
+2. ~~**Dictionary + `resolvePhonemes`**~~ done (see above).
 3. **`opensvr-dnni` inference** (`DnniInference.*`, ~1,500 lines). Scalar port first
    with golden tensors dumped from the C++ build; SIMD/`Cache` later.
 4. Then Phase 5 in the listed stage order (timing -> pitch -> acoustic -> vocoder),
@@ -101,6 +104,15 @@ New crate `opensvr-nofs`.
 
 ## Phase 3: pronunciation (about 1,500 lines)
 
+Done: new crate `opensvr-g2p` ports `PhoneSet` (DNNI `_psv2` table),
+`PhonemeDictionary` (generic, Japanese kana, Mandarin/CEDICT, CMUDict English
+pipelines) and `ProjectRenderer::resolvePhonemes` with the `+`/`-` sequencing
+around it (75 unit tests plus CLI tests). `opensvr info --phonemes` prints
+resolved phonemes per note. `TimingSyllable`/`PhonemeDuration` are types only;
+the duration model lands in Phase 5.
+
+Original plan, kept for reference:
+
 New crate `opensvr-g2p` (grapheme-to-phoneme).
 
 - **Phone sets and dictionaries** (`PhoneSet.*`, `PhonemeDictionary.*`, 1,000 lines). The CLF dictionaries are data files,
@@ -117,6 +129,15 @@ New crate `opensvr-g2p` (grapheme-to-phoneme).
 - **Win.** `opensvr info --phonemes` can print resolved phonemes per note.
 
 ## Phase 4: neural network runtime (about 1,800 lines)
+
+Done (reader half): `opensvr-dnni` parses the node tree and all `prim`
+payloads (50 unit + 2 gated tests, golden `prim0` match). Next is inference,
+scalar-first with golden tensors dumped from the C++ build (see
+`do-not-distribute/next-steps-Thu-Oct-8-3.md`, uncommitted): note there is no
+`modl4` branch and no `moda6` in the C++ loader, and the JUCE submodule is
+still empty so the golden build starts with `git submodule update --init`.
+
+Original plan, kept for reference:
 
 New crate `opensvr-dnni`. This is the largest single risk, so build it test-first.
 
