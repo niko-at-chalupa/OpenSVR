@@ -6,6 +6,6 @@ Place things that must not be publicly distributed in do-not-distribute/, unless
 
 Commit code atomically: one logical change per commit, with a short imperative message (e.g. `Add opensvr-dnni reader`). Do not bundle unrelated work, and do not leave the tree in a half-finished state across commits.
 
-Work each next-steps generation on its own branch (e.g. `dnni-inference-scalar`): WIP commits freely on the branch, then squash-merge to `main` so each generation lands as exactly one atomic commit. Short-lived branches only.
+Work each next-steps generation on its own branch named `<area>/<goal>` (lowercase kebab-case, e.g. `dnni/inference-scalar`, `dnni/simd-cache`, `voice/timing-model`): WIP commits freely on the branch, then squash-merge to `main` so each generation lands as exactly one atomic commit. Short-lived branches only; one branch per generation.
 
 Next-steps spec: the agent-directed working set lives gitignored at `do-not-distribute/next-steps/`. Exactly one active `next-steps-<Day>-<Mon>-<D>.md` at a time; fulfilled generations move to `done/`. Generations tick per unit of work (one PR), not per calendar day. At session start read the active file; when its Definition-of-done verifiably holds, archive it and write the next. If the active file is unfulfilled or nonsensical, say so instead of writing a new one.
