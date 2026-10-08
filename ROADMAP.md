@@ -21,6 +21,27 @@ Line counts are the C++ sizes (`.cpp` + `.h`) and only indicate effort.
 `opensvr render` currently sings sine tones. The pipeline around the voice is real and tested,
 so every step below replaces a stub with the real thing without changing the CLI.
 
+## What to do next
+
+Phase 2 (NOFS + voice config) is done and `opensvr info` shows singer metadata.
+The next PRs, in order:
+
+1. **`opensvr-dnni` reader** (`DnniReader.*`, ~590 lines). Self-contained, no
+   dependencies on other unported code, and a prerequisite for everything
+   downstream: model payloads come out of NOFS entries, and `PhoneSet`/`PhonemeTiming`
+   loads read DNNI nodes. Test against the real model entries in a local voice
+   (parse must succeed; spot-check one `prim0` matrix against an independent decode).
+2. **Dictionary + `resolvePhonemes`** (the DNNI-free half of Phase 3). Pure functions
+   over the `clf-data` text files; table-driven tests per rule in `BUILD_AND_USAGE.md`.
+   Ends with `opensvr info --phonemes`.
+3. **`opensvr-dnni` inference** (`DnniInference.*`, ~1,500 lines). Scalar port first
+   with golden tensors dumped from the C++ build; SIMD/`Cache` later.
+4. Then Phase 5 in the listed stage order (timing -> pitch -> acoustic -> vocoder),
+   each gated on golden files from the previous stage's output.
+
+Do not start Phase 5 before the reader and inference agree with the C++ build:
+every model stage's input is a DNNI tensor.
+
 ## Principles for the remaining work
 
 1. **Golden tests against the C++ build.** Build `OpenSVEngine` once with CMake and dump
