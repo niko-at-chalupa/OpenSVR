@@ -1,0 +1,16 @@
+[package]
+name = "opensvr-dnni"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "DNNI neural network file reader (port of OpenSV synthesis/DnniReader)"
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+opensvr-nofs.workspace = true
+
+[lints]
+workspace = true

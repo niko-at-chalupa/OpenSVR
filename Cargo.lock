@@ -249,6 +249,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "opensvr-dnni"
+version = "0.1.0"
+dependencies = [
+ "opensvr-nofs",
+ "thiserror",
+]
+
+[[package]]
 name = "opensvr-midi"
 version = "0.1.0"
 dependencies = [
