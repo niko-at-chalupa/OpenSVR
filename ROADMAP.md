@@ -188,7 +188,12 @@ Replace `ToneBackend` with `NeuralBackend` and widen the seam as needed. Work in
 ## Out of scope for now: the editor
 
 `ui/*`, `app/*` and `audio/PreviewEngine.*` (about 5,600 lines) are a JUCE desktop editor: piano roll, arrangement, parameter
-view, playback and undo/redo (`ProjectDocument.*`). Do not port them as part of the engine work. When the engine passes its golden tests,
+view, playback and undo/redo (`ProjectDocument.*`). Do not port them as part of the engine work. Also out of scope,
+as editor-only adjuncts: `audio/PitchAudition.*` (realtime key-preview oscillator tied to the audio device thread)
+and `audio/RenderVisualization.*` (`PhraseVisualization` waveform peaks for display).
+Named-but-trivial engine adjuncts that ride along with their phases instead of getting their own:
+`synthesis/SynthesisStatistics.h` and `audio/RenderStatistics.h` (profiling counters) land with Phases 5–6
+alongside `ProgressSink`. When the engine passes its golden tests,
 the editor is a separate project that can sit on the same crates. Options: `egui`, `iced`, Slint, or a Tauri/web front end,
 with `cpal` for audio output. The undo stack in `ProjectDocument` ports well as a command pattern over `opensvr-core::Project`,
 and needs `NoteId` from Phase 1.
