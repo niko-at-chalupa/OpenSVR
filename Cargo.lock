@@ -253,6 +253,7 @@ dependencies = [
 name = "opensvr-dnni"
 version = "0.1.0"
 dependencies = [
+ "opensvr-core",
  "opensvr-nofs",
  "thiserror",
 ]

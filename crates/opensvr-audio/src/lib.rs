@@ -7,12 +7,11 @@
 //! sine tones, enough to exercise the whole pipeline end to end.
 
 mod backend;
-mod cancel;
 mod render;
 mod wav;
 
 pub use backend::{BackendError, TimedNote, ToneBackend, VoiceBackend};
-pub use cancel::CancelToken;
+pub use opensvr_core::CancelToken;
 pub use render::{
     MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, REST_CONTEXT_SECONDS, RenderError, Renderer, StereoBuffer,
 };
