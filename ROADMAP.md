@@ -14,7 +14,7 @@ Line counts are the C++ sizes (`.cpp` + `.h`) and only indicate effort.
 | Mixer, pan law, solo/mute | `ProjectRenderer::mixPhrase` | `opensvr-audio::render` | done |
 | WAV output | `audio/WaveFile.cpp` | `opensvr-audio::wav` | done |
 | CLI | `cli/Main.cpp` | `opensvr-cli` | done, with subcommands instead of flat flags |
-| Voice synthesis | `synthesis/*` (10.4k lines) | `VoiceBackend` trait + `ToneBackend` | **placeholder** |
+| Voice synthesis | `synthesis/*` (10.4k lines) | `VoiceBackend` trait + `ToneBackend`, `opensvr-nofs` (NOFS + voice config) | **partial: database reads, neural engine still placeholder** |
 | Phrase building, pitch/vibrato, caching | `ProjectRenderer.cpp` (1.6k lines) | one phrase per track | **simplified** |
 | Editor GUI | `ui/*`, `app/*`, `audio/PreviewEngine.*` (5.6k lines) | none | out of scope |
 
@@ -59,6 +59,14 @@ Goal: read and write every field OpenSV understands, with lossless round trips.
 - **CLI.** Add `opensvr convert in.{svp,mid} out.{svp,mid}`.
 
 ## Phase 2: voice database (about 900 lines)
+
+Done: new crate `opensvr-nofs` ports `VoiceDatabase.*` and `VoiceConfiguration.*`
+(magic `0xf580`, version 10, entry table, metadata, `0x91` config blob with the
+LCG name cipher, duration/acoustic/vocoder model references). `opensvr info`
+prints the singer name, vendor and timbre styles. Next: `memmap2` for lazy
+entry slices if 40 MiB voices ever matter for startup time.
+
+Original plan, kept for reference:
 
 New crate `opensvr-nofs`.
 

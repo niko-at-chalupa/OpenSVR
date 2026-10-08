@@ -112,6 +112,9 @@ fn load(path: &Path, overrides: &Overrides) -> Result<Project, CliError> {
 fn print_info(project: &Project, out: &mut impl io::Write) -> io::Result<()> {
     writeln!(out, "Project: {}", project.name)?;
     writeln!(out, "Tracks: {}", project.tracks.len())?;
+    // Voice databases are opened lazily and cached per path: several tracks
+    // often share one singer, and a 40 MiB voice should not be re-read.
+    let mut voices: Vec<(PathBuf, Option<String>)> = Vec::new();
     for (index, track) in project.tracks.iter().enumerate() {
         let voice = &track.voice;
         writeln!(
@@ -131,8 +134,43 @@ fn print_info(project: &Project, out: &mut impl io::Write) -> io::Result<()> {
             "      dict:  {}",
             describe(voice.dictionary.as_deref(), Path::is_dir)
         )?;
+        if let Some(path) = voice.database.as_deref()
+            && path.is_file()
+        {
+            let cached = voices
+                .iter()
+                .find(|(known, _)| known == path)
+                .map(|(_, summary)| summary.clone());
+            let summary = cached.unwrap_or_else(|| {
+                let summary = voice_summary(path);
+                voices.push((path.to_owned(), summary.clone()));
+                summary
+            });
+            match summary {
+                Some(summary) => writeln!(out, "      singer: {summary}")?,
+                None => writeln!(out, "      singer: [UNREADABLE]")?,
+            }
+        }
     }
     Ok(())
+}
+
+/// One-line singer summary from a voice database, or `None` when it cannot be read.
+fn voice_summary(path: &Path) -> Option<String> {
+    use std::fmt::Write as _;
+    let database = opensvr_nofs::VoiceDatabase::open(path).ok()?;
+    let metadata = database.metadata();
+    if metadata.name.is_empty() {
+        return Some("(unknown voice)".to_owned());
+    }
+    let mut summary = metadata.name.clone();
+    if !metadata.vendor.is_empty() {
+        let _ = write!(summary, " ({})", metadata.vendor);
+    }
+    if !metadata.timbre_styles.is_empty() {
+        let _ = write!(summary, "  modes={}", metadata.timbre_styles.join(" "));
+    }
+    Some(summary)
 }
 
 /// Formats an optional path, flagging it when `exists` says it is not there.

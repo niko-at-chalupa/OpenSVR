@@ -14,6 +14,7 @@ opensvr-core = { path = "crates/opensvr-core" }
 opensvr-svp = { path = "crates/opensvr-svp" }
 opensvr-midi = { path = "crates/opensvr-midi" }
 opensvr-audio = { path = "crates/opensvr-audio" }
+opensvr-nofs = { path = "crates/opensvr-nofs" }
 
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }

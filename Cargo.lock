@@ -236,6 +236,7 @@ dependencies = [
  "opensvr-audio",
  "opensvr-core",
  "opensvr-midi",
+ "opensvr-nofs",
  "opensvr-svp",
  "thiserror",
 ]
@@ -252,6 +253,13 @@ name = "opensvr-midi"
 version = "0.1.0"
 dependencies = [
  "opensvr-core",
+ "thiserror",
+]
+
+[[package]]
+name = "opensvr-nofs"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 

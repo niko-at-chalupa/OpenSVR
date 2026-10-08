@@ -1,0 +1,13 @@
+[package]
+name = "opensvr-nofs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "NOFS voice database and voice configuration reader (port of OpenSV synthesis/VoiceDatabase, VoiceConfiguration)"
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

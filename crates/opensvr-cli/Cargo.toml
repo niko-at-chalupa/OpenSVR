@@ -15,6 +15,7 @@ opensvr-core.workspace = true
 opensvr-svp.workspace = true
 opensvr-midi.workspace = true
 opensvr-audio.workspace = true
+opensvr-nofs.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 thiserror.workspace = true
