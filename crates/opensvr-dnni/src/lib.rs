@@ -14,6 +14,10 @@
 //!   matrices (dense, row-scaled 8/16-bit quantized, BCSR sparse) and `prim1`
 //!   float vectors.
 
+mod inference;
 mod reader;
 
+pub use inference::{
+    DenseMatrix, DnniInference, DnniTensor, Layer, Operation, Tensor,
+};
 pub use reader::{DnniError, DnniMatrix, DnniNode, DnniReader};

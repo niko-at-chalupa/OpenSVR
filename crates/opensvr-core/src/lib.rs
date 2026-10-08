@@ -4,8 +4,11 @@
 //! only what the command-line tools need: tracks, note groups, group references,
 //! mixer state, voice settings and the tempo map.
 
+mod cancel;
 mod project;
 mod tempo;
+
+pub use cancel::CancelToken;
 
 pub use project::{
     GroupReference, Language, Mixer, Note, NoteGroup, ParseLanguageError, PlacedNote, Project,
