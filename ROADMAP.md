@@ -48,8 +48,8 @@ The next PRs, in order:
 
 1. ~~**`opensvr-dnni` reader**~~ done (see above).
 2. ~~**Dictionary + `resolvePhonemes`**~~ done (see above).
-3. **`opensvr-dnni` inference** (`DnniInference.*`, ~1,500 lines). Scalar port first
-   with golden tensors dumped from the C++ build; SIMD/`Cache` later.
+3. ~~**`opensvr-dnni` inference (scalar)**~~ done (see above); next is SIMD
+   packing + `Cache`.
 4. Then Phase 5 in the listed stage order (timing -> pitch -> acoustic -> vocoder),
    each gated on golden files from the previous stage's output.
 
@@ -145,10 +145,13 @@ New crate `opensvr-g2p` (grapheme-to-phoneme).
 ## Phase 4: neural network runtime (about 1,800 lines)
 
 Done (reader half): `opensvr-dnni` parses the node tree and all `prim`
-payloads (50 unit + 2 gated tests, golden `prim0` match). Next is inference,
-scalar-first with golden tensors dumped from a local C++ build of
-`OpenSVEngine` (the upstream JUCE submodule must be initialized first):
-note there is no `modl4` branch and no `moda6` in the C++ loader.
+payloads (50 unit + 2 gated tests, golden `prim0` match).
+Done (inference half, scalar): `opensvr-dnni` loads every layer type and runs
+every kernel over plain row-major weights (129 unit + 1 golden test over 10
+per-op tensors in `tests/golden/dnni/`, dumped from the C++ DNNI translation
+units; `CancelToken` moved down to `opensvr-core`). Next is SIMD packing +
+the incremental `Cache`, which must not change scalar numerics. Note there is
+no `modl4` branch and no `moda6` in the C++ loader.
 
 Original plan, kept for reference:
 
