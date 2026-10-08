@@ -2,6 +2,19 @@
 
 This document lists what is left to port from OpenSV (commit `84ef139`) and how to do it.
 Line counts are the C++ sizes (`.cpp` + `.h`) and only indicate effort.
+This file is public and self-contained: it never references gitignored
+working files or local paths (see `AGENTS.md`).
+
+## Goals
+
+OpenSVR is a modern, cleaner, and potentially faster version of OpenSV's
+engine — no JUCE dependency, typed errors, tested and deterministic output.
+It is mostly a library with a thin CLI harness: it has no GUI and will not
+gain one. It is not a successor to or competitor with standard SV (SV1 still
+ships and works); it is a headless engine for offline rendering and
+embedding. Parity with OpenSV comes first; speed comes from clean structure
+(packed weight layouts, batch-level parallelism, no JUCE overhead), never
+from relaxed numerics.
 
 ## Where things stand
 
@@ -99,8 +112,9 @@ New crate `opensvr-nofs`.
 - **Voice configuration** (`VoiceConfiguration.*`, 450 lines). Decode the per-voice configuration entries (phone sets,
   frame intervals, rap languages, vocal mode names) into a `VoiceConfig` struct. Make `opensvr info` print the voice
   metadata at this point; it is the first user-visible gain, and needs no neural code.
-- **Tests.** You supply the voice files. Gate tests on an environment variable (`OPENSVR_TEST_VOICE`)
-  and skip cleanly when it is unset, so CI stays green without proprietary data.
+- **Tests.** Tests that need proprietary voice data are gated on an
+  environment variable (`OPENSVR_TEST_VOICE`) and skip cleanly when it is
+  unset, so CI stays green without proprietary data.
 
 ## Phase 3: pronunciation (about 1,500 lines)
 
@@ -132,10 +146,9 @@ New crate `opensvr-g2p` (grapheme-to-phoneme).
 
 Done (reader half): `opensvr-dnni` parses the node tree and all `prim`
 payloads (50 unit + 2 gated tests, golden `prim0` match). Next is inference,
-scalar-first with golden tensors dumped from the C++ build (see
-`do-not-distribute/next-steps-Thu-Oct-8-3.md`, uncommitted): note there is no
-`modl4` branch and no `moda6` in the C++ loader, and the JUCE submodule is
-still empty so the golden build starts with `git submodule update --init`.
+scalar-first with golden tensors dumped from a local C++ build of
+`OpenSVEngine` (the upstream JUCE submodule must be initialized first):
+note there is no `modl4` branch and no `moda6` in the C++ loader.
 
 Original plan, kept for reference:
 
@@ -193,7 +206,7 @@ Replace `ToneBackend` with `NeuralBackend` and widen the seam as needed. Work in
   Use the `rubato` crate (sinc, fixed ratio), and measure and cancel the latency in a test with an impulse.
 - **Cropping at group edges.** The C++ release tail is limited by `absoluteEnd` and `absoluteBegin`; the current code only clips notes.
 - **Caching.** Add the voice, dictionary and phrase caches (`CachedVoice`, `CachedDictionary`, `CachedPhrase`) keyed by file
-  stamp (size + mtime). They matter for the editor and for re-rendering after small edits, less for one-shot CLI renders, so do this last.
+  stamp (size + mtime). They matter for re-rendering after small edits, less for one-shot CLI renders, so do this last.
 - **Parallelism.** Tracks are independent: render them with `rayon` or scoped threads, then sum in a fixed order.
 - **Progress.** Add a `ProgressSink` trait (phrases done / total) and hook up `indicatif` in the CLI behind `-q`.
 
@@ -206,18 +219,15 @@ Replace `ToneBackend` with `NeuralBackend` and widen the seam as needed. Work in
 - **Config.** `OPENSVR_VOICE` and `OPENSVR_DICT` environment variables as defaults for `--voice` and `--dict`.
 - **Release engineering.** `cargo dist` or a plain CI matrix for Linux, macOS and Windows; cache `target/` and run `cargo clippy -D warnings`.
 
-## Out of scope for now: the editor
+## Out of scope: the editor
 
 `ui/*`, `app/*` and `audio/PreviewEngine.*` (about 5,600 lines) are a JUCE desktop editor: piano roll, arrangement, parameter
-view, playback and undo/redo (`ProjectDocument.*`). Do not port them as part of the engine work. Also out of scope,
-as editor-only adjuncts: `audio/PitchAudition.*` (realtime key-preview oscillator tied to the audio device thread)
+view, playback and undo/redo (`ProjectDocument.*`). OpenSVR will not port them — there is no GUI here, at most the thin CLI.
+Also out of scope, as editor-only adjuncts: `audio/PitchAudition.*` (realtime key-preview oscillator tied to the audio device thread)
 and `audio/RenderVisualization.*` (`PhraseVisualization` waveform peaks for display).
 Named-but-trivial engine adjuncts that ride along with their phases instead of getting their own:
 `synthesis/SynthesisStatistics.h` and `audio/RenderStatistics.h` (profiling counters) land with Phases 5–6
-alongside `ProgressSink`. When the engine passes its golden tests,
-the editor is a separate project that can sit on the same crates. Options: `egui`, `iced`, Slint, or a Tauri/web front end,
-with `cpal` for audio output. The undo stack in `ProjectDocument` ports well as a command pattern over `opensvr-core::Project`,
-and needs `NoteId` from Phase 1.
+alongside `ProgressSink`. An editor built on these crates would be a different project, not this one.
 
 ## Suggested order and sizing
 
@@ -229,6 +239,6 @@ and needs `NoteId` from Phase 1.
 | 4 | DNNI files load and run, golden tensors match | 1,800 |
 | 5 | First sung output (single phrase) | 4,500 |
 | 6 | Full-project render matching `opensv-cli` | 1,500 |
-| 7 | Drop-in replacement CLI | 300 |
+| 7 | CLI polish | 300 |
 
 That is roughly 11,000 lines on top of the current 2,600, against 14,400 lines of C++ for the same scope without the editor.
