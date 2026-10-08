@@ -235,6 +235,7 @@ dependencies = [
  "hound",
  "opensvr-audio",
  "opensvr-core",
+ "opensvr-g2p",
  "opensvr-midi",
  "opensvr-nofs",
  "opensvr-svp",
@@ -253,6 +254,15 @@ name = "opensvr-dnni"
 version = "0.1.0"
 dependencies = [
  "opensvr-nofs",
+ "thiserror",
+]
+
+[[package]]
+name = "opensvr-g2p"
+version = "0.1.0"
+dependencies = [
+ "opensvr-core",
+ "opensvr-dnni",
  "thiserror",
 ]
 

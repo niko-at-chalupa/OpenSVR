@@ -47,6 +47,9 @@ pub struct InfoArgs {
     pub project: PathBuf,
     #[command(flatten)]
     pub overrides: Overrides,
+    /// Resolve and print phonemes for each note (needs --dict or voices with dictionary paths)
+    #[arg(long)]
+    pub phonemes: bool,
 }
 
 #[derive(Debug, Args)]

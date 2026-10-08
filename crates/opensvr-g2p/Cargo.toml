@@ -1,0 +1,15 @@
+[package]
+name = "opensvr-g2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Grapheme-to-phoneme pronunciation dictionaries and phoneme resolution (port of OpenSV synthesis/PhoneSet, synthesis/PhonemeDictionary, audio/ProjectRenderer::resolvePhonemes)"
+publish.workspace = true
+
+[dependencies]
+opensvr-core.workspace = true
+opensvr-dnni.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -16,6 +16,7 @@ opensvr-midi = { path = "crates/opensvr-midi" }
 opensvr-audio = { path = "crates/opensvr-audio" }
 opensvr-nofs = { path = "crates/opensvr-nofs" }
 opensvr-dnni = { path = "crates/opensvr-dnni" }
+opensvr-g2p = { path = "crates/opensvr-g2p" }
 
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
