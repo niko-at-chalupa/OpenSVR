@@ -18,6 +18,7 @@ mod inference;
 mod reader;
 
 pub use inference::{
-    DenseMatrix, DnniInference, DnniTensor, Layer, Operation, Tensor,
+    BLOCK, DenseMatrix, DnniCache, DnniInference, DnniRunStatistics, DnniTensor, Layer,
+    Operation, Tensor,
 };
 pub use reader::{DnniError, DnniMatrix, DnniNode, DnniReader};
