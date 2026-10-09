@@ -3,7 +3,7 @@ name = "opensvr-dnni"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "DNNI neural network file reader and scalar inference (port of OpenSV synthesis/DnniReader and DnniInference)"
+description = "DNNI neural network file reader and inference (port of OpenSV DnniReader and DnniInference: SIMD-packed weights, scalar fallback, incremental Cache)"
 publish.workspace = true
 
 [dependencies]

@@ -1,11 +1,11 @@
-//! Scalar neural network inference for Synthesizer V DNNI models.
+//! Blocked-SIMD neural network inference for Synthesizer V DNNI models.
 //!
 //! This is the Rust counterpart of OpenSV's `src/synthesis/DnniInference.{h,cpp}`
-//! (namespace `sv::synthesis`), first half: model loading plus every kernel in
-//! plain scalar form over row-major weights. Blocked SIMD weight packing and
-//! the incremental dirty-range `Cache` are deferred to the follow-up PR; the
-//! scalar summation order is documented at each kernel so the packed port can
-//! preserve it.
+//! (namespace `sv::synthesis`): model loading plus every kernel over blocked
+//! `[f32; BLOCK]` weights (LLVM auto-vectorized, no nightly SIMD), and the
+//! incremental dirty-range [`DnniCache`]. The per-element summation orders
+//! match the C++ engine exactly (block-outer, column-inner; kernel-outer for
+//! convolutions), so numerics agree with the C++ goldens to `1e-5` relative.
 //!
 //! Error strings reproduce the C++ `juce::Result` failure text verbatim
 //! (including the `DNNI inference at 0x<offset>: <reason>` prefix) so golden
@@ -52,17 +52,198 @@ pub struct Tensor {
 /// Alias keeping the C++ `DnniTensor` name usable next to [`Tensor`].
 pub type DnniTensor = Tensor;
 
-/// Plain row-major weight matrix.
+/// Operational statistics for a single inference pass, mirroring the C++
+/// `DnniRunStatistics` (`DnniInference.h:35-40`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DnniRunStatistics {
+    /// Output frames evaluated from scratch this run.
+    pub computed_frames: usize,
+    /// Frames reused verbatim from the cache.
+    pub reused_frames: usize,
+    /// Receptive-field halo frames processed but not emitted.
+    pub context_frames: usize,
+}
+
+/// Maximum elements storable in one phrase cache (64 Mi floats / 64 MiB).
+const MAXIMUM_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Per-phrase cache for incremental dirty-range re-synthesis, mirroring the C++
+/// `DnniInference::Cache` (`DnniInference.h:72-85`).
 ///
-/// `values[row * columns + column]`; `rows` is the output dimension and
-/// `columns` the input dimension. The C++ engine stores these in blocked SIMD
-/// layout (`WeightBlock`); the scalar port keeps them row-major and the
-/// packed port must preserve the documented summation orders.
+/// Invariants (kept from the C++ port):
+/// - One instance belongs to one phrase on the synthesis worker thread.
+/// - Never shared across threads.
+#[derive(Debug, Clone, Default)]
+pub struct DnniCache {
+    /// Last seen input tensor (full sequence).
+    pub input: Tensor,
+    /// Optional conditioning tensor snapshotted alongside the input.
+    pub condition: Tensor,
+    /// Cached output for the most recent successful run.
+    pub output: Tensor,
+    /// Monotonic tag that distinguishes loaded model generations; a `load`
+    /// bump invalidates cached tensors from a prior model.
+    pub model_identity: u64,
+    /// Whether a condition tensor was present for the cached run.
+    pub has_condition: bool,
+}
+
+impl DnniCache {
+    /// Resets the cache to its default state, matching `Cache::clear()`.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Byte size of retained float capacities, matching `Cache::getBytes()`.
+    ///
+    /// Returns `capacity * 4` summed across input, condition and output (using
+    /// `Vec::capacity`, not `len`), exactly as the C++ port does.
+    pub fn get_bytes(&self) -> usize {
+        (self.input.values.capacity()
+            + self.condition.values.capacity()
+            + self.output.values.capacity())
+            * size_of::<f32>()
+    }
+}
+
+/// True when two tensors describe the same shape (frames, channels, count).
+///
+/// Mirrors the C++ `sameShape` (`DnniInference.cpp:54-57`).
+fn same_shape(first: &Tensor, second: &Tensor) -> bool {
+    first.frames == second.frames
+        && first.channels == second.channels
+        && first.values.len() == second.values.len()
+}
+
+/// Inclusive `[first, end)` frame range over time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameRange {
+    first: usize,
+    end: usize,
+}
+
+/// Expands a frame range by a receptive-field radius, clamped to `[0, frames]`.
+///
+/// Mirrors the C++ `expandRange` (`DnniInference.cpp:72-75`).
+fn expand_range(range: FrameRange, radius: usize, frames: usize) -> FrameRange {
+    FrameRange {
+        first: range.first.saturating_sub(radius),
+        end: (range.end + radius).min(frames),
+    }
+}
+
+/// Bitwise float-slice equality, the safe-Rust equivalent of `memcmp`.
+///
+/// Compares `to_bits()` lane by lane so sign-of-zero and NaN payload
+/// differences count as changed, exactly as the C++ byte comparison does.
+/// (`f32: PartialEq` would treat `-0.0 == 0.0` and `NaN != NaN`.)
+fn frames_bit_equal(first: &[f32], second: &[f32]) -> bool {
+    first.len() == second.len()
+        && first
+            .iter()
+            .zip(second.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+}
+
+/// Finds output-frame ranges that differ between two tensors' cached state.
+///
+/// Input is compared first (per frame via byte equality); condition is only
+/// compared when input is unchanged, matching the C++
+/// `findChangedOutputRanges` (`DnniInference.cpp:84-110`). Adjacent ranges are
+/// pre-merged when their radius-expanded spans touch.
+fn find_changed_output_ranges(
+    previous: &Tensor,
+    current: &Tensor,
+    previous_condition: Option<&Tensor>,
+    current_condition: Option<&Tensor>,
+    radius: usize,
+) -> Vec<FrameRange> {
+    let mut ranges: Vec<FrameRange> = Vec::new();
+    let condition_channels = current_condition.map_or(0, |condition| condition.channels);
+    for frame in 0..current.frames {
+        let input_offset = frame * current.channels;
+        // Byte equality like the C++ `memcmp`: compare bit patterns so that
+        // e.g. `-0.0` vs `0.0` counts as changed, exactly as the C++ does.
+        // (`f32: PartialEq` would treat them as equal.)
+        let input_changed = !frames_bit_equal(
+            &previous.values[input_offset..input_offset + current.channels],
+            &current.values[input_offset..input_offset + current.channels],
+        );
+        let condition_changed = !input_changed
+            && current_condition.is_some()
+            && previous_condition.is_some_and(|previous| {
+                let offset = frame * condition_channels;
+                !frames_bit_equal(
+                    &previous.values[offset..offset + condition_channels],
+                    &current_condition.unwrap().values[offset..offset + condition_channels],
+                )
+            });
+        if !input_changed && !condition_changed {
+            continue;
+        }
+        let range = expand_range(
+            FrameRange { first: frame, end: frame + 1 },
+            radius,
+            current.frames,
+        );
+        if ranges.is_empty() || ranges.last().unwrap().end < range.first {
+            ranges.push(range);
+        } else {
+            ranges.last_mut().unwrap().end = ranges.last().unwrap().end.max(range.end);
+        }
+    }
+    ranges
+}
+
+/// Copies frames `[first, end)` out of a tensor, matching `sliceFrames`
+/// (`DnniInference.cpp:112-117`).
+fn slice_frames(input: &Tensor, first: usize, end: usize) -> Tensor {
+    let begin = first * input.channels;
+    let finish = end * input.channels;
+    Tensor {
+        frames: end - first,
+        channels: input.channels,
+        values: input.values[begin..finish].to_vec(),
+    }
+}
+
+/// Maximum elements per SIMD weight block (4 vectors × 4 lanes).
+///
+/// Matches the C++ `channelsPerBlock` at the SSE width; on AVX2 the C++ engine
+/// doubles it to 32, but the Rust port fixes it at 16 per `AGENTS.md` and leans
+/// on LLVM auto-vectorization, so numerics stay portable and bit-stable.
+pub const BLOCK: usize = 16;
+
+/// Number of `[f32; BLOCK]` vectors in one blocked weight block.
+///
+/// Mirrors the C++ `vectorsPerBlock = 4`; on SSE each vector holds 4 floats,
+/// giving `4 * 4 = 16` output channels per block.
+const VECTORS_PER_BLOCK: usize = 4;
+
+/// Blocked SIMD weight matrix, transposing row-major storage into per-column
+/// 16-lane blocks.
+///
+/// This is the Rust counterpart of the C++ `Matrix` with `WeightBlock =
+/// std::array<Vector, vectorsPerBlock>`. Weights for each row-block are laid out
+/// so that `values[block * columns + column]` contains the 16 consecutive
+/// output-channel weights for that column, zero-padded on the tail block. This
+/// lets `multiply_matrix` load one `[f32; BLOCK]` per column and feed it to a
+/// 16-way unrolled accumulator that LLVM can vectorize without nightly SIMD.
+///
+/// `rows` is the output dimension and `columns` the input dimension; the packed
+/// block count is `ceil(rows / BLOCK)`, with `values.len() == block_count *
+/// columns`. The original logical rows (`rows`) are retained because the
+/// convolution and GRU runners address outputs by channel index and must stop at
+/// the real row count, not the padded block boundary.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DenseMatrix {
+    /// Output dimension (number of rows before SIMD padding).
     pub rows: usize,
+    /// Input dimension (number of columns).
     pub columns: usize,
-    pub values: Vec<f32>,
+    /// One `[f32; BLOCK]` per (block, column), row-major within each block with
+    /// zero-padding on the tail. Length is `block_count * columns`.
+    pub values: Vec<[f32; BLOCK]>,
 }
 
 /// Layer operation, mirroring `DnniInference::Operation` in `DnniInference.h`.
@@ -101,10 +282,10 @@ pub enum Operation {
 
 /// One loaded network layer.
 ///
-/// Plain-data mirror of `DnniInference::Layer`: `matrices` are row-major
-/// (one entry per convolution kernel tap, six entries for GRU projections),
-/// `bias` holds the dense/conv bias or the six concatenated GRU biases
-/// `[b_ir, b_iz, b_in, b_hr, b_hz, b_hn]`.
+/// Plain-data mirror of `DnniInference::Layer`: `matrices` are blocked SIMD
+/// weights (one entry per convolution kernel tap, six entries for GRU
+/// projections), `bias` holds the dense/conv bias or the six concatenated GRU
+/// biases `[b_ir, b_iz, b_in, b_hr, b_hz, b_hn]`.
 ///
 /// The default convolution geometry (`stride = 1`, `dilation = 1`) matches the
 /// C++ `Layer` member initializers; dense layers rely on it to address input
@@ -152,6 +333,9 @@ impl Default for Layer {
 pub struct DnniInference {
     root: Option<Layer>,
     context_radius: Option<usize>,
+    /// Monotonic tag identifying the loaded model generation; a `load` bumps
+    /// it so stale [`DnniCache`] entries from a prior model are rejected.
+    model_identity: u64,
     loaded: bool,
 }
 
@@ -189,6 +373,7 @@ impl DnniInference {
         load_layer(reader, root_node, &mut replacement, &mut parameter_count)?;
         self.context_radius = find_context_radius(&replacement);
         self.root = Some(replacement);
+        self.model_identity = next_model_identity();
         self.loaded = true;
         Ok(())
     }
@@ -206,6 +391,28 @@ impl DnniInference {
         condition: Option<&Tensor>,
         cancel: &CancelToken,
     ) -> Result<(), DnniError> {
+        self.run_with_cache(input, output, condition, None, cancel, None)
+    }
+
+    /// Executes inference with optional incremental-cache reuse and statistics.
+    ///
+    /// Mirrors the C++ `run(..., Cache*, ..., DnniRunStatistics*)` overload
+    /// (`DnniInference.cpp:698-853`): when `cache` is armed and the network has
+    /// a finite receptive field, changed output-frame ranges are detected by
+    /// byte-comparing snapshots, expanded by the context radius, and only the
+    /// affected windows are re-synthesized — the rest are copied verbatim.
+    ///
+    /// The plain [`run`](Self::run) delegates here with no cache, so the two
+    /// paths share validation and cancel checks.
+    pub fn run_with_cache(
+        &self,
+        input: &Tensor,
+        output: &mut Tensor,
+        condition: Option<&Tensor>,
+        cache: Option<&mut DnniCache>,
+        cancel: &CancelToken,
+        statistics: Option<&mut DnniRunStatistics>,
+    ) -> Result<(), DnniError> {
         let Some(root) = self.root.as_ref().filter(|_| self.loaded) else {
             return Err(invalid("No DNNI inference model has been loaded."));
         };
@@ -222,14 +429,169 @@ impl DnniInference {
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
+
+        // Cache-gating mirrors C++ lines 718–719:
+        // canCache ⟺ cache armed ∧ finite radius ∧ (no condition OR
+        // condition frames match input frames).
+        let radius = match self.context_radius {
+            Some(radius) => radius,
+            None => 0,
+        };
+        let can_cache = cache.is_some()
+            && self.context_radius.is_some()
+            && condition.is_none_or(|tensor| tensor.frames == input.frames);
+        let has_cached_output = can_cache
+            && cache.as_deref().is_some_and(|cache| {
+                cache.model_identity == self.model_identity
+                    && same_shape(&cache.input, input)
+                    && cache.has_condition == condition.is_some()
+                    && condition.is_none_or(|tensor| same_shape(&cache.condition, tensor))
+            });
+
+        let mut output_ranges: Vec<FrameRange> = Vec::new();
+        if has_cached_output {
+            let cache_ref = cache.as_deref().expect("has_cached_output implies armed cache");
+            output_ranges = find_changed_output_ranges(
+                &cache_ref.input,
+                input,
+                if cache_ref.has_condition { Some(&cache_ref.condition) } else { None },
+                condition,
+                radius,
+            );
+            if output_ranges.is_empty() {
+                // Identical input/condition: reuse the entire cached output.
+                *output = cache_ref.output.clone();
+                if let Some(statistics) = statistics {
+                    statistics.reused_frames += output.frames;
+                }
+                return Ok(());
+            }
+        }
+
         let mut replacement = Tensor::default();
-        run_layer(root, input, &mut replacement, condition, cancel)?;
+        let mut computed_frames = 0_usize;
+        let mut reused_frames = 0_usize;
+        let mut context_frames = 0_usize;
+
+        if has_cached_output {
+            let cache_ref = cache.as_deref().expect("has_cached_output implies armed cache");
+            replacement = cache_ref.output.clone();
+            let mut updated_frames = 0_usize;
+            let mut first_range = 0_usize;
+            while first_range < output_ranges.len() {
+                if cancel.is_cancelled() {
+                    return Err(cancelled());
+                }
+                // Expand then re-merge overlapping radius windows, matching
+                // the C++ window-merge loop (lines 752–761).
+                let mut window = expand_range(output_ranges[first_range], radius, input.frames);
+                let mut end_range = first_range + 1;
+                while end_range < output_ranges.len() {
+                    let next_window = expand_range(output_ranges[end_range], radius, input.frames);
+                    if next_window.first > window.end {
+                        break;
+                    }
+                    window.end = window.end.max(next_window.end);
+                    end_range += 1;
+                }
+                let local_output = if window.first == 0 && window.end == input.frames {
+                    let mut local = Tensor::default();
+                    run_layer(root, input, &mut local, condition, cancel)?;
+                    local
+                } else {
+                    let local_input = slice_frames(input, window.first, window.end);
+                    let local_condition = match condition {
+                        Some(condition) => Some(slice_frames(condition, window.first, window.end)),
+                        None => None,
+                    };
+                    let mut local = Tensor::default();
+                    run_layer(
+                        root,
+                        &local_input,
+                        &mut local,
+                        local_condition.as_ref(),
+                        cancel,
+                    )?;
+                    local
+                };
+                if local_output.frames != window.end - window.first
+                    || local_output.channels != replacement.channels
+                {
+                    return Err(invalid(
+                        "DNNI cached inference produced an unexpected output shape.",
+                    ));
+                }
+                // Paste only the changed centre ranges; halos are computed
+                // but not written back.
+                for index in first_range..end_range {
+                    let range = output_ranges[index];
+                    let source_start = (range.first - window.first) * local_output.channels;
+                    let destination_start = range.first * replacement.channels;
+                    let span = (range.end - range.first) * replacement.channels;
+                    replacement.values[destination_start..destination_start + span]
+                        .copy_from_slice(&local_output.values[source_start..source_start + span]);
+                    updated_frames += range.end - range.first;
+                }
+                computed_frames += local_output.frames;
+                first_range = end_range;
+            }
+            reused_frames = input.frames - updated_frames;
+            context_frames = computed_frames - updated_frames;
+        } else {
+            run_layer(root, input, &mut replacement, condition, cancel)?;
+            computed_frames = replacement.frames;
+        }
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
+
+        // Snapshot the run iff it is cacheable and within the byte cap.
+        if let Some(cache) = cache {
+            let condition_elements = condition.map_or(0, |tensor| tensor.values.len());
+            let snapshot_elements = input.values.len() + condition_elements + replacement.values.len();
+            if can_cache
+                && replacement.frames == input.frames
+                && snapshot_elements <= MAXIMUM_CACHE_BYTES / size_of::<f32>()
+            {
+                let updated = DnniCache {
+                    input: input.clone(),
+                    condition: condition.map_or(Tensor::default(), |t| t.clone()),
+                    output: replacement.clone(),
+                    model_identity: self.model_identity,
+                    has_condition: condition.is_some(),
+                };
+                if updated.get_bytes() <= MAXIMUM_CACHE_BYTES {
+                    *cache = updated;
+                } else {
+                    cache.clear();
+                }
+            } else {
+                cache.clear();
+            }
+        }
+
         *output = replacement;
+        if let Some(statistics) = statistics {
+            statistics.computed_frames += computed_frames;
+            statistics.reused_frames += reused_frames;
+            statistics.context_frames += context_frames;
+        }
         Ok(())
     }
+}
+
+/// Monotonic model-identity source, mirroring the C++ `nextModelIdentity`
+/// atomic (`DnniInference.cpp:22`).
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_MODEL_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_model_identity() -> u64 {
+    // Relaxed ordering matches the C++ `memory_order_relaxed`; identities only
+    // need to be unique, not sequenced relative to other operations. The
+    // counter starts at 1 like the C++ `nextModelIdentity{1}` so that no live
+    // model ever carries the default cache's `0` tag.
+    NEXT_MODEL_IDENTITY.fetch_add(1, Ordering::Relaxed)
 }
 
 fn valid_shape(frames: usize, channels: usize) -> bool {
@@ -270,20 +632,74 @@ fn read_i32(payload: &[u8], offset: usize) -> i32 {
     ])
 }
 
-/// Scalar matrix-vector product: `output[row] = sum over columns in order`.
+/// Blocked SIMD matrix-vector product: `output[block, lane] = sum over columns in order`.
 ///
-/// This is the scalar equivalent of `multiplyMatrix`: the C++ version zeroes
-/// per-row SIMD accumulators and sums column-inner, so each output element is
-/// the columns summed in increasing order, overwriting (not accumulating
-/// into) the target. The packed port must keep that per-element order
-/// (ROADMAP principle 4).
-fn multiply_matrix(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
-    for (row, slot) in output.iter_mut().enumerate() {
-        let mut sum = 0.0_f32;
-        for column in 0..matrix.columns {
-            sum += matrix.values[row * matrix.columns + column] * input[column];
+/// This is the SIMD equivalent of `multiply_matrix`: the C++ `multiplyMatrix`
+/// zeroes four per-block accumulators and sums column-inner, so each output
+/// element is the columns summed in increasing order, overwriting (not
+/// accumulating into) the target. The packed path keeps that per-element order
+/// (ROADMAP principle 4) — only the vector width of the accumulation changes.
+///
+/// For the test suite there is a `#[cfg(test)]` scalar fallback that reads
+/// the same blocked layout but accumulates each lane through a plain `f32`
+/// sum in column order, proving the packed path does not reorder
+/// floating-point additions relative to the scalar reference.
+///
+/// Deliberately outlined (`#[inline(never)]`): in the final linked release
+/// binary the standalone body lowers the 16-lane accumulator to four packed
+/// `mulps`/`addps` pairs with a broadcasted input lane (verified with
+/// `objdump -d` on the release test harness; note `cargo rustc -- --emit=asm`
+/// is misleading here because workspace ThinLTO defers codegen to link time).
+/// A body inlined into the GRU/dense caller control flow scalarizes instead.
+/// Call overhead is negligible next to `columns × 16` fused multiplies per
+/// invocation.
+#[inline(never)]
+pub fn multiply_matrix(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+    debug_assert!(output.len() >= matrix.rows);
+    let block_count = matrix.values.len() / matrix.columns.max(1);
+    for (block_index, first_channel) in (0..block_count).map(|b| (b, b * BLOCK)) {
+        let row_count = (matrix.rows - first_channel).min(BLOCK);
+        // One flat 16-lane accumulator per block, column-inner: LLVM lowers
+        // this to packed `mulps`/`addps` with a broadcasted input lane (16-wide
+        // on AVX2, paired SSE ops otherwise) without changing the per-element
+        // column order. `VECTORS_PER_BLOCK` documents the C++ `WeightBlock`
+        // correspondence: lanes `[4k, 4k+4)` are the k-th SIMD register.
+        debug_assert!(BLOCK == 4 * VECTORS_PER_BLOCK);
+        let mut acc = [0.0_f32; BLOCK];
+        // Bounds checks are hoisted to one per block; the column loop runs
+        // over iterators with no per-lane checks, which is what lets LLVM
+        // SLP-vectorize the 16-lane body into packed arithmetic.
+        let block_weights = &matrix.values[block_index * matrix.columns..][..matrix.columns];
+        for (value, weights) in input.iter().zip(block_weights.iter()) {
+            let value = *value;
+            for lane in 0..BLOCK {
+                acc[lane] += weights[lane] * value;
+            }
         }
-        *slot = sum;
+        output[first_channel..first_channel + row_count].copy_from_slice(&acc[..row_count]);
+    }
+}
+
+/// Scalar reference for [`multiply_matrix`], gated to test builds.
+///
+/// Reads the same blocked layout but accumulates each lane through a plain
+/// `f32` sum in column order, proving the packed path does not reorder
+/// floating-point additions relative to a scalar reference. Unit tests assert
+/// exact (bitwise) agreement between the two.
+#[cfg(test)]
+fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+    debug_assert!(output.len() >= matrix.rows);
+    let block_count = matrix.values.len() / matrix.columns.max(1);
+    for block in 0..block_count {
+        let first_channel = block * BLOCK;
+        let row_count = (matrix.rows - first_channel).min(BLOCK);
+        for row in 0..row_count {
+            let mut sum = 0.0_f32;
+            for column in 0..matrix.columns {
+                sum += matrix.values[block * matrix.columns + column][row] * input[column];
+            }
+            output[first_channel + row] = sum;
+        }
     }
 }
 
@@ -308,20 +724,32 @@ fn load_matrix(
     {
         return Err(node_error(offset, "invalid matrix shape."));
     }
-    // The C++ loader accounts zero-padded SIMD blocks here; the scalar port
-    // stores plain row-major weights, so it accounts the true element count
-    // under the same message and limit.
-    if columns > (MAXIMUM_ELEMENTS - *parameter_count) / rows {
+    // C++ `loadMatrix`: transpose row-major → per-column [f32; BLOCK] blocks,
+    // zero-padded on the tail. The padded element count (blockCount * columns)
+    // is what the C++ loader accounts against `maximumElements`.
+    let block_count = (rows + BLOCK - 1) / BLOCK;
+    let padded_rows = block_count * BLOCK;
+    if columns > (MAXIMUM_ELEMENTS - *parameter_count) / padded_rows {
         return Err(node_error(
             offset,
             "packed model exceeds the parameter memory limit.",
         ));
     }
-    *parameter_count += rows * columns;
+    *parameter_count += padded_rows * columns;
+    let mut values = vec![[0.0; BLOCK]; block_count * columns];
+    for (block, first_row) in (0..block_count).map(|b| (b, b * BLOCK)) {
+        let row_count = (rows - first_row).min(BLOCK);
+        for column in 0..columns {
+            let slot = &mut values[block * columns + column];
+            for row in 0..row_count {
+                slot[row] = decoded.values[(first_row + row) * columns + column];
+            }
+        }
+    }
     Ok(DenseMatrix {
         rows,
         columns,
-        values: decoded.values,
+        values,
     })
 }
 
@@ -1195,9 +1623,10 @@ fn run_layer(
             }
             // Per-output summation order is kernel-outer, column-inner: each
             // output element accumulates tap 0..K, and within a tap the input
-            // channels in increasing order. The C++ 2-frame unrolling keeps
-            // independent accumulator sets per frame, so the scalar port drops
-            // it without changing values.
+            // channels in increasing order. Each kernel writes a disjoint
+            // [first, first+rows) slice of the output, so a temporary buffer
+            // per tap is accumulated and added back in order, mirroring the C++
+            // 2-frame unrolling (which keeps independent accumulators per frame).
             for (kernel, matrix) in layer.matrices.iter().enumerate() {
                 let tap = frame as i64 * layer.stride as i64 + kernel as i64 * layer.dilation as i64
                     - layer.padding as i64;
@@ -1207,13 +1636,11 @@ fn run_layer(
                     continue;
                 }
                 let source = &input.values[tap as usize * input.channels..];
-                for channel_out in 0..output.channels {
-                    let weights = &matrix.values[channel_out * matrix.columns..];
-                    let mut sum = output.values[frame * output.channels + channel_out];
-                    for channel_in in 0..input.channels {
-                        sum += weights[channel_in] * source[channel_in];
-                    }
-                    output.values[frame * output.channels + channel_out] = sum;
+                let mut product = vec![0.0_f32; matrix.rows];
+                multiply_matrix(matrix, source, &mut product);
+                let destination = &mut output.values[frame * output.channels..];
+                for channel_out in 0..matrix.rows {
+                    destination[channel_out] += product[channel_out];
                 }
             }
             if !layer.bias.is_empty() {
@@ -2842,6 +3269,495 @@ mod tests {
         assert_eq!(load_engine(&root).context_radius(), None);
     }
 
+    // --- Blocked packing ---
+
+    /// Loads a dense blob and returns its packed matrix through the real
+    /// `load_matrix` path, so packing tests cover the transpose, not a
+    /// test-local reimplementation.
+    fn packed_matrix_via_blob(rows: usize, columns: usize, values: &[f32]) -> DenseMatrix {
+        let engine = load_engine(&dense_model(
+            rows as u32,
+            columns as u32,
+            values,
+            None,
+        ));
+        engine
+            .root
+            .as_ref()
+            .expect("dense engine must have a root")
+            .matrices[0]
+            .clone()
+    }
+
+    fn lcg(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364_1362_2384_6793_005)
+            .wrapping_add(1_4426_9504_0889_6634_07);
+        ((*state >> 33) as f32 / u32::MAX as f32 - 0.5) * 4.0
+    }
+
+    #[test]
+    fn packing_tail_block_is_zero_padded() {
+        // 17 rows x 3 columns: two blocks, second block holds row 16 only.
+        let values: Vec<f32> = (0..51).map(|index| index as f32 * 0.25 + 1.0).collect();
+        let matrix = packed_matrix_via_blob(17, 3, &values);
+        assert_eq!(matrix.rows, 17);
+        assert_eq!(matrix.columns, 3);
+        assert_eq!(matrix.values.len(), 2 * 3);
+        for column in 0..3 {
+            // Full first block: lanes hold rows 0..16 of this column.
+            let full = &matrix.values[column];
+            for row in 0..16 {
+                assert_eq!(full[row], values[row * 3 + column], "row {row} col {column}");
+            }
+            // Tail block: lane 0 holds row 16, the rest are zero pad.
+            let tail = &matrix.values[3 + column];
+            assert_eq!(tail[0], values[16 * 3 + column]);
+            assert_eq!(&tail[1..], &[0.0; 15]);
+        }
+    }
+
+    #[test]
+    fn packing_exact_block_and_single_element() {
+        // Exact multiple of BLOCK: one block, no padding anywhere.
+        let values: Vec<f32> = (0..32).map(|index| index as f32 - 16.0).collect();
+        let matrix = packed_matrix_via_blob(16, 2, &values);
+        assert_eq!(matrix.values.len(), 2);
+        for column in 0..2 {
+            for row in 0..16 {
+                assert_eq!(matrix.values[column][row], values[row * 2 + column]);
+            }
+        }
+        // 1x1: a single block with lane 0 live and 15 zero lanes.
+        let matrix = packed_matrix_via_blob(1, 1, &[2.5]);
+        assert_eq!(matrix.values.len(), 1);
+        assert_eq!(matrix.values[0][0], 2.5);
+        assert_eq!(&matrix.values[0][1..], &[0.0; 15]);
+    }
+
+    #[test]
+    fn packed_multiply_matches_scalar_exactly() {
+        // Packed vs scalar-fallback agreement must be bitwise: both sum each
+        // lane's columns in increasing order from a zero accumulator.
+        for (rows, columns) in [(1, 1), (2, 3), (16, 16), (17, 3), (31, 5), (5, 33)] {
+            let mut state = 0x1234_5678_9abc_def0_u64 ^ (rows as u64 * 31 + columns as u64);
+            let values: Vec<f32> = (0..rows * columns).map(|_| lcg(&mut state)).collect();
+            let matrix = packed_matrix_via_blob(rows, columns, &values);
+            let input: Vec<f32> = (0..columns).map(|_| lcg(&mut state)).collect();
+            let mut packed = vec![0.0_f32; rows];
+            let mut scalar = vec![0.0_f32; rows];
+            multiply_matrix(&matrix, &input, &mut packed);
+            multiply_matrix_scalar(&matrix, &input, &mut scalar);
+            assert_eq!(packed, scalar, "rows={rows} columns={columns}");
+            // Independent row-major reference agrees within float tolerance.
+            let mut reference = vec![0.0_f32; rows];
+            for row in 0..rows {
+                let mut sum = 0.0_f32;
+                for column in 0..columns {
+                    sum += values[row * columns + column] * input[column];
+                }
+                reference[row] = sum;
+            }
+            assert_close(&packed, &reference, 1e-6);
+        }
+    }
+
+    // --- Cache helpers ---
+
+    fn run_cache_ok(
+        engine: &DnniInference,
+        input: &Tensor,
+        condition: Option<&Tensor>,
+        cache: Option<&mut DnniCache>,
+        statistics: Option<&mut DnniRunStatistics>,
+    ) -> Tensor {
+        let mut output = Tensor::default();
+        engine
+            .run_with_cache(input, &mut output, condition, cache, &test_token(), statistics)
+            .expect("cached run must succeed");
+        output
+    }
+
+    fn tensor(frames: usize, channels: usize, values: Vec<f32>) -> Tensor {
+        Tensor {
+            frames,
+            channels,
+            values,
+        }
+    }
+
+    #[test]
+    fn cache_cold_run_populates_and_rerun_reuses_all_frames() {
+        let engine = load_engine(&dense_model(2, 2, &[1.0, 0.0, 0.0, 1.0], None));
+        let input = tensor(4, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let mut cache = DnniCache::default();
+        let mut first_stats = DnniRunStatistics::default();
+        let first = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut first_stats));
+        assert_eq!(
+            first_stats,
+            DnniRunStatistics {
+                computed_frames: 4,
+                reused_frames: 0,
+                context_frames: 0,
+            }
+        );
+        assert_ne!(cache.model_identity, 0);
+        assert!(!cache.has_condition);
+
+        // Identical rerun: every frame reused, output bytes equal.
+        let mut second_stats = DnniRunStatistics::default();
+        let second = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut second_stats));
+        assert_eq!(second.values, first.values);
+        assert_eq!(
+            second_stats,
+            DnniRunStatistics {
+                computed_frames: 0,
+                reused_frames: 4,
+                context_frames: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_empty_range_return_only_touches_reused() {
+        let engine = load_engine(&dense_model(1, 1, &[2.0], None));
+        let input = tensor(3, 1, vec![1.0, 2.0, 3.0]);
+        let mut cache = DnniCache::default();
+        run_cache_ok(&engine, &input, None, Some(&mut cache), None);
+        // Pre-seeded counters must survive the fast return except `reused`.
+        let mut statistics = DnniRunStatistics {
+            computed_frames: 5,
+            reused_frames: 7,
+            context_frames: 9,
+        };
+        run_cache_ok(
+            &engine,
+            &input,
+            None,
+            Some(&mut cache),
+            Some(&mut statistics),
+        );
+        assert_eq!(
+            statistics,
+            DnniRunStatistics {
+                computed_frames: 5,
+                reused_frames: 10,
+                context_frames: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_single_frame_edit_recomputes_window() {
+        // Kernel-3, pad-1 convolution: context radius 1, weights sum taps.
+        let root = conv_model(3, 1, 1, 1, &[vec![1.0], vec![1.0], vec![1.0]], 1, 1, None);
+        let engine = load_engine(&root);
+        assert_eq!(engine.context_radius(), Some(1));
+        let input = tensor(6, 1, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut cache = DnniCache::default();
+        run_cache_ok(&engine, &input, None, Some(&mut cache), None);
+
+        // Edit frame 3 only: dirty range expands to {2, 5}, the compute
+        // window expands again to {1, 6} (5 frames, 2 of them halo).
+        let edited = tensor(6, 1, vec![1.0, 2.0, 3.0, 40.0, 5.0, 6.0]);
+        let mut statistics = DnniRunStatistics::default();
+        let output = run_cache_ok(
+            &engine,
+            &edited,
+            None,
+            Some(&mut cache),
+            Some(&mut statistics),
+        );
+        assert_eq!(
+            statistics,
+            DnniRunStatistics {
+                computed_frames: 5,
+                reused_frames: 3,
+                context_frames: 2,
+            }
+        );
+        // Cached incremental output equals a fresh full run exactly.
+        let fresh = run_ok(&engine, 6, 1, &[1.0, 2.0, 3.0, 40.0, 5.0, 6.0]);
+        assert_eq!(output.values, fresh.values);
+    }
+
+    #[test]
+    fn cache_two_far_edits_stay_split() {
+        let root = conv_model(3, 1, 1, 1, &[vec![1.0], vec![1.0], vec![1.0]], 1, 1, None);
+        let engine = load_engine(&root);
+        let input = tensor(10, 1, vec![1.0; 10]);
+        let mut cache = DnniCache::default();
+        run_cache_ok(&engine, &input, None, Some(&mut cache), None);
+
+        // Edits at frames 1 and 8: expanded ranges {0, 3} and {7, 10} stay
+        // disjoint after the second window expansion ({0, 4}, {6, 10}).
+        let mut edited_values = vec![1.0; 10];
+        edited_values[1] = 9.0;
+        edited_values[8] = 9.0;
+        let edited = tensor(10, 1, edited_values);
+        let mut statistics = DnniRunStatistics::default();
+        let output = run_cache_ok(
+            &engine,
+            &edited,
+            None,
+            Some(&mut cache),
+            Some(&mut statistics),
+        );
+        assert_eq!(
+            statistics,
+            DnniRunStatistics {
+                computed_frames: 8,
+                reused_frames: 4,
+                context_frames: 2,
+            }
+        );
+        let fresh = run_ok(&engine, 10, 1, &[1.0, 9.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 9.0, 1.0]);
+        assert_eq!(output.values, fresh.values);
+    }
+
+    #[test]
+    fn cache_condition_mismatch_disables_caching() {
+        // A dense layer ignores the condition tensor, so mismatched
+        // condition frames let the run succeed while disabling the snapshot.
+        let engine = load_engine(&dense_model(1, 1, &[2.0], None));
+        let input = tensor(4, 1, vec![1.0, 2.0, 3.0, 4.0]);
+        let mismatched = tensor(3, 1, vec![1.0, 1.0, 1.0]);
+        let mut cache = DnniCache::default();
+        let output = run_cache_ok(&engine, &input, Some(&mismatched), Some(&mut cache), None);
+        assert_eq!(output.values, vec![2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(cache.model_identity, 0);
+        assert_eq!(cache.get_bytes(), 0);
+    }
+
+    #[test]
+    fn cache_gru_has_no_radius_and_clears() {
+        let engine = load_engine(&gru_model(&[1.0, 1.0, 1.0, 0.5, 0.5, 0.5]));
+        assert_eq!(engine.context_radius(), None);
+        let input = tensor(2, 1, vec![1.0, 0.0]);
+        let mut cache = DnniCache::default();
+        let mut first_stats = DnniRunStatistics::default();
+        let first = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut first_stats));
+        assert_eq!(first_stats.computed_frames, 2);
+        // Recurrent state cannot be windowed: the cache is cleared and the
+        // second run recomputes everything.
+        assert_eq!(cache.model_identity, 0);
+        let mut second_stats = DnniRunStatistics::default();
+        let second = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut second_stats));
+        assert_eq!(second.values, first.values);
+        assert_eq!(second_stats.computed_frames, 2);
+        assert_eq!(second_stats.reused_frames, 0);
+    }
+
+    #[test]
+    fn cache_model_reload_invalidates() {
+        let mut engine = load_engine(&dense_model(1, 1, &[2.0], None));
+        let input = tensor(2, 1, vec![3.0, 4.0]);
+        let mut cache = DnniCache::default();
+        let first = run_cache_ok(&engine, &input, None, Some(&mut cache), None);
+        assert_eq!(first.values, vec![6.0, 8.0]);
+
+        // Reload with different weights: the stale snapshot must not be
+        // reused even though the input is identical.
+        let reader = load_reader(&dense_model(1, 1, &[5.0], None));
+        engine.load(&reader, 0).expect("reload must succeed");
+        let mut statistics = DnniRunStatistics::default();
+        let second = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut statistics));
+        assert_eq!(second.values, vec![15.0, 20.0]);
+        assert_eq!(statistics.computed_frames, 2);
+        assert_eq!(statistics.reused_frames, 0);
+    }
+
+    #[test]
+    fn cache_strided_conv_clears_on_frame_mismatch() {
+        // Stride-2 convolution has no finite radius; the 5-frame input also
+        // yields a 2-frame output, so no snapshot is taken either way.
+        let root = conv_model(2, 2, 0, 1, &[vec![1.0], vec![1.0]], 1, 1, Some(&[0.0]));
+        let engine = load_engine(&root);
+        assert_eq!(engine.context_radius(), None);
+        let input = tensor(5, 1, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let mut cache = DnniCache::default();
+        let output = run_cache_ok(&engine, &input, None, Some(&mut cache), None);
+        assert_eq!(output.values, vec![3.0, 7.0]);
+        assert_eq!(cache.model_identity, 0);
+        assert_eq!(cache.get_bytes(), 0);
+    }
+
+    #[test]
+    fn cache_oversize_snapshot_clears() {
+        // Past the 64 MiB / 16 Mi-element snapshot cap the run still
+        // succeeds, but the cache is cleared instead of snapshotted.
+        let engine = load_engine(&dense_model(1, 1, &[1.0], None));
+        let frames = 8_500_000_usize;
+        let input = tensor(frames, 1, vec![1.0; frames]);
+        let mut cache = DnniCache::default();
+        let mut statistics = DnniRunStatistics::default();
+        let output = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut statistics));
+        assert_eq!(output.values.len(), frames);
+        assert_eq!(statistics.computed_frames, frames);
+        assert_eq!(cache.model_identity, 0);
+        assert_eq!(cache.get_bytes(), 0);
+    }
+
+    #[test]
+    fn cache_get_bytes_counts_capacity_and_clear_resets() {
+        let engine = load_engine(&dense_model(1, 1, &[1.0], None));
+        let input = tensor(4, 1, vec![1.0, 2.0, 3.0, 4.0]);
+        let mut cache = DnniCache::default();
+        run_cache_ok(&engine, &input, None, Some(&mut cache), None);
+        // Capacity-based accounting always covers at least the live lengths.
+        assert!(cache.get_bytes() >= (4 + 0 + 4) * size_of::<f32>());
+        assert_ne!(cache.model_identity, 0);
+        cache.clear();
+        assert_eq!(cache.model_identity, 0);
+        assert!(!cache.has_condition);
+        assert!(cache.input.values.is_empty());
+        assert_eq!(cache.get_bytes(), 0);
+    }
+
+    #[test]
+    fn expand_range_clamps_to_bounds() {
+        assert_eq!(
+            expand_range(FrameRange { first: 0, end: 1 }, 2, 10),
+            FrameRange { first: 0, end: 3 }
+        );
+        assert_eq!(
+            expand_range(FrameRange { first: 9, end: 10 }, 2, 10),
+            FrameRange { first: 7, end: 10 }
+        );
+        assert_eq!(
+            expand_range(FrameRange { first: 0, end: 10 }, 5, 10),
+            FrameRange { first: 0, end: 10 }
+        );
+        assert_eq!(
+            expand_range(FrameRange { first: 3, end: 4 }, 0, 10),
+            FrameRange { first: 3, end: 4 }
+        );
+    }
+
+    #[test]
+    fn same_shape_compares_frames_channels_and_len() {
+        let base = tensor(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(same_shape(&base, &tensor(2, 2, vec![0.0; 4])));
+        assert!(!same_shape(&base, &tensor(4, 1, vec![1.0, 2.0, 3.0, 4.0])));
+        assert!(!same_shape(&base, &tensor(2, 1, vec![1.0, 2.0])));
+        assert!(!same_shape(&base, &tensor(2, 2, vec![1.0, 2.0])));
+    }
+
+    #[test]
+    fn slice_frames_copies_window() {
+        let input = tensor(4, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            slice_frames(&input, 1, 3),
+            tensor(2, 2, vec![3.0, 4.0, 5.0, 6.0])
+        );
+        assert_eq!(slice_frames(&input, 0, 4), input);
+    }
+
+    #[test]
+    fn find_changed_ranges_merge_touching_and_condition_only() {
+        let previous = tensor(6, 1, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // Single edit at frame 2, radius 1 → [{1, 4}].
+        let mut current_values = previous.values.clone();
+        current_values[2] = 30.0;
+        let current = tensor(6, 1, current_values);
+        assert_eq!(
+            find_changed_output_ranges(&previous, &current, None, None, 1),
+            vec![FrameRange { first: 1, end: 4 }]
+        );
+        // Edits at frames 1 and 4, radius 1: expanded {0, 3} and {3, 6}
+        // touch at 3, so they pre-merge into [{0, 6}].
+        let mut merged_values = previous.values.clone();
+        merged_values[1] = 20.0;
+        merged_values[4] = 50.0;
+        let merged = tensor(6, 1, merged_values);
+        assert_eq!(
+            find_changed_output_ranges(&previous, &merged, None, None, 1),
+            vec![FrameRange { first: 0, end: 6 }]
+        );
+        // Far edits stay split with radius 0.
+        let mut split_values = previous.values.clone();
+        split_values[0] = 10.0;
+        split_values[5] = 60.0;
+        let split = tensor(6, 1, split_values);
+        assert_eq!(
+            find_changed_output_ranges(&previous, &split, None, None, 0),
+            vec![
+                FrameRange { first: 0, end: 1 },
+                FrameRange { first: 5, end: 6 },
+            ]
+        );
+        // Condition-only edit with identical input still flags the frame.
+        let previous_condition = tensor(6, 1, vec![0.0; 6]);
+        let mut condition_values = vec![0.0; 6];
+        condition_values[2] = 1.0;
+        let current_condition = tensor(6, 1, condition_values);
+        assert_eq!(
+            find_changed_output_ranges(
+                &previous,
+                &previous,
+                Some(&previous_condition),
+                Some(&current_condition),
+                0,
+            ),
+            vec![FrameRange { first: 2, end: 3 }]
+        );
+        // `-0.0` vs `0.0` counts as changed, matching `memcmp` semantics.
+        let zero_previous = tensor(6, 1, vec![1.0, 2.0, 0.0, 4.0, 5.0, 6.0]);
+        let mut neg_zero_values = zero_previous.values.clone();
+        neg_zero_values[2] = -0.0;
+        let neg_zero = tensor(6, 1, neg_zero_values);
+        assert_eq!(
+            find_changed_output_ranges(&zero_previous, &neg_zero, None, None, 0),
+            vec![FrameRange { first: 2, end: 3 }]
+        );
+    }
+
+    #[test]
+    fn cached_run_with_condition_matches_fresh() {
+        let input_conv = conv_model(1, 1, 0, 1, &[vec![1.0, 2.0]], 2, 1, None);
+        let cond_conv = conv_model(1, 1, 0, 1, &[vec![10.0, 20.0]], 2, 1, None);
+        let root = node_bytes("_gnc1v0", &dims3(1, 1, 1), &[input_conv, cond_conv]);
+        let engine = load_engine(&root);
+        let input = tensor(3, 1, vec![1.0, 2.0, 3.0]);
+        let condition = tensor(3, 1, vec![1.0, 1.0, 1.0]);
+        let mut cache = DnniCache::default();
+        let first = run_cache_ok(
+            &engine,
+            &input,
+            Some(&condition),
+            Some(&mut cache),
+            None,
+        );
+        assert!(cache.has_condition);
+
+        // Identical rerun reuses everything, condition included.
+        let mut statistics = DnniRunStatistics::default();
+        let second = run_cache_ok(
+            &engine,
+            &input,
+            Some(&condition),
+            Some(&mut cache),
+            Some(&mut statistics),
+        );
+        assert_eq!(second.values, first.values);
+        assert_eq!(statistics.reused_frames, 3);
+
+        // Editing only the condition recomputes the affected window and
+        // still matches a fresh run exactly.
+        let mut edited_condition_values = vec![1.0, 1.0, 1.0];
+        edited_condition_values[1] = 5.0;
+        let edited_condition = tensor(3, 1, edited_condition_values);
+        let third = run_cache_ok(
+            &engine,
+            &input,
+            Some(&edited_condition),
+            Some(&mut cache),
+            None,
+        );
+        let fresh = run_cond_ok(&engine, 3, 1, &[1.0, 2.0, 3.0], Some(edited_condition));
+        assert_eq!(third.values, fresh.values);
+    }
+
     // --- Golden tensors dumped from the C++ engine ---
     //
     // `tests/golden/dnni/<case>.{dnni,in.txt,cond.txt,out.txt}` were produced
@@ -2919,6 +3835,35 @@ mod tests {
             assert_eq!(output.frames, expected.frames, "{case} frames");
             assert_eq!(output.channels, expected.channels, "{case} channels");
             assert_close(&output.values, &expected.values, 1e-5);
+            // A cached second run over identical inputs must reproduce the
+            // same bytes exactly (full reuse for finite-radius networks, full
+            // recompute otherwise).
+            let mut cache = DnniCache::default();
+            let mut statistics = DnniRunStatistics::default();
+            engine
+                .run_with_cache(
+                    &input,
+                    &mut Tensor::default(),
+                    condition.as_ref(),
+                    Some(&mut cache),
+                    &test_token(),
+                    Some(&mut statistics),
+                )
+                .expect("golden cache prime must succeed");
+            let mut rerun = Tensor::default();
+            engine
+                .run_with_cache(
+                    &input,
+                    &mut rerun,
+                    condition.as_ref(),
+                    Some(&mut cache),
+                    &test_token(),
+                    None,
+                )
+                .expect("golden cached rerun must succeed");
+            assert_eq!(rerun.frames, output.frames, "{case} cached frames");
+            assert_eq!(rerun.channels, output.channels, "{case} cached channels");
+            assert_eq!(rerun.values, output.values, "{case} cached bytes");
         }
     }
 }
