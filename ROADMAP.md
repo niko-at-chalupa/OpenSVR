@@ -27,7 +27,7 @@ from relaxed numerics.
 | Mixer, pan law, solo/mute | `ProjectRenderer::mixPhrase` | `opensvr-audio::render` | done |
 | WAV output | `audio/WaveFile.cpp` | `opensvr-audio::wav` | done |
 | CLI | `cli/Main.cpp` | `opensvr-cli` | done, with subcommands instead of flat flags |
-| Voice synthesis | `synthesis/*` (10.4k lines) | `VoiceBackend` trait + `ToneBackend`, `opensvr-nofs` (NOFS + voice config), `opensvr-dnni` (DNNI reader) | **partial: database and model-file reads done, neural inference still placeholder** |
+| Voice synthesis | `synthesis/*` (10.4k lines) | `VoiceBackend` trait + `ToneBackend`, `opensvr-nofs` (NOFS + voice config), `opensvr-dnni` (DNNI reader + blocked-SIMD inference with incremental cache) | **partial: database, model-file reads and neural inference done, voice stages not started** |
 | Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done (dictionary + resolution + `info --phonemes`; timing model types only) |
 | Phrase building, pitch/vibrato, caching | `ProjectRenderer.cpp` (1.6k lines) | one phrase per track | **simplified** |
 | Editor GUI | `ui/*`, `app/*`, `audio/PreviewEngine.*` (5.6k lines) | none | out of scope |
@@ -48,9 +48,12 @@ The next PRs, in order:
 
 1. ~~**`opensvr-dnni` reader**~~ done (see above).
 2. ~~**Dictionary + `resolvePhonemes`**~~ done (see above).
-3. ~~**`opensvr-dnni` inference (scalar)**~~ done (see above); next is SIMD
-   packing + `Cache`.
-4. Then Phase 5 in the listed stage order (timing -> pitch -> acoustic -> vocoder),
+3. ~~**`opensvr-dnni` inference (scalar)**~~ done (see above).
+4. ~~**`opensvr-dnni` SIMD packing + `Cache`**~~ done (see above): blocked
+   `[f32; 16]` weights (LLVM auto-vectorized, objdump-verified packed
+   `mulps`/`addps`) and incremental dirty-range inference with
+   `DnniRunStatistics`; goldens green unmodified plus exact cached reruns.
+5. Then Phase 5 in the listed stage order (timing -> pitch -> acoustic -> vocoder),
    each gated on golden files from the previous stage's output.
 
 Do not start Phase 5 before the reader and inference agree with the C++ build:
@@ -149,8 +152,13 @@ payloads (50 unit + 2 gated tests, golden `prim0` match).
 Done (inference half, scalar): `opensvr-dnni` loads every layer type and runs
 every kernel over plain row-major weights (129 unit + 1 golden test over 10
 per-op tensors in `tests/golden/dnni/`, dumped from the C++ DNNI translation
-units; `CancelToken` moved down to `opensvr-core`). Next is SIMD packing +
-the incremental `Cache`, which must not change scalar numerics. Note there is
+units; `CancelToken` moved down to `opensvr-core`).
+Done (SIMD + cache): weights pack into blocked `[f32; 16]` columns at load
+(zero-padded tails) with block-outer/column-inner multiply lowering to packed
+SIMD, plus the incremental dirty-range `Cache` (`DnniCache`,
+`DnniRunStatistics`, `run_with_cache`; `run` delegates unchanged). Scalar
+numerics unchanged: all per-op goldens green unmodified, packed-vs-scalar
+matrix tests agree bitwise. Note there is
 no `modl4` branch and no `moda6` in the C++ loader.
 
 Original plan, kept for reference:
