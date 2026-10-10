@@ -293,6 +293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "opensvr-voice"
+version = "0.1.0"
+dependencies = [
+ "opensvr-core",
+ "opensvr-dnni",
+ "opensvr-g2p",
+ "opensvr-nofs",
+ "thiserror",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"

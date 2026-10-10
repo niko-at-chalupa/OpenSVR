@@ -1,0 +1,19 @@
+# Duration-model golden for opensvr-voice (Phase 5, timing stage).
+# Predicted with the C++ engine's voice-compatible PhonemeTiming loader
+# against the GUMI AI voice. The voice archive itself is proprietary and
+# stays behind OPENSVR_TEST_VOICE; only these small text goldens are committed.
+# Input lines start with "in " (<language> <midi> <seconds> <phonemes...>).
+# "interval" is the acoustic frame interval in seconds used for quantization.
+in english 64 0.8173 s ay aa
+in english 65 0.4613 sil
+interval 0.005
+durations 4
+english s 0 0 0.29388275742530823
+english ay 0 0 0.11476723104715347
+english aa 0 1 0.40865001082420349
+english sil 1 2 0.46129998564720154
+frames 4 at 0.004999999888241291
+english s 58
+english ay 23
+english aa 82
+english sil 92

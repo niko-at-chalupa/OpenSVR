@@ -1,0 +1,19 @@
+[package]
+name = "opensvr-voice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Neural singing-voice stages (port of OpenSV synthesis/PhonemeTiming, FeatureNormalizer)"
+publish.workspace = true
+
+[dependencies]
+opensvr-core.workspace = true
+opensvr-dnni.workspace = true
+opensvr-g2p.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+opensvr-nofs.workspace = true
+
+[lints]
+workspace = true
