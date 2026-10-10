@@ -1,13 +1,23 @@
 //! Neural phoneme duration prediction (`PhonemeTiming`).
 //!
-//! Ports OpenSV's `src/synthesis/PhonemeTiming.{h,cpp}`: syllables are mapped
-//! to timing intervals through the voice's per-language [`PhoneSet`]s,
-//! consonant onsets are shifted onto the beat ([`align_intervals`]), a
-//! 272-channel feature tensor is built per phoneme ([`encode_scalar`] RBF
-//! expansions plus learned embeddings), one full [`DnniInference`] pass
-//! predicts log-durations, and the results are denormalized and distributed
-//! across each interval ([`PhonemeTiming::predict`]). [`quantize_phoneme_durations`]
-//! then snaps the continuous durations onto acoustic frames.
+//! Ports OpenSV's `src/synthesis/PhonemeTiming.{h,cpp}` as of the
+//! voice-compatible upstream design (the `gen2a` loader): syllables are
+//! mapped to timing intervals through the voice's per-language [`PhoneSet`]s
+//! (a syllable language matches by substring), consonant onsets are shifted
+//! onto the beat ([`align_intervals`]), a 272-channel feature tensor is built
+//! per phoneme (column-copied embeddings plus sinusoidal [`encode_scalar`]
+//! expansions), one full [`DnniInference`] pass predicts log-durations, and
+//! the results are denormalized and distributed across each interval
+//! ([`PhonemeTiming::predict`]). [`quantize_phoneme_durations`] then snaps
+//! the continuous durations onto acoustic frames with int32 boundaries.
+//!
+//! Provenance note: the pinned OpenSV revision's `PhonemeTiming::load`
+//! expects an 8-child frontend that the available real voice does not have;
+//! its duration model carries a 4-child frontend with the embedding tables in
+//! `modl4` wrappers at root level instead. This crate ports the loader that
+//! reads the real voice (same error strings, same feature math), so golden
+//! tests against the C++ build stay meaningful. `FeatureNormalizer` is
+//! unaffected (identical logic in both revisions).
 
 use opensvr_core::CancelToken;
 use opensvr_dnni::{DnniInference, DnniMatrix, DnniReader, DnniTensor};
@@ -22,6 +32,7 @@ use crate::{Result, invalid};
 // = 272 channels.
 const FEATURE_CHANNELS: usize = 272;
 const MAXIMUM_TENSOR_ELEMENTS: usize = 64 * 1024 * 1024;
+const PHRASE_LIMIT: usize = MAXIMUM_TENSOR_ELEMENTS / FEATURE_CHANNELS;
 
 // Model architecture type hashes in DNNI.
 const DURATION_TYPES: [u64; 12] = [
@@ -79,9 +90,10 @@ struct TimingInterval {
 ///
 /// Step 1 (onset shift): leading consonants before the first nucleus move into
 /// the preceding interval so the vowel nucleus lands on the note onset; index
-/// 0 has no predecessor and is left alone. Step 2 (multi-nuclei split):
-/// intervals with more than one nucleus split into equal-duration pieces cut
-/// right before each subsequent nucleus, carrying the MIDI pitch over.
+/// 0 has no predecessor and is left alone, as is an interval without a
+/// nucleus. Step 2 (multi-nuclei split): intervals with more than one nucleus
+/// split into equal-duration pieces cut right before each subsequent nucleus,
+/// carrying the MIDI pitch over.
 fn align_intervals(mut intervals: Vec<TimingInterval>) -> Vec<TimingInterval> {
     for index in 1..intervals.len() {
         let nucleus = intervals[index]
@@ -89,8 +101,7 @@ fn align_intervals(mut intervals: Vec<TimingInterval>) -> Vec<TimingInterval> {
             .iter()
             .position(|phone| phone.is_nucleus);
         if let Some(nucleus) = nucleus {
-            let moved: Vec<TimingPhone> =
-                intervals[index].phones.drain(..nucleus).collect();
+            let moved: Vec<TimingPhone> = intervals[index].phones.drain(..nucleus).collect();
             intervals[index - 1].phones.extend(moved);
         }
     }
@@ -133,21 +144,31 @@ fn align_intervals(mut intervals: Vec<TimingInterval>) -> Vec<TimingInterval> {
     result
 }
 
-/// Encodes one continuous scalar into a multi-channel Gaussian RBF expansion.
+/// Encodes one continuous scalar into sinusoidal position channels.
+///
+/// The destination splits into two halves: sines in the first, cosines in the
+/// second, with exponentially spaced frequencies (`exp2` steps of
+/// `-26.575424 / len`). A zero value yields all-zero sines and all-one
+/// cosines.
 fn encode_scalar(value: f32, destination: &mut [f32]) {
-    let channels = destination.len();
-    for (channel, slot) in destination.iter_mut().enumerate() {
-        let center = channel as f32 / (channels - 1) as f32;
-        let delta = value - center;
-        // Standard Gaussian RBF expansion.
-        *slot = (-delta * delta * channels as f32).exp();
+    let half = destination.len() / 2;
+    for index in 0..half {
+        let angle =
+            value * (index as f32 * -26.575_424_f32 / destination.len() as f32).exp2();
+        destination[index] = angle.sin();
+        destination[index + half] = angle.cos();
     }
 }
 
-/// Copies one embedding row into the feature buffer.
-fn copy_embedding(matrix: &DnniMatrix, index: usize, destination: &mut [f32]) {
-    let begin = index * matrix.columns as usize;
-    destination.copy_from_slice(&matrix.values[begin..begin + matrix.columns as usize]);
+/// Copies one embedding column into the feature buffer.
+///
+/// Embeddings are stored channels-by-entries (`rows` channels,
+/// `columns` entries); the `column`-th entry fills the whole destination,
+/// which must hold exactly `rows` channels.
+fn copy_embedding(matrix: &DnniMatrix, column: usize, destination: &mut [f32]) {
+    for (row, slot) in destination.iter_mut().enumerate() {
+        *slot = matrix.values[row * matrix.columns as usize + column];
+    }
 }
 
 /// One discrete acoustic frame span assigned to a phoneme.
@@ -160,41 +181,67 @@ pub struct TimedPhoneme {
 
 /// Quantizes continuous phoneme durations into discrete acoustic frames.
 ///
-/// Every phoneme receives at least one frame; cumulative boundaries accumulate
-/// from zero so rounding never drifts. `output` is cleared first and only
+/// Boundaries accumulate from zero (`accumulated * framesPerSecond`,
+/// truncated toward zero like the C++ `int32` cast) so rounding never
+/// drifts; every phoneme receives at least one frame. Empty inputs, invalid
+/// intervals and non-positive durations are rejected, and `output` is only
 /// assigned on success.
 pub fn quantize_phoneme_durations(
     durations: &[PhonemeDuration],
     frame_interval_seconds: f32,
     output: &mut Vec<TimedPhoneme>,
 ) -> Result<()> {
-    if frame_interval_seconds <= 0.0 || !frame_interval_seconds.is_finite() {
-        return Err(failure("invalid acoustic frame interval."));
+    if durations.is_empty()
+        || durations.len() > PHRASE_LIMIT
+        || !frame_interval_seconds.is_finite()
+        || frame_interval_seconds <= 0.0
+    {
+        return Err(failure(
+            "invalid phoneme sequence or acoustic frame interval for time quantization.",
+        ));
     }
+    let frames_per_second = 1.0 / f64::from(frame_interval_seconds);
     let mut quantized = Vec::with_capacity(durations.len());
-    let mut cumulative_seconds = 0.0_f64;
-    let mut previous_frame = 0_usize;
-    for duration in durations {
-        cumulative_seconds += duration.duration_seconds;
-        // Round the cumulative time to the nearest acoustic frame boundary,
-        // keeping at least one frame per phoneme.
-        let target_frame = (previous_frame as f64 + 1.0)
-            .max((cumulative_seconds / f64::from(frame_interval_seconds)).round())
-            as usize;
+    let mut accumulated_seconds = 0.0_f64;
+    let mut previous_boundary = 0_i32;
+    for phoneme in durations {
+        if !phoneme.duration_seconds.is_finite()
+            || phoneme.duration_seconds <= 0.0
+            || phoneme.language.is_empty()
+            || phoneme.symbol.is_empty()
+        {
+            return Err(failure(
+                "time quantization requires positive finite durations and explicit phonemes.",
+            ));
+        }
+        accumulated_seconds += phoneme.duration_seconds;
+        let boundary = accumulated_seconds * frames_per_second;
+        if !boundary.is_finite()
+            || boundary > f64::from(i32::MAX)
+            || previous_boundary == i32::MAX
+        {
+            return Err(failure(
+                "quantized phoneme boundaries exceed the supported int32 frame range.",
+            ));
+        }
+        // Truncation toward zero matches the C++ `int32` cast; the accumulated
+        // boundary is always positive here.
+        let next_boundary = (previous_boundary + 1).max(boundary as i32);
         quantized.push(TimedPhoneme {
-            language: duration.language.clone(),
-            symbol: duration.symbol.clone(),
-            frame_count: target_frame - previous_frame,
+            language: phoneme.language.clone(),
+            symbol: phoneme.symbol.clone(),
+            frame_count: (next_boundary - previous_boundary) as usize,
         });
-        previous_frame = target_frame;
+        previous_boundary = next_boundary;
     }
     *output = quantized;
     Ok(())
 }
 
 fn read_word(bytes: &[u8], offset: usize) -> i32 {
-    // Little-endian pitch bound; the wrapping bit pattern matches C++'s
-    // `static_cast<int>(readWord(...))`. Callers guarantee `offset + 4` fits.
+    // Little-endian word; the bit pattern matches C++'s
+    // `std::bit_cast<std::int32_t>(readWord(...))`. Callers guarantee
+    // `offset + 4` fits.
     i32::from_le_bytes([
         bytes[offset],
         bytes[offset + 1],
@@ -203,7 +250,10 @@ fn read_word(bytes: &[u8], offset: usize) -> i32 {
     ])
 }
 
-/// Reads an embedding matrix and verifies its declared dimensions.
+/// Reads an embedding matrix out of its `modl4` wrapper and verifies dims.
+///
+/// The wrapper must be an empty `modl4` node with exactly one matrix child
+/// holding `rows` channels by `columns` entries.
 fn read_embedding(
     reader: &DnniReader,
     node_index: usize,
@@ -211,15 +261,109 @@ fn read_embedding(
     columns: usize,
     matrix: &mut DnniMatrix,
 ) -> Result<()> {
-    *matrix = reader.read_float_matrix(node_index)?;
-    if matrix.rows as usize != rows || matrix.columns as usize != columns {
+    let wrapper = reader.nodes().get(node_index).filter(|node| {
+        node.name == "modl4"
+            && reader.payload(node_index).is_empty()
+            && node.children.len() == 1
+    });
+    let Some(wrapper) = wrapper else {
         return Err(failure(
-            "embedding matrix dimensions do not match the declared channels.",
+            "an embedding must be an empty modl4 node with one matrix.",
         ));
+    };
+    *matrix = reader.read_float_matrix(wrapper.children[0])?;
+    if matrix.rows as usize != rows || matrix.columns as usize != columns {
+        return Err(failure("an embedding matrix has unsupported dimensions."));
     }
     Ok(())
 }
 
+/// Frontend tables loaded from the 4-child descriptor node.
+struct FrontendTables {
+    phone_sets: Vec<PhoneSet>,
+    unified_phone_set: PhoneSet,
+    input_normalization: FeatureNormalizer,
+    output_normalization: FeatureNormalizer,
+    minimum_pitch: i32,
+    maximum_pitch: i32,
+}
+
+/// Loads the phone sets, normalizers and pitch bounds from the frontend.
+fn load_frontend(reader: &DnniReader, frontend_node: usize) -> Result<FrontendTables> {
+    let nodes = reader.nodes();
+    let frontend_payload = reader.payload(frontend_node);
+    let frontend_type = nodes
+        .get(frontend_node)
+        .map_or(0, |node| node.type_id);
+    if !FRONTEND_TYPES.contains(&frontend_type)
+        || nodes
+            .get(frontend_node)
+            .is_none_or(|node| node.children.len() != 4)
+        || frontend_payload.len() != 8
+    {
+        return Err(failure("unsupported duration feature frontend."));
+    }
+    let minimum_pitch = read_word(frontend_payload, 0);
+    let maximum_pitch = read_word(frontend_payload, 4);
+    if minimum_pitch < 0 || maximum_pitch > 127 || minimum_pitch >= maximum_pitch {
+        return Err(failure("invalid MIDI pitch normalization range."));
+    }
+    let frontend_children = nodes[frontend_node].children.clone();
+
+    // Read the phone sets and the unified phone set.
+    let group = &nodes[frontend_children[0]];
+    if group.name != "cmpg1"
+        || !reader.payload(frontend_children[0]).is_empty()
+        || group.children.is_empty()
+    {
+        return Err(failure(
+            "the duration frontend requires a nonempty language phone-set group.",
+        ));
+    }
+    let mut phone_sets = Vec::with_capacity(group.children.len());
+    for &child in &group.children.clone() {
+        phone_sets.push(read_phone_set(reader, child)?);
+    }
+    let unified_phone_set = read_phone_set(reader, frontend_children[1])?;
+    let unified_symbols: std::collections::HashSet<&str> = unified_phone_set
+        .symbols
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for phone_set in &phone_sets {
+        for symbol in &phone_set.unified_symbols[..phone_set.symbols.len()] {
+            if !unified_symbols.contains(symbol.as_str()) {
+                return Err(failure(
+                    "a language phoneme maps to an unknown unified symbol.",
+                ));
+            }
+        }
+    }
+
+    // Normalizers (exactly one channel each).
+    let mut input_normalization = FeatureNormalizer::default();
+    input_normalization.load(reader, frontend_children[2])?;
+    let mut output_normalization = FeatureNormalizer::default();
+    output_normalization.load(reader, frontend_children[3])?;
+    if input_normalization.channel_count() != 1
+        || output_normalization.channel_count() != 1
+    {
+        return Err(failure(
+            "duration normalizers must each contain one channel.",
+        ));
+    }
+    Ok(FrontendTables {
+        phone_sets,
+        unified_phone_set,
+        input_normalization,
+        output_normalization,
+        minimum_pitch,
+        maximum_pitch,
+    })
+}
+///
+/// Predicts the continuous time duration (in seconds) of each phoneme within
+/// a singing phrase; see the module docs for the pipeline.
 /// Neural phoneme duration prediction model (`gen2a` duration model).
 ///
 /// Predicts the continuous time duration (in seconds) of each phoneme within
@@ -237,12 +381,6 @@ pub struct PhonemeTiming {
     network: DnniInference,
     minimum_pitch: i32,
     maximum_pitch: i32,
-}
-
-impl Default for PhonemeTiming {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl PhonemeTiming {
@@ -276,55 +414,36 @@ impl PhonemeTiming {
         }
     }
 
-    /// Loads the duration model weights and embeddings from a DNNI file.
+    /// Loads the verified `gen2a` duration model weights and embeddings.
     ///
-    /// The root must be a duration model container with a frontend feature
-    /// extractor child and an inference network child. On failure the model
-    /// keeps its previous state.
+    /// The root carries six children (frontend, network, three `modl4`
+    /// embeddings, voice vector) and an 8-byte `[32, 16]` feature-layout
+    /// payload; the frontend carries four children (phone-set group, unified
+    /// set, two 1-channel normalizers) and the MIDI pitch bounds. Everything
+    /// is staged into a candidate first: a failed load preserves the current
+    /// model.
     pub fn load(&mut self, reader: &DnniReader, root_node: usize) -> Result<()> {
         let nodes = reader.nodes();
-        let Some(root) = nodes.get(root_node) else {
-            return Err(failure("root node index out of bounds."));
-        };
-        if !DURATION_TYPES.contains(&root.type_id) {
-            return Err(failure("unsupported duration model root type."));
-        }
-        // Child 0: frontend feature descriptors, embeddings, normalizers.
-        // Child 1: inference network.
-        if root.children.len() < 2 {
-            return Err(failure("duration model missing required child components."));
-        }
-        let frontend_node = root.children[0];
-        let network_node = root.children[1];
-        let Some(frontend_type) = nodes.get(frontend_node).map(|node| node.type_id) else {
-            return Err(failure("duration model missing required child components."));
-        };
-        if !FRONTEND_TYPES.contains(&frontend_type) {
-            return Err(failure("unsupported frontend feature descriptor type."));
-        }
-        let Some(frontend) = nodes.get(frontend_node) else {
-            return Err(failure("duration model missing required child components."));
-        };
-        if frontend.children.len() < 8 {
+        let Some(root) = nodes.get(root_node).filter(|root| {
+            DURATION_TYPES.contains(&root.type_id)
+        }) else {
             return Err(failure(
-                "frontend descriptor missing required embedding tables.",
-            ));
-        }
-        let frontend_children = frontend.children.clone();
-
-        // Read the phone sets and the unified phone set.
-        let mut phone_sets = Vec::new();
-        let Some(group) = nodes.get(frontend_children[0]) else {
-            return Err(failure(
-                "frontend descriptor missing required embedding tables.",
+                "the selected node is not the verified gen2a duration model.",
             ));
         };
-        for &child in &group.children.clone() {
-            phone_sets.push(read_phone_set(reader, child)?);
+        let payload = reader.payload(root_node);
+        if root.children.len() != 6
+            || payload.len() != 8
+            || read_word(payload, 0) != 32
+            || read_word(payload, 4) != 16
+        {
+            return Err(failure("unsupported gen2a feature layout."));
         }
-        let unified_phone_set = read_phone_set(reader, frontend_children[1])?;
+        let children = root.children.clone();
+        let frontend = load_frontend(reader, children[0])?;
 
-        // Load the embeddings: language (32), phoneme (32), position (16).
+        // Embeddings live at root level: language (32 x languages), phoneme
+        // (32 x unified symbols), position (16 x 8).
         let mut language_embedding = DnniMatrix {
             rows: 0,
             columns: 0,
@@ -332,9 +451,9 @@ impl PhonemeTiming {
         };
         read_embedding(
             reader,
-            frontend_children[2],
-            phone_sets.len(),
+            children[2],
             32,
+            frontend.phone_sets.len(),
             &mut language_embedding,
         )?;
         let mut phoneme_embedding = DnniMatrix {
@@ -344,9 +463,9 @@ impl PhonemeTiming {
         };
         read_embedding(
             reader,
-            frontend_children[3],
-            unified_phone_set.symbols.len(),
+            children[3],
             32,
+            frontend.unified_phone_set.symbols.len(),
             &mut phoneme_embedding,
         )?;
         let mut position_embedding = DnniMatrix {
@@ -354,58 +473,51 @@ impl PhonemeTiming {
             columns: 0,
             values: Vec::new(),
         };
-        read_embedding(reader, frontend_children[4], 8, 16, &mut position_embedding)?;
+        read_embedding(reader, children[4], 16, 8, &mut position_embedding)?;
 
         // Speaker / voice embedding vector (128 floats).
-        let voice_embedding = reader.read_float_vector(frontend_children[5])?;
+        let voice_embedding = reader.read_float_vector(children[5])?;
         if voice_embedding.len() != 128 {
-            return Err(failure("voice embedding must be 128 elements."));
+            return Err(failure(
+                "the duration voice embedding must contain 128 channels.",
+            ));
         }
-
-        // Normalizers.
-        let mut input_normalization = FeatureNormalizer::default();
-        input_normalization.load(reader, frontend_children[6])?;
-        let mut output_normalization = FeatureNormalizer::default();
-        output_normalization.load(reader, frontend_children[7])?;
-
-        // Pitch bounds from the frontend payload.
-        let payload = reader.payload(frontend_node);
-        if payload.len() < 8 {
-            return Err(failure("frontend payload truncated."));
-        }
-        let minimum_pitch = read_word(payload, 0);
-        let maximum_pitch = read_word(payload, 4);
 
         // Neural network.
         let mut network = DnniInference::new();
-        network.load(reader, network_node)?;
+        network.load(reader, children[1])?;
 
-        self.phone_sets = phone_sets;
-        self.unified_phone_set = unified_phone_set;
-        self.input_normalization = input_normalization;
-        self.output_normalization = output_normalization;
+        self.phone_sets = frontend.phone_sets;
+        self.unified_phone_set = frontend.unified_phone_set;
+        self.input_normalization = frontend.input_normalization;
+        self.output_normalization = frontend.output_normalization;
         self.language_embedding = language_embedding;
         self.phoneme_embedding = phoneme_embedding;
         self.position_embedding = position_embedding;
         self.voice_embedding = voice_embedding;
         self.network = network;
-        self.minimum_pitch = minimum_pitch;
-        self.maximum_pitch = maximum_pitch;
+        self.minimum_pitch = frontend.minimum_pitch;
+        self.maximum_pitch = frontend.maximum_pitch;
         Ok(())
     }
 
     /// Predicts the duration in seconds of each phoneme in a syllable phrase.
     ///
-    /// `output` is cleared first (including for empty input) and only
-    /// assigned on success.
+    /// Include an explicit leading rest if the first syllable's consonants
+    /// should start early; the whole phrase is processed together. `output`
+    /// is only assigned on success. This allocates and runs neural inference.
     pub fn predict(
         &self,
         syllables: &[TimingSyllable],
         output: &mut Vec<PhonemeDuration>,
     ) -> Result<()> {
-        if syllables.is_empty() {
-            output.clear();
-            return Ok(());
+        if self.phone_sets.is_empty() {
+            return Err(failure("no duration model has been loaded."));
+        }
+        if syllables.is_empty() || syllables.len() > PHRASE_LIMIT {
+            return Err(failure(
+                "the phrase is empty or exceeds the tensor size limit.",
+            ));
         }
 
         let (intervals, phoneme_count) = self.build_intervals(syllables)?;
@@ -437,23 +549,42 @@ impl PhonemeTiming {
         Ok(())
     }
 
-    /// Maps syllables to aligned timing intervals (steps 1-2).
+    /// Maps syllables to aligned timing intervals, validating every field.
     ///
     /// Returns the intervals plus the total phoneme count.
     fn build_intervals(
         &self,
         syllables: &[TimingSyllable],
     ) -> Result<(Vec<TimingInterval>, usize)> {
-        // 1. Map input syllables and phonemes into timing intervals.
         let mut intervals = Vec::with_capacity(syllables.len());
         let mut phoneme_count = 0_usize;
         for (syllable_index, syllable) in syllables.iter().enumerate() {
+            if syllable.phonemes.is_empty()
+                || syllable.phonemes.len()
+                    > PHRASE_LIMIT.saturating_sub(phoneme_count)
+            {
+                return Err(failure(
+                    "a syllable is empty or exceeds the tensor size limit.",
+                ));
+            }
+            if !syllable.duration_seconds.is_finite()
+                || syllable.duration_seconds <= 0.0
+                || syllable.duration_seconds > f64::from(f32::MAX)
+                || syllable.midi_pitch < 0
+                || syllable.midi_pitch > 127
+            {
+                return Err(failure(
+                    "syllable duration must be finite and positive, and pitch must be a MIDI note.",
+                ));
+            }
             phoneme_count += syllable.phonemes.len();
-
-            // Match the syllable language to the known phone sets.
+            if syllable.language.is_empty() {
+                return Err(failure("an explicit phoneme language is required."));
+            }
+            // The syllable language matches by nonempty substring, exactly once.
             let mut language_index = self.phone_sets.len();
             for (index, phone_set) in self.phone_sets.iter().enumerate() {
-                if phone_set.name == syllable.language {
+                if phone_set.name.contains(syllable.language.as_str()) {
                     if language_index != self.phone_sets.len() {
                         return Err(failure(
                             "the language matches more than one phone set.",
@@ -483,6 +614,7 @@ impl PhonemeTiming {
                         phone_set.name
                     )));
                 };
+                // The loader verified every mapping, so this always resolves.
                 let unified = &phone_set.unified_symbols[source_index];
                 let Some(target_index) = self
                     .unified_phone_set
@@ -490,10 +622,9 @@ impl PhonemeTiming {
                     .iter()
                     .position(|candidate| candidate == unified)
                 else {
-                    return Err(failure(format!(
-                        "unknown unified phoneme '{unified}' for {}.",
-                        phone_set.name
-                    )));
+                    return Err(failure(
+                        "a language phoneme maps to an unknown unified symbol.",
+                    ));
                 };
                 let category = &phone_set.categories[source_index];
                 interval.phones.push(TimingPhone {
@@ -506,19 +637,17 @@ impl PhonemeTiming {
             }
             intervals.push(interval);
         }
-
-        // 2. Singing timing alignment (leading consonant shift, vowel splits).
         Ok((align_intervals(intervals), phoneme_count))
     }
 
-    /// Builds the 272-channel feature tensor plus duration shells (steps 3-4).
+    /// Builds the 272-channel feature tensor plus duration shells.
     fn render_features(
         &self,
         syllables: &[TimingSyllable],
         intervals: &[TimingInterval],
         phoneme_count: usize,
     ) -> Result<(DnniTensor, Vec<PhonemeDuration>)> {
-        // 3. Normalized log-duration input features.
+        // Normalized log-duration input features.
         let mut raw_values = Vec::with_capacity(intervals.len());
         for interval in intervals {
             // The reference uses log(durationSeconds + 0.01) to prevent the
@@ -537,26 +666,21 @@ impl PhonemeTiming {
             true,
         )?;
 
-        // 4. Construct the 272-channel input feature tensor.
-        let total = phoneme_count
-            .checked_mul(FEATURE_CHANNELS)
-            .filter(|&elements| elements <= MAXIMUM_TENSOR_ELEMENTS)
-            .ok_or_else(|| failure("feature tensor exceeds the memory limit."))?;
         let mut features = DnniTensor {
             frames: phoneme_count,
             channels: FEATURE_CHANNELS,
-            values: vec![0.0; total],
+            values: vec![0.0; phoneme_count * FEATURE_CHANNELS],
         };
         let mut durations = Vec::with_capacity(phoneme_count);
         let mut frame = 0_usize;
         for (interval_index, interval) in intervals.iter().enumerate() {
-            let pitch = (interval.midi_pitch.wrapping_sub(self.minimum_pitch)) as f32
-                / (self.maximum_pitch.wrapping_sub(self.minimum_pitch)) as f32;
+            let pitch = (interval.midi_pitch - self.minimum_pitch) as f32
+                / (self.maximum_pitch - self.minimum_pitch) as f32;
             for (position, phone) in interval.phones.iter().enumerate() {
                 let syllable = &syllables[phone.syllable_index];
                 let destination =
                     &mut features.values[frame * FEATURE_CHANNELS..(frame + 1) * FEATURE_CHANNELS];
-                // Feature layout:
+                // Feature layout (column-copied embeddings):
                 // [0..32): phoneme embedding (32 channels).
                 copy_embedding(
                     &self.phoneme_embedding,
@@ -581,12 +705,12 @@ impl PhonemeTiming {
                     (interval.phones.len() - position - 1).min(7),
                     &mut destination[80..96],
                 );
-                // [96..128): RBF expansion of the normalized interval duration.
+                // [96..128): sinusoidal expansion of the normalized duration.
                 encode_scalar(
                     normalized_duration.values[interval_index],
                     &mut destination[96..128],
                 );
-                // [128..144): RBF expansion of the normalized pitch.
+                // [128..144): sinusoidal expansion of the normalized pitch.
                 encode_scalar(pitch, &mut destination[128..144]);
                 // [144..272): voice / speaker identity embedding.
                 destination[144..272].copy_from_slice(&self.voice_embedding);
@@ -605,7 +729,13 @@ impl PhonemeTiming {
     }
 }
 
-/// Distributes each interval duration across its phonemes (step 7).
+impl Default for PhonemeTiming {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Distributes each interval duration across its phonemes.
 ///
 /// The denormalized network outputs are exponentiated and each phoneme takes
 /// its softmax-like share of the musical interval.
@@ -657,6 +787,8 @@ mod tests {
     use super::*;
     use opensvr_dnni::DnniReader;
 
+    // --- Pure alignment tests (unchanged algorithm) ---
+
     fn phone(
         syllable_index: usize,
         phoneme_index: usize,
@@ -681,7 +813,7 @@ mod tests {
         }
     }
 
-    fn symbols(intervals: &[TimingInterval]) -> Vec<Vec<bool>> {
+    fn nuclei(intervals: &[TimingInterval]) -> Vec<Vec<bool>> {
         intervals
             .iter()
             .map(|interval| {
@@ -713,12 +845,10 @@ mod tests {
         assert_eq!(aligned[0].phones.len(), 3);
         assert_eq!(aligned[1].phones.len(), 1);
         assert!(aligned[1].phones[0].is_nucleus);
-        // Durations and pitches stay with their own intervals.
         assert_eq!(aligned[0].duration_seconds, 0.4);
         assert_eq!(aligned[1].duration_seconds, 0.6);
         assert_eq!(aligned[0].midi_pitch, 60);
         assert_eq!(aligned[1].midi_pitch, 62);
-        // The moved phones keep their source syllable / phoneme indices.
         assert_eq!(aligned[0].phones[1].syllable_index, 1);
         assert_eq!(aligned[0].phones[1].phoneme_index, 0);
     }
@@ -726,10 +856,7 @@ mod tests {
     #[test]
     fn first_interval_has_no_predecessor_to_shift_into() {
         let intervals = vec![interval(
-            vec![
-                phone(0, 0, 0, 1, false),
-                phone(0, 1, 0, 3, true),
-            ],
+            vec![phone(0, 0, 0, 1, false), phone(0, 1, 0, 3, true)],
             0.5,
             60,
         )];
@@ -745,7 +872,7 @@ mod tests {
             interval(vec![phone(1, 0, 0, 4, false)], 0.3, 62),
         ];
         let aligned = align_intervals(intervals);
-        assert_eq!(symbols(&aligned), vec![vec![true], vec![false]]);
+        assert_eq!(nuclei(&aligned), vec![vec![true], vec![false]]);
     }
 
     #[test]
@@ -762,7 +889,10 @@ mod tests {
         )];
         let aligned = align_intervals(intervals);
         assert_eq!(aligned.len(), 3);
-        assert_eq!(symbols(&aligned), vec![vec![true, false], vec![true], vec![true]]);
+        assert_eq!(
+            nuclei(&aligned),
+            vec![vec![true, false], vec![true], vec![true]]
+        );
         for piece in &aligned {
             assert_eq!(piece.duration_seconds, 0.3);
             assert_eq!(piece.midi_pitch, 64);
@@ -786,6 +916,8 @@ mod tests {
         assert_eq!(aligned[0].duration_seconds, 0.5);
     }
 
+    // --- Sinusoidal scalar encoding ---
+
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
         assert_eq!(actual.len(), expected.len());
         for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
@@ -798,59 +930,50 @@ mod tests {
     }
 
     #[test]
-    fn encode_scalar_matches_hand_computed_rbf_values() {
-        // Centers for 4 channels are 0, 1/3, 2/3, 1 (f32); value 0 peaks at 1.
-        // Expectations keep 7 significant digits (what f32 resolves) and the
-        // comparison allows 1e-6 relative slack for the last-ulp rounding.
-        let mut out = [0.0_f32; 4];
+    fn encode_scalar_zero_yields_zero_sines_and_unit_cosines() {
+        let mut out = [9.0_f32; 4];
         encode_scalar(0.0, &mut out);
-        assert_close(&out, &[1.0, 0.641_180_4, 0.169_013_3, 0.018_315_64], 1e-6);
-        // Value 0.5 sits between the middle centers; the RBF is symmetric up
-        // to f32 center rounding (channels 1 and 2 differ in the last ulp).
-        encode_scalar(0.5, &mut out);
-        assert_close(&out, &[0.367_879_5, 0.894_839_3, 0.894_839_3, 0.367_879_5], 1e-6);
-        let mut pair = [0.0_f32; 2];
-        encode_scalar(1.0, &mut pair);
-        assert_close(&pair, &[0.135_335_28, 1.0], 1e-6);
-        encode_scalar(0.25, &mut pair);
-        assert_close(&pair, &[0.882_496_9, 0.324_652_5], 1e-6);
+        assert_eq!(out, [0.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]
-    fn encode_scalar_into_32_and_16_channels_is_finite_and_peaked() {
+    fn encode_scalar_matches_hand_computed_sinusoids() {
+        // angle(i) = value * exp2(i * -26.575424 / len); channel i holds
+        // sin(angle), channel i + half holds cos(angle).
+        let mut out = [0.0_f32; 4];
+        encode_scalar(1.0, &mut out);
+        assert_close(&out, &[0.841_471, 0.009_999_83, 0.540_302_3, 0.999_95], 1e-6);
+    }
+
+    #[test]
+    fn encode_scalar_pairs_stay_on_the_unit_circle() {
         let mut wide = [0.0_f32; 32];
         encode_scalar(0.43, &mut wide);
         assert!(wide.iter().all(|value| value.is_finite()));
-        let peak = wide
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .expect("nonempty")
-            .0;
-        // 0.43 * 31 = 13.3, so channel 13 must be the peak (off-center, < 1).
-        assert_eq!(peak, 13);
-        assert!(wide[peak] < 1.0 && wide[peak] > 0.99);
-        // Exactly on a center the RBF peaks at exactly 1.
-        let mut centered = [0.0_f32; 32];
-        encode_scalar(13.0 / 31.0, &mut centered);
-        assert_eq!(centered[13], 1.0);
+        for pair in 0..16 {
+            let (sine, cosine) = (wide[pair], wide[pair + 16]);
+            assert!(sine.abs() <= 1.0 && cosine.abs() <= 1.0);
+            assert!((sine * sine + cosine * cosine - 1.0).abs() < 1e-6);
+        }
         let mut narrow = [0.0_f32; 16];
-        encode_scalar(0.0, &mut narrow);
-        assert_eq!(narrow[0], 1.0);
-        assert!(narrow[1..].iter().all(|&value| value < 1.0));
+        encode_scalar(-2.0, &mut narrow);
+        assert!(narrow.iter().all(|value| value.is_finite()));
     }
 
     #[test]
-    fn copy_embedding_copies_the_indexed_row() {
+    fn copy_embedding_copies_the_indexed_column() {
+        // 2 channels x 3 entries; column 1 is [2, 5].
         let matrix = DnniMatrix {
             rows: 2,
             columns: 3,
             values: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         };
-        let mut destination = [0.0_f32; 3];
+        let mut destination = [0.0_f32; 2];
         copy_embedding(&matrix, 1, &mut destination);
-        assert_eq!(destination, [4.0, 5.0, 6.0]);
+        assert_eq!(destination, [2.0, 5.0]);
     }
+
+    // --- int32-boundary quantization ---
 
     fn duration(
         language: &str,
@@ -866,6 +989,10 @@ mod tests {
             timing_interval_index,
             duration_seconds,
         }
+    }
+
+    fn frame_counts(output: &[TimedPhoneme]) -> Vec<usize> {
+        output.iter().map(|phoneme| phoneme.frame_count).collect()
     }
 
     #[test]
@@ -900,23 +1027,9 @@ mod tests {
     }
 
     #[test]
-    fn quantize_gives_every_phoneme_at_least_one_frame() {
-        let durations = vec![
-            duration("japanese", "k", 0, 0, 1e-9),
-            duration("japanese", "a", 0, 0, 1e-9),
-        ];
-        let mut output = Vec::new();
-        quantize_phoneme_durations(&durations, 0.005, &mut output).expect("must quantize");
-        assert_eq!(
-            output.iter().map(|phoneme| phoneme.frame_count).collect::<Vec<_>>(),
-            vec![1, 1]
-        );
-    }
-
-    #[test]
-    fn quantize_accumulates_from_zero_without_drift() {
-        // 3 x 0.006 s at 5 ms frames: cumulative boundaries fall at frames
-        // round(1.2) = 1, round(2.4) = 2, round(3.6) = 4.
+    fn quantize_truncates_boundaries_toward_zero() {
+        // 3 x 0.006 s at 5 ms frames: f64 boundaries 1.2000/2.4000/3.6000
+        // truncate to 1/2/3 (the float-cumulative variant would round up).
         let durations = vec![
             duration("english", "s", 0, 0, 0.006),
             duration("english", "ih", 0, 0, 0.006),
@@ -924,39 +1037,86 @@ mod tests {
         ];
         let mut output = Vec::new();
         quantize_phoneme_durations(&durations, 0.005, &mut output).expect("must quantize");
-        assert_eq!(
-            output.iter().map(|phoneme| phoneme.frame_count).collect::<Vec<_>>(),
-            vec![1, 1, 2]
-        );
-        // The frame sum covers the whole phrase: 4 frames = 0.02 s >= 0.018 s.
-        assert_eq!(
-            output.iter().map(|phoneme| phoneme.frame_count).sum::<usize>(),
-            4
-        );
+        assert_eq!(frame_counts(&output), vec![1, 1, 1]);
+        assert_eq!(frame_counts(&output).iter().sum::<usize>(), 3);
     }
 
     #[test]
-    fn quantize_rejects_non_positive_or_non_finite_frame_intervals() {
-        let durations = vec![duration("japanese", "a", 0, 0, 0.25)];
+    fn quantize_gives_every_phoneme_at_least_one_frame() {
+        let durations = vec![
+            duration("japanese", "k", 0, 0, 1e-9),
+            duration("japanese", "a", 0, 0, 1e-9),
+        ];
+        let mut output = Vec::new();
+        quantize_phoneme_durations(&durations, 0.005, &mut output).expect("must quantize");
+        assert_eq!(frame_counts(&output), vec![1, 1]);
+    }
+
+    #[test]
+    fn quantize_rejects_empty_input_and_bad_intervals() {
         let mut output = vec![TimedPhoneme {
             language: "sentinel".to_owned(),
             symbol: "x".to_owned(),
             frame_count: 7,
         }];
+        assert_eq!(
+            quantize_phoneme_durations(&[], 0.005, &mut output)
+                .unwrap_err()
+                .to_string(),
+            "Phoneme timing: invalid phoneme sequence or acoustic frame interval for time quantization."
+        );
         for interval in [0.0, -0.005, f32::INFINITY, f32::NAN] {
             assert_eq!(
-                quantize_phoneme_durations(&durations, interval, &mut output)
+                quantize_phoneme_durations(
+                    &[duration("japanese", "a", 0, 0, 0.25)],
+                    interval,
+                    &mut output
+                )
+                .unwrap_err()
+                .to_string(),
+                "Phoneme timing: invalid phoneme sequence or acoustic frame interval for time quantization."
+            );
+        }
+        // The output is untouched on failure.
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].symbol, "x");
+    }
+
+    #[test]
+    fn quantize_rejects_non_positive_durations_and_blank_labels() {
+        let bad = [
+            duration("japanese", "a", 0, 0, 0.0),
+            duration("japanese", "a", 0, 0, -0.1),
+            duration("japanese", "a", 0, 0, f64::INFINITY),
+            duration("", "a", 0, 0, 0.1),
+            duration("japanese", "", 0, 0, 0.1),
+        ];
+        for durations in bad.chunks(1) {
+            let mut output = Vec::new();
+            assert_eq!(
+                quantize_phoneme_durations(durations, 0.005, &mut output)
                     .unwrap_err()
                     .to_string(),
-                "Phoneme timing: invalid acoustic frame interval."
+                "Phoneme timing: time quantization requires positive finite durations and explicit phonemes."
             );
-            // The output is untouched on failure.
-            assert_eq!(output.len(), 1);
-            assert_eq!(output[0].symbol, "x");
+            assert!(output.is_empty());
         }
     }
 
-    // --- Synthetic DNNI blob builders (v2 object trees) ---
+    #[test]
+    fn quantize_rejects_boundaries_past_int32() {
+        // 1e8 s at 5 ms frames: the boundary (~2e10) exceeds i32::MAX.
+        let durations = vec![duration("japanese", "a", 0, 0, 1e8)];
+        let mut output = Vec::new();
+        assert_eq!(
+            quantize_phoneme_durations(&durations, 0.005, &mut output)
+                .unwrap_err()
+                .to_string(),
+            "Phoneme timing: quantized phoneme boundaries exceed the supported int32 frame range."
+        );
+    }
+
+    // --- Synthetic DNNI blob builders (v2 object trees, gen2a layout) ---
 
     const FNV_PRIME_64: u64 = 0x0100_0000_01b3;
     const CHILD_XOR_MASK: u32 = 0xac5e_7bd5;
@@ -1025,6 +1185,34 @@ mod tests {
         out
     }
 
+    fn phone_set_node(name: &str) -> Vec<u8> {
+        v2_node(
+            named_id("_psv2"),
+            &phone_set_payload(
+                name,
+                &["k", "a", "sil"],
+                &["consonant", "vowel", "silence"],
+                &["k", "a", "sil"],
+                &["consonant", "vowel", "silence"],
+            ),
+            &[],
+        )
+    }
+
+    fn unified_node() -> Vec<u8> {
+        v2_node(
+            named_id("_psv2"),
+            &phone_set_payload(
+                "multiphone",
+                &["k", "a", "sil"],
+                &["consonant", "vowel", "silence"],
+                &["k", "a", "sil"],
+                &["consonant", "vowel", "silence"],
+            ),
+            &[],
+        )
+    }
+
     fn dense_payload(rows: u32, columns: u32, values: &[f32]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&rows.to_le_bytes());
@@ -1056,72 +1244,37 @@ mod tests {
         )
     }
 
-    /// Minimal valid timing-model frontend: one phone set plus embeddings.
+    fn embedding_node(rows: u32, columns: u32, fill: f32) -> Vec<u8> {
+        let values = vec![fill; rows as usize * columns as usize];
+        v2_node(
+            named_id("modl4"),
+            &[],
+            &[v2_node(
+                named_id("prim0"),
+                &dense_payload(rows, columns, &values),
+                &[],
+            )],
+        )
+    }
+
+    fn pitch_payload(minimum: u32, maximum: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&minimum.to_le_bytes());
+        out.extend_from_slice(&maximum.to_le_bytes());
+        out
+    }
+
+    /// Valid frontend: group[1 phone set], unified, two 1-channel normalizers.
     fn frontend_node() -> Vec<u8> {
-        let phone_set = v2_node(
-            named_id("_psv2"),
-            &phone_set_payload(
-                "japanese",
-                &["k", "a", "sil"],
-                &["consonant", "vowel", "silence"],
-                &["k", "a", "sil"],
-                &["consonant", "vowel", "silence"],
-            ),
-            &[],
-        );
-        let group = v2_node(named_id("cmpg1"), &[], &[phone_set]);
-        let unified = v2_node(
-            named_id("_psv2"),
-            &phone_set_payload(
-                "unified",
-                &["k", "a", "sil"],
-                &["consonant", "vowel", "silence"],
-                &["k", "a", "sil"],
-                &["consonant", "vowel", "silence"],
-            ),
-            &[],
-        );
-        let language = v2_node(named_id("prim0"), &dense_payload(1, 32, &[0.5; 32]), &[]);
-        let phoneme = v2_node(
-            named_id("prim0"),
-            &dense_payload(
-                3,
-                32,
-                &[
-                    vec![0.0; 32],
-                    vec![1.0; 32],
-                    vec![2.0; 32],
-                ]
-                .concat(),
-            ),
-            &[],
-        );
-        let position = v2_node(
-            named_id("prim0"),
-            &dense_payload(
-                8,
-                16,
-                &(0..8)
-                    .flat_map(|row| vec![row as f32 * 0.1; 16])
-                    .collect::<Vec<_>>(),
-            ),
-            &[],
-        );
-        let voice = v2_node(
-            named_id("prim1"),
-            &vector_payload(&(0..128).map(|index| index as f32 * 0.001).collect::<Vec<_>>()),
-            &[],
-        );
-        let input_norm = cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]);
-        let output_norm = cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]);
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&127_u32.to_le_bytes());
+        let group = v2_node(named_id("cmpg1"), &[], &[phone_set_node("japanese-romaji-phones")]);
         v2_node(
             FRONTEND_TYPES[0],
-            &payload,
+            &pitch_payload(0, 127),
             &[
-                group, unified, language, phoneme, position, voice, input_norm, output_norm,
+                group,
+                unified_node(),
+                cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]),
+                cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]),
             ],
         )
     }
@@ -1139,13 +1292,48 @@ mod tests {
         )
     }
 
-    fn timing_reader(frontend: Vec<u8>, network: Vec<u8>) -> DnniReader {
-        let root = v2_node(DURATION_TYPES[0], &[], &[frontend, network]);
+    fn timing_reader(
+        frontend: Vec<u8>,
+        network: Vec<u8>,
+        language: Vec<u8>,
+        phoneme: Vec<u8>,
+        position: Vec<u8>,
+        voice: Vec<u8>,
+    ) -> DnniReader {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&32_u32.to_le_bytes());
+        payload.extend_from_slice(&16_u32.to_le_bytes());
+        let root = v2_node(
+            DURATION_TYPES[0],
+            &payload,
+            &[frontend, network, language, phoneme, position, voice],
+        );
         DnniReader::from_bytes(v2_file(&root)).expect("synthetic timing blob must parse")
     }
 
+    /// Six v2 blobs in root-child order: frontend, network, language
+    /// embedding, phoneme embedding, position embedding, voice vector.
+    type ModelParts = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+    fn valid_parts() -> ModelParts {
+        let voice = v2_node(
+            named_id("prim1"),
+            &vector_payload(&(0..128).map(|index| index as f32 * 0.001).collect::<Vec<_>>()),
+            &[],
+        );
+        (
+            frontend_node(),
+            zero_dense_network(),
+            embedding_node(32, 1, 0.5),
+            embedding_node(32, 3, 1.0),
+            embedding_node(16, 8, 0.1),
+            voice,
+        )
+    }
+
     fn valid_reader() -> DnniReader {
-        timing_reader(frontend_node(), zero_dense_network())
+        let (frontend, network, language, phoneme, position, voice) = valid_parts();
+        timing_reader(frontend, network, language, phoneme, position, voice)
     }
 
     fn loaded_model() -> PhonemeTiming {
@@ -1155,7 +1343,12 @@ mod tests {
         model
     }
 
-    fn syllable(language: &str, phonemes: &[&str], duration_seconds: f64, midi_pitch: i32) -> TimingSyllable {
+    fn syllable(
+        language: &str,
+        phonemes: &[&str],
+        duration_seconds: f64,
+        midi_pitch: i32,
+    ) -> TimingSyllable {
         TimingSyllable {
             language: language.to_owned(),
             phonemes: phonemes.iter().map(|symbol| (*symbol).to_owned()).collect(),
@@ -1168,6 +1361,7 @@ mod tests {
     #[test]
     fn synthetic_model_predicts_even_splits() {
         let model = loaded_model();
+        // "japanese" matches "japanese-romaji-phones" by substring.
         let syllables = vec![
             syllable("japanese", &["k", "a"], 0.5, 60),
             syllable("japanese", &["sil"], 0.5, 62),
@@ -1176,11 +1370,17 @@ mod tests {
         model.predict(&syllables, &mut output).expect("must predict");
         assert_eq!(output.len(), 3);
         assert_eq!(
-            output.iter().map(|duration| duration.symbol.clone()).collect::<Vec<_>>(),
+            output
+                .iter()
+                .map(|duration| duration.symbol.clone())
+                .collect::<Vec<_>>(),
             vec!["k", "a", "sil"]
         );
         assert_eq!(
-            output.iter().map(|duration| duration.syllable_index).collect::<Vec<_>>(),
+            output
+                .iter()
+                .map(|duration| duration.syllable_index)
+                .collect::<Vec<_>>(),
             vec![0, 0, 1]
         );
         assert_eq!(
@@ -1213,17 +1413,63 @@ mod tests {
         model.predict(&syllables, &mut durations).expect("must predict");
         let mut timed = Vec::new();
         quantize_phoneme_durations(&durations, 0.005, &mut timed).expect("must quantize");
-        assert_eq!(
-            timed.iter().map(|phoneme| phoneme.frame_count).collect::<Vec<_>>(),
-            vec![50, 50, 100]
-        );
+        assert_eq!(frame_counts(&timed), vec![50, 50, 100]);
     }
 
     #[test]
-    fn empty_phrase_predicts_nothing() {
-        let model = loaded_model();
+    fn unloaded_model_rejects_predict() {
+        let model = PhonemeTiming::new();
         let mut output = vec![duration("japanese", "a", 0, 0, 1.0)];
-        model.predict(&[], &mut output).expect("empty must succeed");
+        assert_eq!(
+            model
+                .predict(&[syllable("japanese", &["a"], 0.5, 60)], &mut output)
+                .unwrap_err()
+                .to_string(),
+            "Phoneme timing: no duration model has been loaded."
+        );
+        assert_eq!(output.len(), 1);
+    }
+
+    #[test]
+    fn predict_rejects_empty_and_invalid_phrases() {
+        let model = loaded_model();
+        let mut output = Vec::new();
+        assert_eq!(
+            model.predict(&[], &mut output).unwrap_err().to_string(),
+            "Phoneme timing: the phrase is empty or exceeds the tensor size limit."
+        );
+        // Syllables with no phonemes are rejected.
+        assert_eq!(
+            model
+                .predict(&[syllable("japanese", &[], 0.5, 60)], &mut output)
+                .unwrap_err()
+                .to_string(),
+            "Phoneme timing: a syllable is empty or exceeds the tensor size limit."
+        );
+        // Bad durations and out-of-range pitches are rejected.
+        for (duration_seconds, midi_pitch) in
+            [(0.0, 60), (-0.5, 60), (f64::INFINITY, 60), (1e39, 60), (0.5, -1), (0.5, 128)]
+        {
+            assert_eq!(
+                model
+                    .predict(
+                        &[syllable("japanese", &["a"], duration_seconds, midi_pitch)],
+                        &mut output
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                "Phoneme timing: syllable duration must be finite and positive, and pitch must be a MIDI note.",
+                "duration {duration_seconds} pitch {midi_pitch}"
+            );
+        }
+        // A blank language is rejected before matching.
+        assert_eq!(
+            model
+                .predict(&[syllable("", &["a"], 0.5, 60)], &mut output)
+                .unwrap_err()
+                .to_string(),
+            "Phoneme timing: an explicit phoneme language is required."
+        );
         assert!(output.is_empty());
     }
 
@@ -1243,62 +1489,44 @@ mod tests {
                 .predict(&[syllable("japanese", &["xyz"], 0.5, 60)], &mut output)
                 .unwrap_err()
                 .to_string(),
-            "Phoneme timing: unknown phoneme 'xyz' for japanese."
+            "Phoneme timing: unknown phoneme 'xyz' for japanese-romaji-phones."
         );
         assert!(output.is_empty());
     }
 
     #[test]
     fn predict_rejects_ambiguous_language_match() {
-        // Two phone sets share one name, so the lookup is ambiguous.
-        let phone_set = v2_node(
-            named_id("_psv2"),
-            &phone_set_payload(
-                "japanese",
-                &["a"],
-                &["vowel"],
-                &["a"],
-                &["vowel"],
-            ),
+        // Both phone-set names contain "lang", so the lookup is ambiguous.
+        let group = v2_node(
+            named_id("cmpg1"),
             &[],
+            &[phone_set_node("lang-a-phones"), phone_set_node("lang-ab-phones")],
         );
-        let group = v2_node(named_id("cmpg1"), &[], &[phone_set.clone(), phone_set]);
-        let reader = {
-            let unified = v2_node(
-                named_id("_psv2"),
-                &phone_set_payload("unified", &["a"], &["vowel"], &["a"], &["vowel"]),
-                &[],
-            );
-            let language = v2_node(named_id("prim0"), &dense_payload(2, 32, &[0.0; 64]), &[]);
-            let phoneme =
-                v2_node(named_id("prim0"), &dense_payload(1, 32, &[0.0; 32]), &[]);
-            let position = v2_node(
-                named_id("prim0"),
-                &dense_payload(8, 16, &[0.0; 128]),
-                &[],
-            );
-            let voice = v2_node(named_id("prim1"), &vector_payload(&[0.0; 128]), &[]);
-            let input_norm = cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]);
-            let output_norm = cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]);
-            let mut payload = Vec::new();
-            payload.extend_from_slice(&0_u32.to_le_bytes());
-            payload.extend_from_slice(&127_u32.to_le_bytes());
-            let frontend = v2_node(
-                FRONTEND_TYPES[0],
-                &payload,
-                &[
-                    group, unified, language, phoneme, position, voice, input_norm,
-                    output_norm,
-                ],
-            );
-            timing_reader(frontend, zero_dense_network())
-        };
+        let frontend = v2_node(
+            FRONTEND_TYPES[0],
+            &pitch_payload(0, 127),
+            &[
+                group,
+                unified_node(),
+                cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]),
+                cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]),
+            ],
+        );
+        let (_, _, _, _, position, voice) = valid_parts();
+        let reader = timing_reader(
+            frontend,
+            zero_dense_network(),
+            embedding_node(32, 2, 0.0),
+            embedding_node(32, 3, 0.0),
+            position,
+            voice,
+        );
         let mut model = PhonemeTiming::new();
         model.load(&reader, 0).expect("ambiguous blob must load");
         let mut output = Vec::new();
         assert_eq!(
             model
-                .predict(&[syllable("japanese", &["a"], 0.5, 60)], &mut output)
+                .predict(&[syllable("lang", &["a"], 0.5, 60)], &mut output)
                 .unwrap_err()
                 .to_string(),
             "Phoneme timing: the language matches more than one phone set."
@@ -1308,9 +1536,14 @@ mod tests {
     #[test]
     fn predict_rejects_wrong_shaped_network_output() {
         // Identity network passes 272 channels through: not one value per phoneme.
+        let (frontend, _, language, phoneme, position, voice) = valid_parts();
         let reader = timing_reader(
-            frontend_node(),
+            frontend,
             v2_node(named_id("moda5"), &[], &[]),
+            language,
+            phoneme,
+            position,
+            voice,
         );
         let mut model = PhonemeTiming::new();
         model.load(&reader, 0).expect("identity blob must load");
@@ -1325,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_bad_root_type() {
+    fn load_rejects_bad_root() {
         let mut tag = [0_u8; 8];
         tag[.."prim0".len()].copy_from_slice(b"prim0");
         let mut node = Vec::new();
@@ -1341,182 +1574,266 @@ mod tests {
         let mut model = loaded_model();
         assert_eq!(
             model.load(&reader, 0).unwrap_err().to_string(),
-            "Phoneme timing: unsupported duration model root type."
+            "Phoneme timing: the selected node is not the verified gen2a duration model."
         );
         assert_eq!(
             model.load(&reader, 99).unwrap_err().to_string(),
-            "Phoneme timing: root node index out of bounds."
+            "Phoneme timing: the selected node is not the verified gen2a duration model."
         );
     }
 
     #[test]
-    fn load_rejects_missing_children_and_tables() {
+    fn load_rejects_bad_feature_layout() {
+        let (frontend, network, _, _, _, _) = valid_parts();
+        // Root with two children instead of six.
+        let short = v2_node(DURATION_TYPES[3], &pitch_payload(32, 16), &[frontend, network]);
+        let reader = DnniReader::from_bytes(v2_file(&short)).expect("must parse");
         let mut model = loaded_model();
-        // Root with a single child: no network component.
-        let lonely = v2_node(DURATION_TYPES[3], &[], &[frontend_node()]);
-        let reader = DnniReader::from_bytes(v2_file(&lonely)).expect("must parse");
         assert_eq!(
             model.load(&reader, 0).unwrap_err().to_string(),
-            "Phoneme timing: duration model missing required child components."
+            "Phoneme timing: unsupported gen2a feature layout."
         );
+        // Six children but the wrong layout payload.
+        let (frontend, network, language, phoneme, position, voice) = valid_parts();
+        let bad_payload = v2_node(
+            DURATION_TYPES[3],
+            &pitch_payload(31, 16),
+            &[frontend, network, language, phoneme, position, voice],
+        );
+        let reader = DnniReader::from_bytes(v2_file(&bad_payload)).expect("must parse");
+        assert_eq!(
+            model.load(&reader, 0).unwrap_err().to_string(),
+            "Phoneme timing: unsupported gen2a feature layout."
+        );
+    }
+
+    #[test]
+    fn load_rejects_bad_frontend() {
+        let (_, network, language, phoneme, position, voice) = valid_parts();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&32_u32.to_le_bytes());
+        payload.extend_from_slice(&16_u32.to_le_bytes());
         // Frontend of the wrong type.
         let wrong = v2_node(
             DURATION_TYPES[3],
-            &[],
+            &payload,
             &[
                 v2_node(named_id("prim0"), &dense_payload(1, 1, &[1.0]), &[]),
-                zero_dense_network(),
+                network.clone(),
+                language.clone(),
+                phoneme.clone(),
+                position.clone(),
+                voice.clone(),
             ],
         );
         let reader = DnniReader::from_bytes(v2_file(&wrong)).expect("must parse");
+        let mut model = loaded_model();
         assert_eq!(
             model.load(&reader, 0).unwrap_err().to_string(),
-            "Phoneme timing: unsupported frontend feature descriptor type."
+            "Phoneme timing: unsupported duration feature frontend."
         );
-        // Frontend with too few children.
+        // Frontend with two children instead of four.
         let short = v2_node(
             DURATION_TYPES[3],
-            &[],
+            &payload,
             &[
-                v2_node(FRONTEND_TYPES[7], &[], &[frontend_node()]),
-                zero_dense_network(),
+                v2_node(
+                    FRONTEND_TYPES[7],
+                    &pitch_payload(0, 127),
+                    &[v2_node(named_id("cmpg1"), &[], &[phone_set_node("x")])],
+                ),
+                network,
+                language,
+                phoneme,
+                position,
+                voice,
             ],
         );
         let reader = DnniReader::from_bytes(v2_file(&short)).expect("must parse");
         assert_eq!(
             model.load(&reader, 0).unwrap_err().to_string(),
-            "Phoneme timing: frontend descriptor missing required embedding tables."
+            "Phoneme timing: unsupported duration feature frontend."
         );
     }
 
     #[test]
-    fn load_rejects_bad_voice_embedding_length() {
-        // Frontend identical to the valid one except the voice vector is short.
-        let phone_set = v2_node(
+    fn load_rejects_bad_pitch_range() {
+        for (minimum, maximum) in [(90_u32, 60_u32), (0, 200), (60, 60)] {
+            let group =
+                v2_node(named_id("cmpg1"), &[], &[phone_set_node("japanese-romaji-phones")]);
+            let frontend = v2_node(
+                FRONTEND_TYPES[0],
+                &pitch_payload(minimum, maximum),
+                &[
+                    group,
+                    unified_node(),
+                    cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]),
+                    cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]),
+                ],
+            );
+            let (_, _, language, phoneme, position, voice) = valid_parts();
+            let reader = timing_reader(
+                frontend,
+                zero_dense_network(),
+                language,
+                phoneme,
+                position,
+                voice,
+            );
+            let mut model = loaded_model();
+            assert_eq!(
+                model.load(&reader, 0).unwrap_err().to_string(),
+                "Phoneme timing: invalid MIDI pitch normalization range.",
+                "pitch [{minimum}, {maximum}]"
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_bad_phone_set_group() {
+        // Group node of the wrong type.
+        let frontend = v2_node(
+            FRONTEND_TYPES[0],
+            &pitch_payload(0, 127),
+            &[
+                phone_set_node("japanese-romaji-phones"),
+                unified_node(),
+                cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]),
+                cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]),
+            ],
+        );
+        let (_, _, language, phoneme, position, voice) = valid_parts();
+        let reader =
+            timing_reader(frontend, zero_dense_network(), language, phoneme, position, voice);
+        let mut model = loaded_model();
+        assert_eq!(
+            model.load(&reader, 0).unwrap_err().to_string(),
+            "Phoneme timing: the duration frontend requires a nonempty language phone-set group."
+        );
+        // Empty group.
+        let frontend = v2_node(
+            FRONTEND_TYPES[0],
+            &pitch_payload(0, 127),
+            &[
+                v2_node(named_id("cmpg1"), &[], &[]),
+                unified_node(),
+                cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]),
+                cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]),
+            ],
+        );
+        let (_, _, language, phoneme, position, voice) = valid_parts();
+        let reader =
+            timing_reader(frontend, zero_dense_network(), language, phoneme, position, voice);
+        assert_eq!(
+            model.load(&reader, 0).unwrap_err().to_string(),
+            "Phoneme timing: the duration frontend requires a nonempty language phone-set group."
+        );
+    }
+
+    #[test]
+    fn load_rejects_unmapped_unified_symbol() {
+        // The language set maps "k" to "zzz", outside the unified inventory.
+        let rogue = v2_node(
             named_id("_psv2"),
             &phone_set_payload(
-                "japanese",
-                &["a"],
-                &["vowel"],
-                &["a"],
-                &["vowel"],
+                "japanese-romaji-phones",
+                &["k", "a"],
+                &["consonant", "vowel"],
+                &["zzz", "a"],
+                &["consonant", "vowel"],
             ),
             &[],
         );
-        let group = v2_node(named_id("cmpg1"), &[], &[phone_set]);
-        let unified = v2_node(
-            named_id("_psv2"),
-            &phone_set_payload("unified", &["a"], &["vowel"], &["a"], &["vowel"]),
-            &[],
-        );
-        let language = v2_node(named_id("prim0"), &dense_payload(1, 32, &[0.0; 32]), &[]);
-        let phoneme = v2_node(named_id("prim0"), &dense_payload(1, 32, &[0.0; 32]), &[]);
-        let position =
-            v2_node(named_id("prim0"), &dense_payload(8, 16, &[0.0; 128]), &[]);
-        let voice = v2_node(named_id("prim1"), &vector_payload(&[0.0; 4]), &[]);
-        let input_norm = cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]);
-        let output_norm = cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]);
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&127_u32.to_le_bytes());
         let frontend = v2_node(
-            FRONTEND_TYPES[2],
-            &payload,
+            FRONTEND_TYPES[0],
+            &pitch_payload(0, 127),
             &[
-                group, unified, language, phoneme, position, voice, input_norm,
-                output_norm,
+                v2_node(named_id("cmpg1"), &[], &[rogue]),
+                unified_node(),
+                cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]),
+                cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]),
             ],
         );
-        let reader = timing_reader(frontend, zero_dense_network());
+        let (_, _, language, phoneme, position, voice) = valid_parts();
+        let reader =
+            timing_reader(frontend, zero_dense_network(), language, phoneme, position, voice);
         let mut model = loaded_model();
         assert_eq!(
             model.load(&reader, 0).unwrap_err().to_string(),
-            "Phoneme timing: voice embedding must be 128 elements."
+            "Phoneme timing: a language phoneme maps to an unknown unified symbol."
         );
     }
 
     #[test]
-    fn load_rejects_embedding_shape_mismatch() {
-        // Language embedding claims 2 rows for a single phone set.
-        let phone_set = v2_node(
-            named_id("_psv2"),
-            &phone_set_payload(
-                "japanese",
-                &["a"],
-                &["vowel"],
-                &["a"],
-                &["vowel"],
-            ),
-            &[],
-        );
-        let group = v2_node(named_id("cmpg1"), &[], &[phone_set]);
-        let unified = v2_node(
-            named_id("_psv2"),
-            &phone_set_payload("unified", &["a"], &["vowel"], &["a"], &["vowel"]),
-            &[],
-        );
-        let language = v2_node(named_id("prim0"), &dense_payload(2, 32, &[0.0; 64]), &[]);
-        let phoneme = v2_node(named_id("prim0"), &dense_payload(1, 32, &[0.0; 32]), &[]);
-        let position =
-            v2_node(named_id("prim0"), &dense_payload(8, 16, &[0.0; 128]), &[]);
-        let voice = v2_node(named_id("prim1"), &vector_payload(&[0.0; 128]), &[]);
-        let input_norm = cmpu_node(&[-5.0], &[5.0], &[0.0, 1.0]);
-        let output_norm = cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]);
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&127_u32.to_le_bytes());
+    fn load_rejects_multi_channel_normalizers() {
         let frontend = v2_node(
-            FRONTEND_TYPES[2],
-            &payload,
+            FRONTEND_TYPES[0],
+            &pitch_payload(0, 127),
             &[
-                group, unified, language, phoneme, position, voice, input_norm,
-                output_norm,
+                v2_node(named_id("cmpg1"), &[], &[phone_set_node("japanese-romaji-phones")]),
+                unified_node(),
+                cmpu_node(&[-5.0, 0.0], &[5.0, 1.0], &[0.0, 1.0]),
+                cmpu_node(&[-10.0], &[10.0], &[0.0, 1.0]),
             ],
         );
-        let reader = timing_reader(frontend, zero_dense_network());
+        let (_, _, language, phoneme, position, voice) = valid_parts();
+        let reader =
+            timing_reader(frontend, zero_dense_network(), language, phoneme, position, voice);
         let mut model = loaded_model();
         assert_eq!(
             model.load(&reader, 0).unwrap_err().to_string(),
-            "Phoneme timing: embedding matrix dimensions do not match the declared channels."
+            "Phoneme timing: duration normalizers must each contain one channel."
         );
     }
 
     #[test]
-    fn load_rejects_truncated_frontend_payload() {
-        // Rebuild the valid blob, then shrink the frontend payload from 8 to
-        // 3 bytes in place (payload bytes drain with it, so the tree still
-        // parses but the pitch bounds no longer fit).
-        let bare = {
-            let valid = v2_file(&v2_node(
-                DURATION_TYPES[0],
-                &[],
-                &[frontend_node(), zero_dense_network()],
-            ));
-            // Frontend payload starts at the frontend header + 20; find it by
-            // re-reading the node table instead of hardcoding offsets.
-            let parsed = DnniReader::from_bytes(valid).expect("must parse");
-            let front = parsed.nodes()[0].children[0];
-            let offset = parsed.nodes()[front].payload_offset;
-            let mut bytes = {
-                let root = v2_node(DURATION_TYPES[0], &[], &[frontend_node(), zero_dense_network()]);
-                v2_file(&root)
-            };
-            // Zero the 8 payload bytes in place.
-            for byte in &mut bytes[offset..offset + 8] {
-                *byte = 0;
-            }
-            // Now shrink the payload size field (header + 16) from 8 to 3 and
-            // drop 5 bytes so the file still parses but the payload is short.
-            let header = parsed.nodes()[front].offset;
-            bytes[header + 16] = 3;
-            bytes.drain(offset + 3..offset + 8);
-            bytes
-        };
-        let reader = DnniReader::from_bytes(bare).expect("short payload blob must parse");
+    fn load_rejects_bad_embeddings() {
+        // Raw matrix instead of a modl4 wrapper.
+        let (frontend, network, _, _, position, voice) = valid_parts();
+        let reader = timing_reader(
+            frontend,
+            network,
+            v2_node(named_id("prim0"), &dense_payload(32, 1, &[0.0; 32]), &[]),
+            embedding_node(32, 3, 0.0),
+            position,
+            voice,
+        );
         let mut model = loaded_model();
         assert_eq!(
             model.load(&reader, 0).unwrap_err().to_string(),
-            "Phoneme timing: frontend payload truncated."
+            "Phoneme timing: an embedding must be an empty modl4 node with one matrix."
+        );
+        // Wrapper present but the dimensions are wrong (32x2 for one language).
+        let (frontend, network, _, _, position, voice) = valid_parts();
+        let reader = timing_reader(
+            frontend,
+            network,
+            embedding_node(32, 2, 0.0),
+            embedding_node(32, 3, 0.0),
+            position,
+            voice,
+        );
+        assert_eq!(
+            model.load(&reader, 0).unwrap_err().to_string(),
+            "Phoneme timing: an embedding matrix has unsupported dimensions."
+        );
+    }
+
+    #[test]
+    fn load_rejects_short_voice_embedding() {
+        let (frontend, network, language, phoneme, position, _) = valid_parts();
+        let reader = timing_reader(
+            frontend,
+            network,
+            language,
+            phoneme,
+            position,
+            v2_node(named_id("prim1"), &vector_payload(&[0.0; 4]), &[]),
+        );
+        let mut model = loaded_model();
+        assert_eq!(
+            model.load(&reader, 0).unwrap_err().to_string(),
+            "Phoneme timing: the duration voice embedding must contain 128 channels."
         );
     }
 }
