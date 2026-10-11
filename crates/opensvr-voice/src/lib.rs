@@ -1,19 +1,24 @@
 //! Neural singing-voice stages: the DNNI-backed half of Phase 5.
 //!
 //! This is the Rust counterpart of OpenSV's `src/synthesis/PhonemeTiming.*`,
-//! `src/synthesis/FeatureNormalizer.*` and `src/synthesis/Pitch*.{h,cpp}`
-//! (namespace `sv::synthesis`). Timing turns [`TimingSyllable`]s
-//! (re-exported from [`opensvr_g2p`], where the types already live) into
-//! per-phoneme durations in seconds, then quantizes them into acoustic
-//! [`TimedPhoneme`] frames; the pitch stage predicts the automatic per-frame
-//! F0 curve from score [`PitchNote`]s plus phoneme durations.
+//! `src/synthesis/FeatureNormalizer.*`, `src/synthesis/Pitch*.{h,cpp}` and
+//! `src/synthesis/Acoustic*.{h,cpp}` (namespace `sv::synthesis`). Timing turns [`TimingSyllable`]s
+//! (re-exported from [`opensvr_g2p`], where the
+//! types already live) into per-phoneme durations in seconds, then quantizes
+//! them into acoustic [`TimedPhoneme`] frames; the pitch stage predicts the
+//! automatic per-frame F0 curve from score [`PitchNote`]s plus phoneme
+//! durations; the acoustic stage predicts vocoder-ready frames from timed
+//! phonemes plus the log-F0 curve.
 //!
 //! Error strings reproduce the C++ `juce::Result` failure text verbatim so
 //! golden tests can compare messages. Dependency direction follows the
 //! workspace rule (`core` <- `dnni`/`g2p` <- `voice`): this crate never
 //! touches `opensvr-audio` or the CLI.
 
+mod acoustic_features;
+mod acoustic_model;
 mod normalizer;
+mod noise;
 mod pitch_context;
 mod pitch_curve;
 mod pitch_decoder;
@@ -22,6 +27,8 @@ mod pitch_model;
 mod pitch_postprocess;
 mod timing;
 
+pub use acoustic_features::{AcousticFeatureConfig, AcousticFeatures};
+pub use acoustic_model::{AcousticFrameInterval, AcousticModel, AcousticModelState};
 pub use normalizer::FeatureNormalizer;
 pub use opensvr_g2p::{PhonemeDuration, TimingSyllable};
 pub use pitch_context::{PitchContext, PitchContextState};
