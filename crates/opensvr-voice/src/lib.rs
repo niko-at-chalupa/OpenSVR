@@ -1,10 +1,12 @@
 //! Neural singing-voice stages: the DNNI-backed half of Phase 5.
 //!
-//! This is the Rust counterpart of OpenSV's `src/synthesis/PhonemeTiming.*`
-//! and `src/synthesis/FeatureNormalizer.*` (namespace `sv::synthesis`). It
-//! turns [`TimingSyllable`]s (re-exported from [`opensvr_g2p`], where the
-//! types already live) into per-phoneme durations in seconds, then quantizes
-//! them into acoustic [`TimedPhoneme`] frames.
+//! This is the Rust counterpart of OpenSV's `src/synthesis/PhonemeTiming.*`,
+//! `src/synthesis/FeatureNormalizer.*` and `src/synthesis/Pitch*.{h,cpp}`
+//! (namespace `sv::synthesis`). Timing turns [`TimingSyllable`]s
+//! (re-exported from [`opensvr_g2p`], where the types already live) into
+//! per-phoneme durations in seconds, then quantizes them into acoustic
+//! [`TimedPhoneme`] frames; the pitch stage predicts the automatic per-frame
+//! F0 curve from score [`PitchNote`]s plus phoneme durations.
 //!
 //! Error strings reproduce the C++ `juce::Result` failure text verbatim so
 //! golden tests can compare messages. Dependency direction follows the
@@ -12,10 +14,25 @@
 //! touches `opensvr-audio` or the CLI.
 
 mod normalizer;
+mod pitch_context;
+mod pitch_curve;
+mod pitch_decoder;
+mod pitch_features;
+mod pitch_model;
+mod pitch_postprocess;
 mod timing;
 
 pub use normalizer::FeatureNormalizer;
 pub use opensvr_g2p::{PhonemeDuration, TimingSyllable};
+pub use pitch_context::{PitchContext, PitchContextState};
+pub use pitch_curve::{
+    PitchCurveNote, render_automatic_pitch_mask, render_pitch_prediction_base,
+    render_pitch_transitions, render_pitch_vibrato,
+};
+pub use pitch_decoder::{PitchDecoder, PitchDecoderNotes};
+pub use pitch_features::{PitchFeatureOutput, PitchFeatures, PitchNote};
+pub use pitch_model::{PitchModel, PitchModelState};
+pub use pitch_postprocess::{PitchFrameInterval, apply_pitch_postprocess};
 pub use timing::{PhonemeTiming, TimedPhoneme, quantize_phoneme_durations};
 
 use opensvr_dnni::DnniError;
@@ -42,4 +59,15 @@ pub(crate) type Result<T> = std::result::Result<T, VoiceError>;
 
 pub(crate) fn invalid(message: impl Into<String>) -> VoiceError {
     VoiceError::Invalid(message.into())
+}
+
+/// Reborrows an optional DNNI statistics accumulator for sequential network
+/// calls inside one `run` (each call needs its own `Option<&mut _>`).
+pub(crate) fn reborrow_stats<'a>(
+    statistics: &'a mut Option<&mut opensvr_dnni::DnniRunStatistics>,
+) -> Option<&'a mut opensvr_dnni::DnniRunStatistics> {
+    match statistics {
+        Some(inner) => Some(&mut **inner),
+        None => None,
+    }
 }
