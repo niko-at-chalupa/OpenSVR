@@ -3,10 +3,11 @@
 //! This is the Rust counterpart of OpenSV's `src/synthesis/PhonemeTiming.*`,
 //! `src/synthesis/FeatureNormalizer.*` and `src/synthesis/Pitch*.{h,cpp}`
 //! (namespace `sv::synthesis`). Timing turns [`TimingSyllable`]s
-//! (re-exported from [`opensvr_g2p`], where the types already live) into
-//! per-phoneme durations in seconds, then quantizes them into acoustic
-//! [`TimedPhoneme`] frames; the pitch stage predicts the automatic per-frame
-//! F0 curve from score [`PitchNote`]s plus phoneme durations.
+//! (re-exported from [`opensvr_g2p`], where the
+//! types already live) into per-phoneme durations in seconds, then quantizes
+//! them into acoustic [`TimedPhoneme`] frames; the pitch stage predicts the
+//! automatic per-frame F0 curve from score [`PitchNote`]s plus phoneme
+//! durations.
 //!
 //! Error strings reproduce the C++ `juce::Result` failure text verbatim so
 //! golden tests can compare messages. Dependency direction follows the
@@ -14,6 +15,7 @@
 //! touches `opensvr-audio` or the CLI.
 
 mod normalizer;
+mod noise;
 mod pitch_context;
 mod pitch_curve;
 mod pitch_decoder;
