@@ -10,19 +10,24 @@
 //! assembles log-F0, and `render` (seed 5489, default vocal-mode weights) sings
 //! native-rate audio that is resampled to the project rate.
 //!
-//! Voice databases load per phrase from `VoiceSettings::database`; dictionaries
-//! load per phrase from `VoiceSettings::dictionary` (a missing directory only
-//! fails phrases that actually need a lookup — explicit phonemes never touch
-//! it, exactly as in C++). Per-phrase loading is the simple correct baseline;
-//! stamp-keyed voice/dictionary caches are a later Phase 6 PR per `ROADMAP.md`.
+//! Voice databases load once per file from `VoiceSettings::database` into an
+//! MRU voice cache (cap 2, like C++); dictionaries load once per stamp set
+//! from `VoiceSettings::dictionary` (a missing directory only fails phrases
+//! that actually need a lookup — explicit phonemes never touch it, exactly as
+//! in C++). Phrase renders keep their native-rate mono output keyed on the
+//! synthesis inputs, so repeated identical phrases resample the cached audio
+//! instead of running the vocoder again.
 
 use opensvr_core::{CancelToken, Language, VoiceSettings};
-use opensvr_g2p::{DictionarySet, NoteResolver, TimingSyllable, load_dictionaries};
+use opensvr_g2p::{
+    DictionarySet, NoteResolver, TimingSyllable, dictionary_stem, load_dictionaries,
+};
 use opensvr_voice::{
     DEFAULT_RENDER_SEED, NeuralVocoderOutput, PITCH_CONTEXT_SECONDS, PhonemeDuration, PitchNote,
-    VoiceSynthesizer, quantize_phoneme_durations,
+    TimedPhoneme, VoiceSynthesizer, quantize_phoneme_durations,
 };
 
+use crate::cache::{DictionaryCache, DictionaryKey, FileStamp, PhraseCache, VoiceCache};
 use crate::pitch::{build_log_f0, merge_continuation_phones};
 use crate::resample::resample_mono;
 use crate::{BackendError, Phrase, PhraseAudio, REST_CONTEXT_SECONDS, VoiceBackend};
@@ -139,38 +144,149 @@ fn needs_dictionary(lyrics: &str, explicit: &str) -> bool {
     lyrics != "+" && lyrics != "-" && explicit.is_empty() && !lyrics.starts_with('.')
 }
 
-/// Loads the track dictionaries, tolerating a missing directory for phrases
-/// whose notes all carry explicit phonemes.
-fn dictionaries_for(
-    voice: &VoiceSettings,
-    notes: &[crate::TimedNote<'_>],
-) -> Result<DictionarySet, BackendError> {
-    if voice.dictionary.is_none()
-        && notes
-            .iter()
-            .any(|note| needs_dictionary(note.lyrics, note.phonemes))
-    {
-        return Err(backend_error(
-            "Select the clf-data pronunciation dictionary directory or enter explicit phonemes.",
-        ));
+fn cannot_read(path: &std::path::Path) -> BackendError {
+    backend_error(format!(
+        "Cannot read synthesis resource: {}",
+        path.display()
+    ))
+}
+
+fn stamp_file(path: &std::path::Path) -> Result<FileStamp, BackendError> {
+    FileStamp::read(path).map_err(|_| cannot_read(path))
+}
+
+/// Stamps every dictionary file `load_dictionaries` reads for one language.
+///
+/// File selection mirrors `load_dictionaries` (including the `cmudict-07b.txt`
+/// preference and the best-effort Japanese English fallback), so the first
+/// missing file reports the same path that path would. Errors use the C++
+/// `readFileStamp` text verbatim, exactly as the loader does.
+fn dictionary_stamps(
+    directory: &std::path::Path,
+    language: Language,
+) -> Result<Vec<FileStamp>, BackendError> {
+    let stem = dictionary_stem(language);
+    let phones = directory.join(format!("{stem}-phones.txt"));
+    let mut dictionary = directory.join(format!("{stem}-dict.txt"));
+    if language == Language::English && directory.join("cmudict-07b.txt").is_file() {
+        dictionary = directory.join("cmudict-07b.txt");
     }
-    let dictionaries = match voice.dictionary.as_deref() {
-        Some(directory) => load_dictionaries(directory, voice.language)
-            .map_err(|error| backend_error(error.to_string()))?,
-        // Every remaining resolution path is explicit or state-carried, and the
-        // tolerated English-inference lookup degrades gracefully on empty tables.
-        None => DictionarySet::default(),
-    };
-    Ok(dictionaries)
+    let mut stamps = vec![stamp_file(&phones)?, stamp_file(&dictionary)?];
+    match language {
+        Language::Mandarin => {
+            stamps.push(stamp_file(&directory.join("cedict.txt"))?);
+        }
+        Language::Japanese => {
+            for name in [
+                "japanese-hira2romaji-dict.txt",
+                "japanese-kata2romaji-dict.txt",
+                "japanese-sute2romaji-dict.txt",
+            ] {
+                stamps.push(stamp_file(&directory.join(name))?);
+            }
+            // Best-effort fallback, exactly as in `load_dictionaries`: only
+            // stamp the English files when they are all present.
+            let english_phones = directory.join("english-arpabet-phones.txt");
+            let cmu = directory.join("cmudict-07b.txt");
+            let plain = directory.join("english-arpabet-dict.txt");
+            if english_phones.is_file() && (cmu.is_file() || plain.is_file()) {
+                stamps.push(stamp_file(&english_phones)?);
+                stamps.push(stamp_file(if cmu.is_file() { &cmu } else { &plain })?);
+            }
+        }
+        Language::English | Language::Cantonese | Language::Spanish => {}
+    }
+    Ok(stamps)
+}
+
+/// Stamps a voice database, reporting a missing file exactly as the
+/// uncached `VoiceSynthesizer::load` path does today (`could not read voice
+/// database ...`, via `VoiceDatabase::open`).
+fn stamp_voice(database: &std::path::Path) -> Result<FileStamp, BackendError> {
+    FileStamp::read(database).map_err(|source| {
+        backend_error(format!(
+            "could not read voice database {}: {source}",
+            database.display()
+        ))
+    })
 }
 
 /// Sings whole phrases through the neural voice: the first sung output.
+///
+/// Voice databases, dictionaries and identical phrase renders are cached by
+/// file stamp across the phrases (and re-renders) this backend sings, so one
+/// render loads each file once. The counters below expose that sharing for
+/// tests; cached audio is always resampled and cropped exactly like a fresh
+/// render, so hits stay sample-identical.
 #[derive(Debug, Default)]
-pub struct NeuralBackend;
+pub struct NeuralBackend {
+    voices: VoiceCache,
+    dictionaries: DictionaryCache,
+    phrases: PhraseCache,
+}
 
 impl NeuralBackend {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Successful voice-database loads so far (one per distinct file stamp).
+    pub fn voice_loads(&self) -> usize {
+        self.voices.loads()
+    }
+
+    /// Successful dictionary loads so far (one per distinct stamp set).
+    pub fn dictionary_loads(&self) -> usize {
+        self.dictionaries.loads()
+    }
+
+    /// Phrase renders served from the cache so far.
+    pub fn phrase_hits(&self) -> usize {
+        self.phrases.hits()
+    }
+
+    /// Phrase renders synthesized (and retained) so far.
+    pub fn phrase_misses(&self) -> usize {
+        self.phrases.misses()
+    }
+
+    /// Returns the track dictionaries, loading them once per stamp set.
+    ///
+    /// Phrases whose notes all carry explicit phonemes never touch the
+    /// filesystem and bypass the cache, exactly as in C++ (where
+    /// `resolvePhonemes` returns before the directory check for them).
+    fn dictionaries_for(
+        &mut self,
+        voice: &VoiceSettings,
+        notes: &[crate::TimedNote<'_>],
+    ) -> Result<DictionarySet, BackendError> {
+        let Some(directory) = voice.dictionary.as_deref() else {
+            if notes
+                .iter()
+                .any(|note| needs_dictionary(note.lyrics, note.phonemes))
+            {
+                return Err(backend_error(
+                    "Select the clf-data pronunciation dictionary directory or enter explicit phonemes.",
+                ));
+            }
+            // Every remaining resolution path is explicit or state-carried, and the
+            // tolerated English-inference lookup degrades gracefully on empty tables.
+            return Ok(DictionarySet::default());
+        };
+        if !notes
+            .iter()
+            .any(|note| needs_dictionary(note.lyrics, note.phonemes))
+        {
+            return Ok(DictionarySet::default());
+        }
+        let stamps = dictionary_stamps(directory, voice.language)?;
+        let key = DictionaryKey::new(directory.to_owned(), voice.language, stamps);
+        self.dictionaries
+            .get_or_load(key, || {
+                load_dictionaries(directory, voice.language)
+                    .map_err(|error| backend_error(error.to_string()))
+            })
+            .cloned()
     }
 }
 
@@ -198,7 +314,7 @@ impl VoiceBackend for NeuralBackend {
                 "the connected phrase exceeds 30 seconds; add a rest of at least 0.2 seconds to separate phrases.",
             ));
         }
-        let dictionaries = dictionaries_for(voice, phrase.notes)?;
+        let dictionaries = self.dictionaries_for(voice, phrase.notes)?;
         let inputs = build_phrase_inputs(phrase.notes, voice.language, &dictionaries)?;
 
         let database = voice
@@ -208,68 +324,141 @@ impl VoiceBackend for NeuralBackend {
             .ok_or_else(|| {
                 backend_error("Select a voice.nofs database before playing singing notes.")
             })?;
-        let mut synthesizer = VoiceSynthesizer::new();
-        synthesizer
-            .load(database)
-            .map_err(|error| backend_error(error.to_string()))?;
-
-        let mut durations: Vec<PhonemeDuration> = Vec::new();
-        synthesizer
-            .predict(&inputs.syllables, &mut durations)
-            .map_err(|error| backend_error(error.to_string()))?;
-        let frame_interval = synthesizer.frame_interval_seconds();
-        let mut timed = Vec::new();
-        quantize_phoneme_durations(&durations, frame_interval, &mut timed)
-            .map_err(|error| backend_error(error.to_string()))?;
-        let timed = merge_continuation_phones(&durations, &inputs.syllables, &timed);
-        let frame_count: usize = timed.iter().map(|phoneme| phoneme.frame_count).sum();
-        if frame_count as f64 * f64::from(frame_interval)
-            > MAXIMUM_PHRASE_SECONDS + f64::from(frame_interval)
-        {
-            return Err(backend_error(
-                "The predicted phrase exceeds the 30-second inference limit.",
-            ));
-        }
+        let voice_stamp = stamp_voice(database)?;
+        let synthesizer = self.voices.get_or_load(voice_stamp.clone(), || {
+            let mut loaded = VoiceSynthesizer::new();
+            loaded
+                .load(database)
+                .map_err(|error| backend_error(error.to_string()))?;
+            Ok(loaded)
+        })?;
+        let synthesis = predict_phrase(synthesizer, &inputs, phrase.notes, start_seconds, cancel)?;
 
         // Empty vibrato envelope means unity; empty vocal-mode weights mean defaults.
-        let mut automatic_pitch = Vec::new();
-        synthesizer
-            .predict_pitch(&inputs.pitch_notes, &mut automatic_pitch, cancel, None, None, &[])
-            .map_err(|error| backend_error(error.to_string()))?;
-        let log_f0 = build_log_f0(
-            phrase.notes,
-            start_seconds,
-            frame_interval,
-            frame_count,
-            &automatic_pitch,
-            first.start - PITCH_CONTEXT_SECONDS,
-            synthesizer.pitch_frame_interval_seconds(),
-        )?;
-
-        let mut rendered = NeuralVocoderOutput::default();
-        synthesizer
-            .render(
-                &timed,
-                &log_f0,
-                &mut rendered,
-                DEFAULT_RENDER_SEED,
-                cancel,
-                None,
-                None,
-                &[],
-            )
-            .map_err(|error| backend_error(error.to_string()))?;
-        if !rendered.sample_rate.is_finite() || rendered.sample_rate <= 0.0 {
-            return Err(backend_error("The voice renderer returned invalid audio."));
+        let vocal_mode_weights: Vec<f32> = Vec::new();
+        if let Some((native_rate, native)) = self.phrases.lookup(
+            &voice_stamp,
+            &inputs.syllables,
+            &synthesis.log_f0,
+            &vocal_mode_weights,
+        ) {
+            let samples = resample_mono(&native, native_rate, sample_rate)?;
+            return Ok(PhraseAudio {
+                start: start_seconds,
+                samples,
+                sample_rate,
+            });
         }
-        let native_rate = rendered.sample_rate.round() as u32;
-        let samples = resample_mono(&rendered.samples, native_rate, sample_rate)?;
+
+        let (native_rate, native) = render_native(
+            synthesizer,
+            &synthesis.timed,
+            &synthesis.log_f0,
+            &vocal_mode_weights,
+            cancel,
+        )?;
+        // Cache the native-rate mono output before resampling: placement,
+        // project rate and mixer never participate in synthesis, so a hit
+        // resamples and crops exactly like this fresh render did.
+        self.phrases.retain(
+            voice_stamp,
+            inputs.syllables.clone(),
+            synthesis.log_f0.clone(),
+            vocal_mode_weights,
+            native_rate,
+            native.clone(),
+        );
+        let samples = resample_mono(&native, native_rate, sample_rate)?;
         Ok(PhraseAudio {
             start: start_seconds,
             samples,
             sample_rate,
         })
     }
+}
+
+/// Timed phonemes plus their log-F0 curve: everything `render` needs.
+struct PhraseSynthesis {
+    timed: Vec<TimedPhoneme>,
+    log_f0: Vec<f32>,
+}
+
+/// Runs timing and pitch prediction for one phrase's inputs.
+fn predict_phrase(
+    synthesizer: &VoiceSynthesizer,
+    inputs: &PhraseInputs,
+    notes: &[crate::TimedNote<'_>],
+    start_seconds: f64,
+    cancel: &CancelToken,
+) -> Result<PhraseSynthesis, BackendError> {
+    let mut durations: Vec<PhonemeDuration> = Vec::new();
+    synthesizer
+        .predict(&inputs.syllables, &mut durations)
+        .map_err(|error| backend_error(error.to_string()))?;
+    let frame_interval = synthesizer.frame_interval_seconds();
+    let mut timed = Vec::new();
+    quantize_phoneme_durations(&durations, frame_interval, &mut timed)
+        .map_err(|error| backend_error(error.to_string()))?;
+    let timed = merge_continuation_phones(&durations, &inputs.syllables, &timed);
+    let frame_count: usize = timed.iter().map(|phoneme| phoneme.frame_count).sum();
+    if frame_count as f64 * f64::from(frame_interval)
+        > MAXIMUM_PHRASE_SECONDS + f64::from(frame_interval)
+    {
+        return Err(backend_error(
+            "The predicted phrase exceeds the 30-second inference limit.",
+        ));
+    }
+
+    // Empty vibrato envelope means unity.
+    let mut automatic_pitch = Vec::new();
+    synthesizer
+        .predict_pitch(
+            &inputs.pitch_notes,
+            &mut automatic_pitch,
+            cancel,
+            None,
+            None,
+            &[],
+        )
+        .map_err(|error| backend_error(error.to_string()))?;
+    let first = notes.first().expect("phrases are never empty");
+    let log_f0 = build_log_f0(
+        notes,
+        start_seconds,
+        frame_interval,
+        frame_count,
+        &automatic_pitch,
+        first.start - PITCH_CONTEXT_SECONDS,
+        synthesizer.pitch_frame_interval_seconds(),
+    )?;
+    Ok(PhraseSynthesis { timed, log_f0 })
+}
+
+/// Runs the acoustic model and vocoder, returning native-rate mono audio.
+fn render_native(
+    synthesizer: &VoiceSynthesizer,
+    timed: &[TimedPhoneme],
+    log_f0: &[f32],
+    vocal_mode_weights: &[f32],
+    cancel: &CancelToken,
+) -> Result<(u32, Vec<f32>), BackendError> {
+    let mut rendered = NeuralVocoderOutput::default();
+    synthesizer
+        .render(
+            timed,
+            log_f0,
+            &mut rendered,
+            DEFAULT_RENDER_SEED,
+            cancel,
+            None,
+            None,
+            vocal_mode_weights,
+        )
+        .map_err(|error| backend_error(error.to_string()))?;
+    if !rendered.sample_rate.is_finite() || rendered.sample_rate <= 0.0 {
+        return Err(backend_error("The voice renderer returned invalid audio."));
+    }
+    Ok((rendered.sample_rate.round() as u32, rendered.samples))
 }
 
 #[cfg(test)]
@@ -374,13 +563,142 @@ mod tests {
             window_end: None,
             ..note(0.0, 0.4, 60, "ka")
         }];
-        assert!(dictionaries_for(&voice, &explicit).is_ok());
+        assert!(
+            NeuralBackend::new()
+                .dictionaries_for(&voice, &explicit)
+                .is_ok()
+        );
         // A plain lyric without overrides needs the files.
         let plain = [note(0.0, 0.4, 60, "ka")];
         assert_eq!(
-            dictionaries_for(&voice, &plain).unwrap_err().to_string(),
+            NeuralBackend::new()
+                .dictionaries_for(&voice, &plain)
+                .unwrap_err()
+                .to_string(),
             "Select the clf-data pronunciation dictionary directory or enter explicit phonemes."
         );
+    }
+
+    #[test]
+    fn explicit_phrases_skip_dictionary_files_entirely() {
+        // A configured-but-missing directory must not fail a phrase whose
+        // notes all carry explicit phonemes (C++ returns before its
+        // directory check for those notes).
+        let dir = std::env::temp_dir().join(format!(
+            "opensvr-audio-neural-{}-missing-clf",
+            std::process::id()
+        ));
+        let voice = VoiceSettings {
+            dictionary: Some(dir),
+            ..VoiceSettings::default()
+        };
+        let explicit = [crate::TimedNote {
+            phonemes: "k a",
+            window_start: 0.0,
+            window_end: None,
+            ..note(0.0, 0.4, 60, "ka")
+        }];
+        assert!(
+            NeuralBackend::new()
+                .dictionaries_for(&voice, &explicit)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn voice_stamps_fail_like_uncached_loads() {
+        let missing = std::env::temp_dir().join("opensvr-audio-neural-missing-voice.nofs");
+        assert!(!missing.is_file());
+        let stamped = stamp_voice(&missing).unwrap_err().to_string();
+        let mut synthesizer = VoiceSynthesizer::new();
+        let loaded = synthesizer.load(&missing).unwrap_err().to_string();
+        assert_eq!(stamped, loaded);
+    }
+
+    #[test]
+    fn dictionary_stamps_report_missing_files_like_the_loader() {
+        let dir = std::env::temp_dir().join(format!(
+            "opensvr-audio-neural-{}-stamps",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stamped = dictionary_stamps(&dir, Language::English)
+            .unwrap_err()
+            .to_string();
+        let loaded = load_dictionaries(&dir, Language::English)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(stamped, loaded);
+        assert!(stamped.starts_with("Cannot read synthesis resource: "));
+    }
+
+    /// Counting stub around the phrase cache plus the project resampler, in
+    /// the same shape as `render_phrase`'s tail: a hit resamples the cached
+    /// native audio instead of synthesizing again.
+    struct CachedStub {
+        cache: PhraseCache,
+        renders: usize,
+    }
+
+    impl CachedStub {
+        fn sing(
+            &mut self,
+            voice: &FileStamp,
+            syllables: &[TimingSyllable],
+            log_f0: &[f32],
+            native: &[f32],
+            project_rate: u32,
+        ) -> Vec<f32> {
+            let weights: Vec<f32> = Vec::new();
+            if let Some((native_rate, cached)) =
+                self.cache.lookup(voice, syllables, log_f0, &weights)
+            {
+                return resample_mono(&cached, native_rate, project_rate).unwrap();
+            }
+            self.renders += 1;
+            self.cache.retain(
+                voice.clone(),
+                syllables.to_vec(),
+                log_f0.to_vec(),
+                weights,
+                48_000,
+                native.to_vec(),
+            );
+            resample_mono(native, 48_000, project_rate).unwrap()
+        }
+    }
+
+    #[test]
+    fn repeated_phrases_synthesize_once_and_match_fresh_renders() {
+        let dir =
+            std::env::temp_dir().join(format!("opensvr-audio-neural-{}-stub", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let voice_file = dir.join("voice.nofs");
+        std::fs::write(&voice_file, b"voice").unwrap();
+        let stamp = FileStamp::read(&voice_file).unwrap();
+        let syllables = vec![TimingSyllable {
+            language: "japanese".to_owned(),
+            phonemes: vec!["k".to_owned(), "a".to_owned()],
+            duration_seconds: 0.4,
+            midi_pitch: 60,
+            is_continuation: false,
+        }];
+        let log_f0 = vec![4.2_f32; 64];
+        let native: Vec<f32> = (0..4800).map(|index| (index as f32 * 0.01).sin()).collect();
+
+        let mut stub = CachedStub {
+            cache: PhraseCache::default(),
+            renders: 0,
+        };
+        let first = stub.sing(&stamp, &syllables, &log_f0, &native, 8000);
+        let second = stub.sing(&stamp, &syllables, &log_f0, &native, 8000);
+        assert_eq!(stub.renders, 1, "the identical phrase must synthesize once");
+        assert_eq!(first, second, "cache hits stay sample-identical");
+        // Cache off (a fresh backend) resamples the same native audio: equal bits.
+        let fresh = resample_mono(&native, 48_000, 8000).unwrap();
+        assert_eq!(first, fresh);
+        assert_eq!(stub.cache.hits(), 1);
+        assert_eq!(stub.cache.misses(), 1);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! voice when a voice database and dictionaries are configured.
 
 mod backend;
+mod cache;
 mod neural;
 mod phrase;
 mod pitch;

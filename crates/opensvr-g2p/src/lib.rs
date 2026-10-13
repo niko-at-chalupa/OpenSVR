@@ -21,8 +21,8 @@ mod timing;
 pub use dictionary::{PhonemeDefinition, PhonemeDictionary};
 pub use phoneset::{PhoneSet, read_phone_set};
 pub use resolve::{
-    DictionarySet, NoteResolver, Resolved, is_english_vowel_phoneme, load_dictionaries, resolve,
-    split_english_syllables,
+    DictionarySet, NoteResolver, Resolved, dictionary_stem, is_english_vowel_phoneme,
+    load_dictionaries, resolve, split_english_syllables,
 };
 pub use timing::{PhonemeDuration, TimingSyllable};
 
