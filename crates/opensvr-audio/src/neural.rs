@@ -309,6 +309,8 @@ mod tests {
             seconds_per_quarter: 0.5,
             lyrics,
             phonemes: "",
+            window_start: 0.0,
+            window_end: None,
         }
     }
 
@@ -368,6 +370,8 @@ mod tests {
         // Explicit phonemes never touch the dictionary.
         let explicit = [crate::TimedNote {
             phonemes: "k a",
+            window_start: 0.0,
+            window_end: None,
             ..note(0.0, 0.4, 60, "ka")
         }];
         assert!(dictionaries_for(&voice, &explicit).is_ok());

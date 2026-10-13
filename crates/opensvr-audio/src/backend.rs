@@ -18,6 +18,17 @@ pub struct TimedNote<'a> {
     pub lyrics: &'a str,
     /// Explicit phoneme override; empty when the lyrics should be looked up.
     pub phonemes: &'a str,
+    /// Start of the placing group reference's crop window, in seconds.
+    ///
+    /// Backends keep the full model-input context (onset consonants live in
+    /// the preceding rest); the renderer crops the mixed output here, exactly
+    /// as OpenSV's `cropStartSeconds` in `src/audio/ProjectRenderer.cpp`.
+    pub window_start: f64,
+    /// End of the crop window, in seconds; `None` means unbounded.
+    ///
+    /// The mixed output stops here (`stopSeconds` in C++): the release tail
+    /// never rings past the group edge.
+    pub window_end: Option<f64>,
 }
 
 /// Mono audio rendered for one phrase.
@@ -43,7 +54,7 @@ pub trait VoiceBackend {
     ///
     /// The returned samples run [`REST_CONTEXT_SECONDS`] past the end of the last
     /// note so the release is not cut off; the renderer crops anything beyond the
-    /// project end.
+    /// phrase's group window (and the project end).
     fn render_phrase(
         &mut self,
         voice: &VoiceSettings,
@@ -124,6 +135,8 @@ mod tests {
             seconds_per_quarter: 0.5,
             lyrics: "la",
             phonemes: "",
+            window_start: 0.0,
+            window_end: None,
         }
     }
 

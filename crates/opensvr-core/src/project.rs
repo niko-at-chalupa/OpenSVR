@@ -167,6 +167,11 @@ impl Track {
 }
 
 /// A note resolved onto the track timeline: offset, transposed and cropped.
+///
+/// `window_start`/`window_end` are the placing reference's crop boundaries:
+/// the renderer keeps the full model-input context but crops the mixed
+/// output to this window, exactly as OpenSV's `cropStartSeconds`/`stopSeconds`
+/// in `src/audio/ProjectRenderer.cpp`.
 #[derive(Debug, Clone, Copy)]
 pub struct PlacedNote<'a> {
     pub start: Blick,
@@ -174,6 +179,8 @@ pub struct PlacedNote<'a> {
     /// Pitch after the reference's transposition, `0..=127`.
     pub pitch: u8,
     pub note: &'a Note,
+    pub window_start: Blick,
+    pub window_end: Option<Blick>,
 }
 
 /// A whole Synthesizer V project.
@@ -253,6 +260,8 @@ fn place<'a>(
             end,
             pitch,
             note,
+            window_start: reference.begin,
+            window_end: reference.end,
         });
     }
     Ok(())
@@ -322,6 +331,41 @@ mod tests {
         // The first note is cropped on the left, the second on the right, the third is dropped.
         let spans: Vec<_> = placed.iter().map(|n| (n.start, n.end, n.pitch)).collect();
         assert_eq!(spans, [(4 * Q + Q / 2, 5 * Q, 62), (5 * Q, 6 * Q, 66)]);
+    }
+
+    #[test]
+    fn references_carry_their_crop_window() {
+        let mut track = Track::new("t", group("main", Vec::new()));
+        track.groups.push(GroupReference {
+            group_id: "lib".into(),
+            time_offset: 4 * Q,
+            pitch_offset: 0,
+            begin: 4 * Q + Q / 2,
+            end: Some(6 * Q),
+            instrumental: false,
+        });
+        let library = vec![group("lib", vec![note(0, Q, 60)])];
+        let project = Project {
+            tracks: vec![track.clone()],
+            library,
+            ..Project::default()
+        };
+
+        let placed = project.placed_notes(&track).unwrap();
+        assert_eq!(placed.len(), 1);
+        assert_eq!((placed[0].start, placed[0].end), (4 * Q + Q / 2, 5 * Q));
+        assert_eq!(placed[0].window_start, 4 * Q + Q / 2);
+        assert_eq!(placed[0].window_end, Some(6 * Q));
+
+        // The main reference is unbounded and starts at zero.
+        let main = Track::new("m", group("m", vec![note(0, Q, 60)]));
+        let project = Project {
+            tracks: vec![main.clone()],
+            ..Project::default()
+        };
+        let placed = project.placed_notes(&main).unwrap();
+        assert_eq!(placed[0].window_start, 0);
+        assert_eq!(placed[0].window_end, None);
     }
 
     #[test]
