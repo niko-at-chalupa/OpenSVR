@@ -10,11 +10,11 @@ publish.workspace = true
 opensvr-core.workspace = true
 opensvr-dnni.workspace = true
 opensvr-g2p.workspace = true
+opensvr-nofs.workspace = true
 rustfft = "6"
 thiserror.workspace = true
 
 [dev-dependencies]
-opensvr-nofs.workspace = true
 
 [lints]
 workspace = true
