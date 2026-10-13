@@ -5,7 +5,9 @@ use std::{
     path::{self, Path, PathBuf},
 };
 
-use opensvr_audio::{CancelToken, RenderError, Renderer, ToneBackend, WavError, write_wav};
+use opensvr_audio::{
+    CancelToken, NeuralBackend, RenderError, Renderer, ToneBackend, WavError, write_wav,
+};
 use opensvr_core::Project;
 use opensvr_midi::MidiError;
 use opensvr_svp::SvpError;
@@ -68,12 +70,27 @@ fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
             args.rate
         );
     }
-    // Not progress output, so `--quiet` does not hide it: the result is not singing.
-    eprintln!(
-        "opensvr: note: the neural voice engine is not ported yet; notes are rendered as placeholder tones"
-    );
-
-    let audio = Renderer::new(ToneBackend::default()).render(&project, args.rate, cancel)?;
+    // Backend selection: any voice database that resolves to a real file
+    // renders the whole project through the neural voice, matching C++
+    // `ProjectRenderer`, which fails audible tracks without one ("Select a
+    // voice.nofs database before playing singing notes."). Tracks without
+    // notes render silence under either backend, so mixed projects only fail
+    // when a voiceless track actually has notes to sing. A configured but
+    // missing database counts as voiceless: the placeholder keeps those
+    // renders (and CI without proprietary data) working, warning included,
+    // while `info` flags the path as [MISSING] for diagnosis.
+    let voiced = project.tracks.iter().any(|track| {
+        track.voice.database.as_deref().is_some_and(Path::is_file)
+    });
+    let audio = if voiced {
+        Renderer::new(NeuralBackend::new()).render(&project, args.rate, cancel)?
+    } else {
+        // Not progress output, so `--quiet` does not hide it: the result is not singing.
+        eprintln!(
+            "opensvr: note: the neural voice engine is not ported yet; notes are rendered as placeholder tones"
+        );
+        Renderer::new(ToneBackend::default()).render(&project, args.rate, cancel)?
+    };
     write_wav(&args.output, &audio, args.rate, cancel)?;
     if !args.quiet {
         let seconds = audio.frames() as f64 / f64::from(args.rate);
