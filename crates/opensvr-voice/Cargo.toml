@@ -3,13 +3,14 @@ name = "opensvr-voice"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Neural singing-voice stages (port of OpenSV synthesis/PhonemeTiming, FeatureNormalizer)"
+description = "Neural singing-voice stages (port of OpenSV synthesis/PhonemeTiming, FeatureNormalizer, Pitch, Acoustic, NeuralVocoder)"
 publish.workspace = true
 
 [dependencies]
 opensvr-core.workspace = true
 opensvr-dnni.workspace = true
 opensvr-g2p.workspace = true
+rustfft = "6"
 thiserror.workspace = true
 
 [dev-dependencies]
