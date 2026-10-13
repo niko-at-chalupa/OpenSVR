@@ -57,6 +57,8 @@ mod tests {
             seconds_per_quarter: 0.5,
             lyrics: "la",
             phonemes: "",
+            window_start: 0.0,
+            window_end: None,
         }
     }
 

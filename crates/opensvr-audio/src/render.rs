@@ -143,10 +143,23 @@ impl<B: VoiceBackend> Renderer<B> {
                         BackendError("the voice backend returned a non-finite sample".into());
                     return Err(backend_error(error));
                 }
+                // Per-phrase group-window crop, exactly as in C++: the front
+                // note's `absoluteBegin` bounds the mixed output on the left
+                // (model-input context is kept), the back note's `absoluteEnd`
+                // clamps the release tail on the right.
+                let (Some(first), Some(last)) = (phrase.notes.first(), phrase.notes.last()) else {
+                    continue;
+                };
+                let release_end = last.end + REST_CONTEXT_SECONDS;
+                let stop = last
+                    .window_end
+                    .map_or(release_end, |end| release_end.min(end));
                 mix(
                     &mut output,
                     &audio.samples,
                     audio.start,
+                    first.window_start,
+                    stop,
                     sample_rate,
                     &track.mixer,
                     cancel,
@@ -179,6 +192,8 @@ fn timed_notes<'a>(project: &Project, placed: &[PlacedNote<'a>]) -> Vec<TimedNot
             seconds_per_quarter: 60.0 / project.tempo_map.tempo_at(placed.start),
             lyrics: &placed.note.lyrics,
             phonemes: &placed.note.phonemes,
+            window_start: seconds(placed.window_start),
+            window_end: placed.window_end.map(seconds),
         })
         .collect()
 }
@@ -187,26 +202,35 @@ fn timed_notes<'a>(project: &Project, placed: &[PlacedNote<'a>]) -> Vec<TimedNot
 ///
 /// Neural phrases start before zero when the leading context precedes the
 /// project start; like C++ `mixPhrase`, whatever falls before zero is dropped
-/// rather than shifting the timeline.
+/// rather than shifting the timeline. The mixed output is additionally cropped
+/// to the phrase's group window (`crop_start_seconds`/`stop_seconds`, from the
+/// front/back notes' references): model-input context is kept, only the
+/// placed audio is cut, after resampling into project sample coordinates.
+#[allow(clippy::too_many_arguments)]
 fn mix(
     output: &mut StereoBuffer,
     samples: &[f32],
     start_seconds: f64,
+    crop_start_seconds: f64,
+    stop_seconds: f64,
     sample_rate: u32,
     mixer: &Mixer,
     cancel: &CancelToken,
 ) -> Result<(), RenderError> {
-    let phrase_offset = (start_seconds * f64::from(sample_rate)).round() as i64;
-    let offset = phrase_offset.max(0) as usize;
+    let rate = f64::from(sample_rate);
+    let phrase_offset = (start_seconds * rate).round() as i64;
+    let crop_offset = (crop_start_seconds * rate).ceil() as i64;
+    let offset = phrase_offset.max(0).max(crop_offset) as usize;
+    let stop = ((stop_seconds * rate).ceil().max(0.0) as usize).min(output.frames());
     let skipped = if phrase_offset < 0 {
-        phrase_offset.unsigned_abs() as usize
+        offset + phrase_offset.unsigned_abs() as usize
     } else {
-        0
+        offset - phrase_offset as usize
     };
     let Some(source) = samples.get(skipped..) else {
         return Ok(());
     };
-    let count = source.len().min(output.frames().saturating_sub(offset));
+    let count = source.len().min(stop.saturating_sub(offset));
     if count == 0 {
         return Ok(());
     }
@@ -239,6 +263,105 @@ mod tests {
 
     use super::*;
     use crate::{Phrase, PhraseAudio};
+
+    /// Emits 1.0 across the whole model-input span (leading context through
+    /// the release tail), like `NeuralBackend`, so group-window cropping is
+    /// observable: a backend that only sings note bodies would leave digital
+    /// silence in exactly the cropped regions.
+    #[derive(Default)]
+    struct FullSpan;
+
+    impl VoiceBackend for FullSpan {
+        fn render_phrase(
+            &mut self,
+            _: &VoiceSettings,
+            phrase: &Phrase<'_>,
+            rate: u32,
+            _: &CancelToken,
+        ) -> Result<PhraseAudio, BackendError> {
+            let first = phrase.notes.first().unwrap();
+            let last = phrase.notes.last().unwrap();
+            let start = first.start - REST_CONTEXT_SECONDS;
+            let frames =
+                ((last.end + REST_CONTEXT_SECONDS - start) * f64::from(rate)).round() as usize;
+            Ok(PhraseAudio {
+                start,
+                samples: vec![1.0; frames],
+                sample_rate: rate,
+            })
+        }
+    }
+
+    /// A track whose only singing note comes from a windowed library reference.
+    fn windowed_track(
+        name: &str,
+        onset: Blick,
+        time_offset: Blick,
+        begin: Blick,
+        end: Option<Blick>,
+    ) -> (Track, NoteGroup) {
+        let library = NoteGroup {
+            id: format!("{name}-lib"),
+            name: name.into(),
+            notes: vec![Note {
+                onset,
+                duration: Q,
+                pitch: 60,
+                lyrics: "la".into(),
+                phonemes: String::new(),
+                detune: 0.0,
+            }],
+        };
+        let mut track = Track::new(
+            name,
+            NoteGroup {
+                id: format!("{name}-main"),
+                name: name.into(),
+                notes: Vec::new(),
+            },
+        );
+        track.groups.push(GroupReference {
+            group_id: library.id.clone(),
+            time_offset,
+            pitch_offset: 0,
+            begin,
+            end,
+            instrumental: false,
+        });
+        (track, library)
+    }
+
+    #[test]
+    fn group_windows_crop_the_release_tail_and_leading_context() {
+        // At 120 BPM one quarter is 0.5 s. The lead note (0.0..0.5 s) sits in
+        // a window ending mid-project at 0.5 s; the tail note (1.0..1.5 s)
+        // sits in a window beginning at 1.0 s and sets the project end.
+        let (lead, lead_lib) = windowed_track("lead", 0, 0, 0, Some(Q));
+        let (tail, tail_lib) = windowed_track("tail", 0, 2 * Q, 2 * Q, None);
+        let project = Project {
+            tracks: vec![lead, tail],
+            library: vec![lead_lib, tail_lib],
+            ..Project::default()
+        };
+        let mut renderer = Renderer::new(FullSpan);
+        let audio = renderer
+            .render(&project, 8000, &CancelToken::new())
+            .unwrap();
+        assert_eq!(audio.frames(), 12_800);
+
+        // The lead release tail (0.5..0.6 s) stops at the window edge.
+        assert!(audio.left[3999] > 0.0);
+        assert_eq!(audio.left[4000], 0.0);
+        assert_eq!(audio.left[4799], 0.0);
+        // The tail leading context (0.9..1.0 s) stops at the window begin.
+        assert_eq!(audio.left[7200], 0.0);
+        assert_eq!(audio.left[7999], 0.0);
+        assert!(audio.left[8000] > 0.0);
+        // The unbounded tail still rings to the project end.
+        assert!(audio.left[11_999] > 0.0);
+        assert!(audio.left[12_000] > 0.0);
+        assert!(audio.left[12_799] > 0.0);
+    }
 
     /// Fills each phrase with 1.0 and records where phrases start.
     #[derive(Default)]

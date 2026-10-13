@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 
 use opensvr_audio::{CancelToken, NeuralBackend, Renderer, StereoBuffer};
+use opensvr_core::{Blick, GroupReference, NoteGroup, Project, Track};
 
 /// Project rate for the resampling test: the voice renders natively at 48 kHz.
 const SAMPLE_RATE: u32 = 8000;
@@ -178,4 +179,99 @@ fn neural_backend_matches_the_cpp_reference_excerpts() {
     }
     check_excerpt("neural-basic-48k-ref.txt", NATIVE_TOLERANCE);
     check_excerpt("neural-basic-8k-ref.txt", RESAMPLED_TOLERANCE);
+}
+
+/// Rehosts `source`'s main-group notes behind a library reference with the
+/// given right window edge (`None` means unbounded); the track's own main
+/// group is left empty so only the windowed notes sing.
+fn windowed(basic: &Project, source: &Track, end: Option<Blick>) -> Project {
+    let mut project = basic.clone();
+    project.tracks.clear();
+    project.library.push(NoteGroup {
+        id: "windowed-lib".to_owned(),
+        name: "windowed".to_owned(),
+        notes: source.main_group.notes.clone(),
+    });
+    let mut track = Track::new(
+        "lead",
+        NoteGroup {
+            id: "empty-main".to_owned(),
+            name: String::new(),
+            notes: Vec::new(),
+        },
+    );
+    track.mixer = source.mixer.clone();
+    track.voice = source.voice.clone();
+    track.groups.push(GroupReference {
+        group_id: "windowed-lib".to_owned(),
+        time_offset: 0,
+        pitch_offset: 0,
+        begin: 0,
+        end,
+        instrumental: false,
+    });
+    project.tracks.push(track);
+    project
+}
+
+/// A group reference ending mid-project rings no release tail past its edge.
+///
+/// The `neural-basic` score (1.5 s, explicit phonemes throughout) is moved
+/// behind a library reference whose window ends exactly at the last note
+/// end. The sung notes are untouched; only the 0.1 s release tail (1.5..1.6 s)
+/// must go silent. An unbounded control render proves the tail is
+/// voice-audible, so the exact-zero assertion is sensitive.
+#[test]
+fn group_windows_crop_the_neural_release_tail() {
+    let Some(voice) = voice_path() else {
+        return;
+    };
+    let svp = golden_dir().join("neural-basic.svp");
+    let basic = opensvr_svp::load(&svp).expect("basic SVP must parse");
+    assert_eq!(basic.tracks.len(), 1);
+    let source = basic.tracks[0].clone();
+    let score_end: Blick = source
+        .main_group
+        .notes
+        .iter()
+        .map(|note| note.onset + note.duration)
+        .max()
+        .expect("basic SVP has notes");
+
+    let tail_start = (1.5 * f64::from(SAMPLE_RATE)) as usize;
+    let cancel = CancelToken::new();
+    let mut renderer = Renderer::new(NeuralBackend::new());
+
+    // Control: without a window the voice emits audible tail audio, so the
+    // cropped render's exact zeros below are a sensitive assertion.
+    let mut open = windowed(&basic, &source, None);
+    open.tracks[0].voice.database = Some(voice.clone());
+    let open = renderer
+        .render(&open, SAMPLE_RATE, &cancel)
+        .expect("unbounded neural render must succeed");
+    assert_eq!(open.frames(), tail_start + 800);
+    let open_tail_max = open.left[tail_start..]
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    assert!(
+        open_tail_max > 0.0,
+        "the unbounded release tail must be voice-audible, got {open_tail_max}"
+    );
+
+    let mut shut = windowed(&basic, &source, Some(score_end));
+    shut.tracks[0].voice.database = Some(voice.clone());
+    let shut = renderer
+        .render(&shut, SAMPLE_RATE, &cancel)
+        .expect("windowed neural render must succeed");
+    assert_eq!(shut.frames(), open.frames());
+    assert!(
+        shut.left[tail_start..].iter().all(|sample| *sample == 0.0),
+        "no release tail may ring past the group edge"
+    );
+    // The window only crops the tail: the sung phrase still sings.
+    let peak: f32 = shut
+        .left
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    assert!(peak > 0.05, "peak {peak}: the phrase must sing audibly");
 }
