@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use opensvr_audio::{CancelToken, NeuralBackend, Renderer, StereoBuffer};
-use opensvr_core::{Blick, GroupReference, NoteGroup, Project, Track};
+use opensvr_core::{BLICKS_PER_QUARTER, Blick, GroupReference, NoteGroup, Project, Track};
 
 /// Project rate for the resampling test: the voice renders natively at 48 kHz.
 const SAMPLE_RATE: u32 = 8000;
@@ -179,6 +179,91 @@ fn neural_backend_matches_the_cpp_reference_excerpts() {
     }
     check_excerpt("neural-basic-48k-ref.txt", NATIVE_TOLERANCE);
     check_excerpt("neural-basic-8k-ref.txt", RESAMPLED_TOLERANCE);
+}
+
+/// A two-phrase project loads each file once and matches a fresh render.
+///
+/// The `neural-basic` notes (explicit phonemes throughout, so no dictionary)
+/// sing twice, 2 s apart: the gap splits two phrases with identical synthesis
+/// inputs. One backend sings both phrases plus a full re-render; a second,
+/// fresh backend re-sings from scratch. All three outputs must be bitwise
+/// identical, with exactly one voice load across the shared backend's renders.
+#[test]
+fn repeated_phrases_load_once_and_match_fresh_renders() {
+    let Some(voice) = voice_path() else {
+        return;
+    };
+    let basic =
+        opensvr_svp::load(&golden_dir().join("neural-basic.svp")).expect("basic SVP must parse");
+    assert_eq!(basic.tracks.len(), 1);
+    let source = basic.tracks[0].clone();
+
+    let mut notes = source.main_group.notes.clone();
+    notes.extend(source.main_group.notes.iter().map(|note| {
+        let mut shifted = note.clone();
+        shifted.onset += 4 * BLICKS_PER_QUARTER;
+        shifted
+    }));
+    let mut project = basic.clone();
+    project.tracks.clear();
+    let mut track = Track::new(
+        "lead",
+        NoteGroup {
+            id: "two-phrase-main".to_owned(),
+            name: String::new(),
+            notes,
+        },
+    );
+    track.mixer = source.mixer.clone();
+    track.voice = source.voice.clone();
+    track.voice.database = Some(voice);
+    project.tracks.push(track);
+
+    let cancel = CancelToken::new();
+    let mut cached = Renderer::new(NeuralBackend::new());
+    let first = cached
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("cached render must succeed");
+    assert_eq!(
+        cached.backend().voice_loads(),
+        1,
+        "one render loads the voice once"
+    );
+    assert_eq!(cached.backend().dictionary_loads(), 0);
+    assert_eq!(
+        cached.backend().phrase_hits() + cached.backend().phrase_misses(),
+        2,
+        "two phrases synthesize or hit"
+    );
+
+    let (hits_before, misses_before) = (
+        cached.backend().phrase_hits(),
+        cached.backend().phrase_misses(),
+    );
+    let second = cached
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("re-render must succeed");
+    assert_eq!(first, second, "re-renders must be bitwise identical");
+    assert_eq!(
+        cached.backend().voice_loads(),
+        1,
+        "re-renders must not reload the voice"
+    );
+    assert_eq!(
+        cached.backend().phrase_hits(),
+        hits_before + 2,
+        "both re-rendered phrases must hit"
+    );
+    assert_eq!(
+        cached.backend().phrase_misses(),
+        misses_before,
+        "re-renders must not re-synthesize"
+    );
+
+    let fresh = Renderer::new(NeuralBackend::new())
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("fresh render must succeed");
+    assert_eq!(first, fresh, "cached renders must match fresh renders");
 }
 
 /// Rehosts `source`'s main-group notes behind a library reference with the
