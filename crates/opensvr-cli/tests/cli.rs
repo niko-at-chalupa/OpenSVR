@@ -7,6 +7,8 @@ use std::{
 };
 
 const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/two-tracks.svp");
+const NEURAL_BASIC: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/audio/neural-basic.svp");
 
 fn opensvr(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_opensvr"))
@@ -67,6 +69,63 @@ fn render_writes_a_wav_file() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Rendering") && stderr.contains("placeholder tones"));
+}
+
+#[test]
+fn render_sings_when_a_voice_is_configured() {
+    let Some(voice) = std::env::var("OPENSVR_TEST_VOICE").ok() else {
+        return;
+    };
+    let path = scratch("neural.wav");
+    let output = opensvr(&[
+        "render",
+        NEURAL_BASIC,
+        "-o",
+        path.to_str().unwrap(),
+        "--rate",
+        "8000",
+        "--voice",
+        &voice,
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("placeholder tones"),
+        "a voiced render must not print the placeholder warning: {stderr}"
+    );
+
+    // Every note carries explicit phonemes, so no --dict is needed. Windows
+    // mirror the audio-crate gated test at 8 kHz: the voiced "k a" region at
+    // 0.1..0.3 s must dominate the "sil" note at 1.05..1.15 s.
+    let mut reader = hound::WavReader::open(&path).unwrap();
+    let samples: Vec<f32> = reader
+        .samples::<i32>()
+        .map(|sample| sample.unwrap() as f32 / 8_388_607.0)
+        .collect();
+    let left: Vec<f32> = samples.iter().step_by(2).copied().collect();
+    assert!(
+        (left.len() as f64 - 12_800.0).abs() <= 2.0,
+        "frames: got {}, want ~12800",
+        left.len()
+    );
+    let mean_abs = |window: &[f32]| -> f64 {
+        window.iter().map(|sample| f64::from(sample.abs())).sum::<f64>()
+            / window.len().max(1) as f64
+    };
+    let voiced = mean_abs(&left[800..2400]);
+    let silence = mean_abs(&left[8400..9200]);
+    let peak = left.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    assert!(peak > 0.05, "peak {peak}: the phrase must sing audibly");
+    assert!(
+        voiced > 10.0 * silence,
+        "voiced {voiced} vs silence {silence}: vowels must dominate the rest note"
+    );
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
