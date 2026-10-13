@@ -294,6 +294,7 @@ dependencies = [
  "hound",
  "opensvr-core",
  "opensvr-g2p",
+ "opensvr-svp",
  "opensvr-voice",
  "rubato",
  "thiserror",

@@ -14,5 +14,8 @@ hound.workspace = true
 rubato = "4"
 thiserror.workspace = true
 
+[dev-dependencies]
+opensvr-svp.workspace = true
+
 [lints]
 workspace = true
