@@ -4,7 +4,8 @@
 //! `src/synthesis/FeatureNormalizer.*`, `src/synthesis/Pitch*.{h,cpp}`,
 //! `src/synthesis/Acoustic*.{h,cpp}` and `src/synthesis/{NeuralVocoder,
 //! VocoderFilterBank,VocoderResidual,VocoderSpectralHeads,
-//! PeriodicExcitation,LipRadiation}.{h,cpp}` (namespace `sv::synthesis`).
+//! PeriodicExcitation,LipRadiation}.{h,cpp}` (namespace `sv::synthesis`),
+//! plus the `VoiceSynthesizer` orchestrator and `SynthesisStatistics` counters.
 //! Timing turns [`TimingSyllable`]s
 //! (re-exported from [`opensvr_g2p`], where the
 //! types already live) into per-phoneme durations in seconds, then quantizes
@@ -12,11 +13,12 @@
 //! automatic per-frame F0 curve from score [`PitchNote`]s plus phoneme
 //! durations; the acoustic stage predicts vocoder-ready frames from timed
 //! phonemes plus the log-F0 curve; the vocoder stage renders waveform
-//! samples from the acoustic frames.
+//! samples from the acoustic frames; the synthesizer loads all four stages
+//! from a NOFS voice and wires `predict` / `predict_pitch` / `render`.
 //!
 //! Error strings reproduce the C++ `juce::Result` failure text verbatim so
 //! golden tests can compare messages. Dependency direction follows the
-//! workspace rule (`core` <- `dnni`/`g2p` <- `voice`): this crate never
+//! workspace rule (`core` <- `nofs`/`dnni`/`g2p` <- `voice`): this crate never
 //! touches `opensvr-audio` or the CLI.
 
 mod acoustic_features;
@@ -35,6 +37,8 @@ mod pitch_model;
 mod pitch_postprocess;
 mod residual;
 mod spectral_heads;
+mod statistics;
+mod synthesizer;
 mod timing;
 mod vocoder;
 
@@ -60,11 +64,16 @@ pub use pitch_model::{PitchModel, PitchModelState};
 pub use pitch_postprocess::{PitchFrameInterval, apply_pitch_postprocess};
 pub use residual::{VocoderResidual, VocoderResidualState};
 pub use spectral_heads::{VocoderSpectralHeads, VocoderSpectralHeadsState};
+pub use statistics::SynthesisStatistics;
+pub use synthesizer::{
+    DEFAULT_RENDER_SEED, PITCH_CONTEXT_SECONDS, VoiceSynthesizer, VoiceSynthesizerState,
+};
 pub use timing::{PhonemeTiming, TimedPhoneme, quantize_phoneme_durations};
 pub use vocoder::{NeuralVocoder, NeuralVocoderOutput, NeuralVocoderState};
 
 use opensvr_dnni::DnniError;
 use opensvr_g2p::G2pError;
+use opensvr_nofs::{NofsError, VoiceConfigError};
 use thiserror::Error;
 
 /// Errors raised while loading or running the voice stages.
@@ -81,6 +90,10 @@ pub enum VoiceError {
     Dnni(#[from] DnniError),
     #[error(transparent)]
     G2p(#[from] G2pError),
+    #[error(transparent)]
+    Nofs(#[from] NofsError),
+    #[error(transparent)]
+    VoiceConfig(#[from] VoiceConfigError),
 }
 
 pub(crate) type Result<T> = std::result::Result<T, VoiceError>;
