@@ -1,0 +1,181 @@
+//! Gated end-to-end test for [`NeuralBackend`](opensvr_audio::NeuralBackend):
+//! first sung output through the real phrase path on a real voice.
+//!
+//! Set `OPENSVR_TEST_VOICE` to a voice archive (e.g. the GUMI AI voice) to
+//! run; the test returns early when unset so CI stays green without
+//! proprietary data. The SVP input and the C++ reference excerpts are
+//! committed under `tests/golden/audio/`; the voice blob itself never is.
+//!
+//! Reference provenance: the excerpts are the first 3000 left-channel
+//! samples of `opensv-cli` renders of `neural-basic.svp` from a clean
+//! engine build (rendered channels are bitwise identical, so one channel
+//! suffices). The 48 kHz native-rate excerpt pins the whole synthesis chain
+//! at tight tolerance; the 8 kHz excerpt covers the resampler at the
+//! tolerance its measured divergence requires (the `rubato` sinc kernel
+//! audibly differs from the C++ `WindowedSincInterpolator`, while every
+//! upstream stage agrees to ~1e-6).
+
+use std::path::PathBuf;
+
+use opensvr_audio::{CancelToken, NeuralBackend, Renderer, StereoBuffer};
+
+/// Project rate for the resampling test: the voice renders natively at 48 kHz.
+const SAMPLE_RATE: u32 = 8000;
+/// Score length of `neural-basic.svp` (1.5 s) plus the 0.1 s rest context.
+const EXPECTED_FRAMES: f64 = 12_800.0;
+/// Measured 8 kHz divergence (max 0.081) plus margin: resampler kernels differ.
+const RESAMPLED_TOLERANCE: f32 = 0.12;
+/// Measured 48 kHz divergence (max 3.5e-7) plus wide margin: chain agrees.
+const NATIVE_TOLERANCE: f32 = 1e-5;
+
+fn voice_path() -> Option<PathBuf> {
+    std::env::var("OPENSVR_TEST_VOICE").ok().map(PathBuf::from)
+}
+
+fn golden_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/audio")
+}
+
+fn mean_abs(samples: &[f32]) -> f64 {
+    samples.iter().map(|sample| f64::from(sample.abs())).sum::<f64>()
+        / samples.len().max(1) as f64
+}
+
+fn render_basic(rate: u32) -> StereoBuffer {
+    let voice = voice_path().expect("voice must be set");
+    let mut project =
+        opensvr_svp::load(&golden_dir().join("neural-basic.svp")).expect("basic SVP must parse");
+    for track in &mut project.tracks {
+        // Every note carries explicit phonemes, so no dictionary is needed.
+        track.voice.database = Some(voice.clone());
+    }
+    Renderer::new(NeuralBackend::new())
+        .render(&project, rate, &CancelToken::new())
+        .expect("neural render must succeed")
+}
+
+struct Excerpt {
+    rate: u32,
+    frames: usize,
+    samples: Vec<f32>,
+}
+
+fn load_excerpt(name: &str) -> Excerpt {
+    let path: PathBuf = golden_dir().join(name);
+    let text = std::fs::read_to_string(&path).expect("excerpt must read");
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let rate = lines
+        .next()
+        .expect("rate header")
+        .strip_prefix("rate ")
+        .expect("rate header")
+        .parse()
+        .expect("rate int");
+    let frames = lines
+        .next()
+        .expect("frames header")
+        .strip_prefix("frames ")
+        .expect("frames header")
+        .parse()
+        .expect("frames int");
+    let count: usize = lines
+        .next()
+        .expect("excerpt header")
+        .strip_prefix("excerpt ")
+        .expect("excerpt header")
+        .parse()
+        .expect("excerpt int");
+    let samples: Vec<f32> = lines
+        .take(count)
+        .map(|line| line.parse().expect("sample float"))
+        .collect();
+    assert_eq!(samples.len(), count, "{}: excerpt truncated", path.display());
+    Excerpt {
+        rate,
+        frames,
+        samples,
+    }
+}
+
+fn check_excerpt(name: &str, tolerance: f32) {
+    let excerpt = load_excerpt(name);
+    let audio = render_basic(excerpt.rate);
+    assert_eq!(
+        audio.frames(),
+        excerpt.frames,
+        "{name}: frame geometry must match"
+    );
+    let rendered = &audio.left[..excerpt.samples.len()];
+    let (worst, max) = rendered
+        .iter()
+        .zip(&excerpt.samples)
+        .enumerate()
+        .map(|(index, (&got, &want))| (index, (got - want).abs()))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("excerpt nonempty");
+    assert!(
+        max <= tolerance,
+        "{name}: frame {worst} differs {max} beyond {tolerance}"
+    );
+}
+
+#[test]
+fn neural_backend_sings_the_basic_phrase_deterministically() {
+    let Some(voice) = voice_path() else {
+        return;
+    };
+    let svp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/audio/neural-basic.svp");
+    let mut project = opensvr_svp::load(&svp).expect("basic SVP must parse");
+    assert_eq!(project.tracks.len(), 1);
+    for track in &mut project.tracks {
+        // Every note carries explicit phonemes, so no dictionary is needed.
+        track.voice.database = Some(voice.clone());
+    }
+
+    let cancel = CancelToken::new();
+    let mut renderer = Renderer::new(NeuralBackend::new());
+    let first = renderer
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("neural render must succeed");
+
+    // Timeline: 1.5 s of score plus 0.1 s of rest context, up to float dust.
+    assert!(
+        (first.frames() as f64 - EXPECTED_FRAMES).abs() <= 2.0,
+        "frames: got {}, want ~{EXPECTED_FRAMES}",
+        first.frames()
+    );
+    assert!(first.left.iter().all(|sample| sample.is_finite()));
+    assert!(first.right.iter().all(|sample| sample.is_finite()));
+
+    // Sung, not silent: the voiced "k a" region carries far more energy
+    // than the "sil" note at 1.0..1.2 s (measured on GUMI AI).
+    let voiced = mean_abs(&first.left[800..2400]);
+    let silence = mean_abs(&first.left[8400..9200]);
+    let peak: f32 = first
+        .left
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    assert!(peak > 0.05, "peak {peak}: the phrase must sing audibly");
+    assert!(
+        voiced > 10.0 * silence,
+        "voiced {voiced} vs silence {silence}: vowels must dominate the rest note"
+    );
+
+    // Deterministic: same seed, same summation order, same output bits.
+    let second = renderer
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("neural re-render must succeed");
+    assert_eq!(first, second, "re-renders must be bitwise identical");
+}
+
+#[test]
+fn neural_backend_matches_the_cpp_reference_excerpts() {
+    if voice_path().is_none() {
+        return;
+    }
+    check_excerpt("neural-basic-48k-ref.txt", NATIVE_TOLERANCE);
+    check_excerpt("neural-basic-8k-ref.txt", RESAMPLED_TOLERANCE);
+}

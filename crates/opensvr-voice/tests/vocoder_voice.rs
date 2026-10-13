@@ -25,7 +25,7 @@ use opensvr_dnni::DnniReader;
 use opensvr_nofs::{VoiceConfiguration, VoiceDatabase};
 use opensvr_voice::{
     AcousticModel, NeuralVocoder, NeuralVocoderState, PhonemeDuration, PhonemeTiming, PitchModel,
-    PitchNote, TimedPhoneme,
+    PitchNote, TimedPhoneme, midi_to_log_f0,
 };
 
 /// Relative tolerance for durations, pitch, acoustic frames and samples.
@@ -210,12 +210,6 @@ fn check_close(got: f64, want: f64, what: &str) {
         (got - want).abs() <= allowed,
         "{what}: got {got}, want {want}"
     );
-}
-
-/// Absolute MIDI pitch to natural-log Hz, exactly as `buildPitch` computes it
-/// (`log(440) + (pitch - 69) * ln2 / 12` in double, narrowed once).
-fn midi_to_log_f0(midi: f32) -> f32 {
-    (440.0_f64.ln() + (f64::from(midi) - 69.0) * std::f64::consts::LN_2 / 12.0) as f32
 }
 
 #[test]

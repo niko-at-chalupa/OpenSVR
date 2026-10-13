@@ -8,8 +8,14 @@ publish.workspace = true
 
 [dependencies]
 opensvr-core.workspace = true
+opensvr-g2p.workspace = true
+opensvr-voice.workspace = true
 hound.workspace = true
+rubato = "4"
 thiserror.workspace = true
+
+[dev-dependencies]
+opensvr-svp.workspace = true
 
 [lints]
 workspace = true

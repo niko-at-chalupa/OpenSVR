@@ -55,7 +55,7 @@ pub use normalizer::FeatureNormalizer;
 pub use opensvr_g2p::{PhonemeDuration, TimingSyllable};
 pub use pitch_context::{PitchContext, PitchContextState};
 pub use pitch_curve::{
-    PitchCurveNote, render_automatic_pitch_mask, render_pitch_prediction_base,
+    PitchCurveNote, midi_to_log_f0, render_automatic_pitch_mask, render_pitch_prediction_base,
     render_pitch_transitions, render_pitch_vibrato,
 };
 pub use pitch_decoder::{PitchDecoder, PitchDecoderNotes};

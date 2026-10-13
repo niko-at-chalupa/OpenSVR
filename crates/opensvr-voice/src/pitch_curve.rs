@@ -345,6 +345,12 @@ fn render_pitch_base(
     result
 }
 
+/// Absolute MIDI pitch to natural-log Hz, exactly as `buildPitch` computes it
+/// (`log(440) + (pitch - 69) * ln2 / 12` in double, narrowed once).
+pub fn midi_to_log_f0(midi: f32) -> f32 {
+    (440.0_f64.ln() + (f64::from(midi) - 69.0) * std::f64::consts::LN_2 / 12.0) as f32
+}
+
 /// Renders analytical portamento transitions with Gaussian overshoot dynamics.
 ///
 /// Evaluates sigmoid transitions between adjacent notes/rests plus swing
