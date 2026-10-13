@@ -1,9 +1,9 @@
 use std::f64::consts::TAU;
 
-use opensvr_core::VoiceSettings;
+use opensvr_core::{CancelToken, VoiceSettings};
 use thiserror::Error;
 
-use crate::REST_CONTEXT_SECONDS;
+use crate::{Phrase, REST_CONTEXT_SECONDS};
 
 /// A note on the absolute timeline, in seconds, ready to be sung.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -13,9 +13,23 @@ pub struct TimedNote<'a> {
     /// MIDI note number after transposition.
     pub pitch: u8,
     pub detune_cents: f64,
+    /// Length of one quarter note at the note start, for pitch-curve timing.
+    pub seconds_per_quarter: f64,
     pub lyrics: &'a str,
     /// Explicit phoneme override; empty when the lyrics should be looked up.
     pub phonemes: &'a str,
+}
+
+/// Mono audio rendered for one phrase.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhraseAudio {
+    /// Absolute start time of `samples[0]` in seconds. Neural backends need
+    /// leading context for onset consonants, so this precedes the first note;
+    /// the renderer drops whatever falls before zero.
+    pub start: f64,
+    /// Mono samples at [`sample_rate`][Self::sample_rate].
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
 }
 
 /// A voice backend failed to produce audio.
@@ -25,17 +39,18 @@ pub struct BackendError(pub String);
 
 /// Something that can sing: the seam where OpenSV's neural synthesis plugs in.
 pub trait VoiceBackend {
-    /// Synthesizes one phrase of non-overlapping, time-ordered `notes` as mono audio.
+    /// Synthesizes one `phrase` of non-overlapping, time-ordered notes as mono audio.
     ///
-    /// The returned samples are at `sample_rate` and begin at `notes[0].start`.
-    /// They should run [`REST_CONTEXT_SECONDS`] past the end of the last note so
-    /// the release is not cut off; the renderer crops anything beyond the project end.
+    /// The returned samples run [`REST_CONTEXT_SECONDS`] past the end of the last
+    /// note so the release is not cut off; the renderer crops anything beyond the
+    /// project end.
     fn render_phrase(
         &mut self,
         voice: &VoiceSettings,
-        notes: &[TimedNote<'_>],
+        phrase: &Phrase<'_>,
         sample_rate: u32,
-    ) -> Result<Vec<f32>, BackendError>;
+        cancel: &CancelToken,
+    ) -> Result<PhraseAudio, BackendError>;
 }
 
 /// Placeholder backend that plays each note as a sine tone and ignores lyrics and voice.
@@ -59,17 +74,22 @@ impl VoiceBackend for ToneBackend {
     fn render_phrase(
         &mut self,
         _voice: &VoiceSettings,
-        notes: &[TimedNote<'_>],
+        phrase: &Phrase<'_>,
         sample_rate: u32,
-    ) -> Result<Vec<f32>, BackendError> {
-        let (Some(first), Some(last)) = (notes.first(), notes.last()) else {
-            return Ok(Vec::new());
+        _cancel: &CancelToken,
+    ) -> Result<PhraseAudio, BackendError> {
+        let (Some(first), Some(last)) = (phrase.notes.first(), phrase.notes.last()) else {
+            return Ok(PhraseAudio {
+                start: 0.0,
+                samples: Vec::new(),
+                sample_rate,
+            });
         };
         let rate = f64::from(sample_rate);
         let length = ((last.end + REST_CONTEXT_SECONDS - first.start) * rate).round() as usize;
         let mut samples = vec![0.0_f32; length];
 
-        for note in notes {
+        for note in phrase.notes {
             let offset = ((note.start - first.start) * rate).round() as usize;
             let count = ((note.end - note.start) * rate).round() as usize;
             let fade = ((Self::FADE_SECONDS * rate) as usize).clamp(1, (count / 2).max(1));
@@ -83,7 +103,11 @@ impl VoiceBackend for ToneBackend {
                 *sample += self.amplitude * envelope * (step * index as f64).sin() as f32;
             }
         }
-        Ok(samples)
+        Ok(PhraseAudio {
+            start: first.start,
+            samples,
+            sample_rate,
+        })
     }
 }
 
@@ -97,18 +121,29 @@ mod tests {
             end,
             pitch,
             detune_cents: 0.0,
+            seconds_per_quarter: 0.5,
             lyrics: "la",
             phonemes: "",
         }
     }
 
+    fn render(notes: &[TimedNote<'_>], rate: u32) -> PhraseAudio {
+        ToneBackend::default()
+            .render_phrase(
+                &VoiceSettings::default(),
+                &Phrase { notes },
+                rate,
+                &CancelToken::new(),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn a4_completes_440_cycles_per_second() {
-        let samples = ToneBackend::default()
-            .render_phrase(&VoiceSettings::default(), &[note(0.0, 1.0, 69)], 44_100)
-            .unwrap();
-        assert_eq!(samples.len(), 48_510, "one second plus the release context");
-        let rising = samples[..44_100]
+        let audio = render(&[note(0.0, 1.0, 69)], 44_100);
+        assert_eq!(audio.start, 0.0);
+        assert_eq!(audio.samples.len(), 48_510, "one second plus the release context");
+        let rising = audio.samples[..44_100]
             .windows(2)
             .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
             .count();
@@ -116,26 +151,23 @@ mod tests {
             (439..=441).contains(&rising),
             "{rising} rising zero crossings"
         );
-        assert!(samples.iter().all(|s| s.abs() <= 0.25));
+        assert!(audio.samples.iter().all(|s| s.abs() <= 0.25));
     }
 
     #[test]
     fn notes_are_placed_relative_to_the_phrase_start() {
         let notes = [note(2.0, 2.1, 60), note(2.5, 2.6, 62)];
-        let samples = ToneBackend::default()
-            .render_phrase(&VoiceSettings::default(), &notes, 1000)
-            .unwrap();
-        assert_eq!(samples.len(), 700);
+        let audio = render(&notes, 1000);
+        assert_eq!(audio.start, 2.0);
+        assert_eq!(audio.samples.len(), 700);
         assert!(
-            samples[200..400].iter().all(|&s| s == 0.0),
+            audio.samples[200..400].iter().all(|&s| s == 0.0),
             "the rest between notes is silent"
         );
-        assert!(samples[500..600].iter().any(|&s| s != 0.0));
+        assert!(audio.samples[500..600].iter().any(|&s| s != 0.0));
         assert!(
-            ToneBackend::default()
-                .render_phrase(&VoiceSettings::default(), &[], 1000)
-                .unwrap()
-                .is_empty()
+            render(&[], 1000).samples.is_empty(),
+            "an empty phrase renders no audio"
         );
     }
 }

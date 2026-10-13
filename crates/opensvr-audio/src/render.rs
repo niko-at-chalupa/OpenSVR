@@ -3,7 +3,7 @@ use std::f64::consts::FRAC_PI_4;
 use opensvr_core::{Blick, Mixer, PlacedNote, Project, ProjectError};
 use thiserror::Error;
 
-use crate::{BackendError, CancelToken, TimedNote, VoiceBackend};
+use crate::{BackendError, CancelToken, TimedNote, VoiceBackend, split_phrases};
 
 pub const MIN_SAMPLE_RATE: u32 = 8_000;
 pub const MAX_SAMPLE_RATE: u32 = 384_000;
@@ -133,22 +133,31 @@ impl<B: VoiceBackend> Renderer<B> {
                 track: track.name.clone(),
                 source,
             };
-            let samples = self
-                .backend
-                .render_phrase(&track.voice, &notes, sample_rate)
-                .map_err(backend_error)?;
-            if samples.iter().any(|sample| !sample.is_finite()) {
-                let error = BackendError("the voice backend returned a non-finite sample".into());
-                return Err(backend_error(error));
+            for phrase in split_phrases(&notes) {
+                let audio = self
+                    .backend
+                    .render_phrase(&track.voice, &phrase, sample_rate, cancel)
+                    .map_err(backend_error)?;
+                if audio.samples.iter().any(|sample| !sample.is_finite()) {
+                    let error =
+                        BackendError("the voice backend returned a non-finite sample".into());
+                    return Err(backend_error(error));
+                }
+                mix(
+                    &mut output,
+                    &audio.samples,
+                    audio.start,
+                    sample_rate,
+                    &track.mixer,
+                    cancel,
+                )?;
             }
-            mix(
-                &mut output,
-                &samples,
-                notes[0].start,
-                sample_rate,
-                &track.mixer,
-                cancel,
-            )?;
+        }
+        // The engine clamps the mixed output, exactly as in C++.
+        for channel in [&mut output.left, &mut output.right] {
+            for sample in channel.iter_mut() {
+                *sample = sample.clamp(-1.0, 1.0);
+            }
         }
         Ok(output)
     }
@@ -167,6 +176,7 @@ fn timed_notes<'a>(project: &Project, placed: &[PlacedNote<'a>]) -> Vec<TimedNot
             end: seconds(placed.end),
             pitch: placed.pitch,
             detune_cents: placed.note.detune,
+            seconds_per_quarter: 60.0 / project.tempo_map.tempo_at(placed.start),
             lyrics: &placed.note.lyrics,
             phonemes: &placed.note.phonemes,
         })
@@ -174,6 +184,10 @@ fn timed_notes<'a>(project: &Project, placed: &[PlacedNote<'a>]) -> Vec<TimedNot
 }
 
 /// Adds mono `samples` to `output` starting at `start_seconds`, applying gain and a constant-power pan law.
+///
+/// Neural phrases start before zero when the leading context precedes the
+/// project start; like C++ `mixPhrase`, whatever falls before zero is dropped
+/// rather than shifting the timeline.
 fn mix(
     output: &mut StereoBuffer,
     samples: &[f32],
@@ -182,8 +196,17 @@ fn mix(
     mixer: &Mixer,
     cancel: &CancelToken,
 ) -> Result<(), RenderError> {
-    let offset = (start_seconds * f64::from(sample_rate)).round() as usize;
-    let count = samples.len().min(output.frames().saturating_sub(offset));
+    let phrase_offset = (start_seconds * f64::from(sample_rate)).round() as i64;
+    let offset = phrase_offset.max(0) as usize;
+    let skipped = if phrase_offset < 0 {
+        phrase_offset.unsigned_abs() as usize
+    } else {
+        0
+    };
+    let Some(source) = samples.get(skipped..) else {
+        return Ok(());
+    };
+    let count = source.len().min(output.frames().saturating_sub(offset));
     if count == 0 {
         return Ok(());
     }
@@ -195,7 +218,7 @@ fn mix(
     let span = offset..offset + count;
     let left = output.left[span.clone()].chunks_mut(MIX_CHUNK_FRAMES);
     let right = output.right[span].chunks_mut(MIX_CHUNK_FRAMES);
-    let source = samples[..count].chunks(MIX_CHUNK_FRAMES);
+    let source = source[..count].chunks(MIX_CHUNK_FRAMES);
     for (source, (left, right)) in source.zip(left.zip(right)) {
         if cancel.is_cancelled() {
             return Err(RenderError::Cancelled);
@@ -215,6 +238,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{Phrase, PhraseAudio};
 
     /// Fills each phrase with 1.0 and records where phrases start.
     #[derive(Default)]
@@ -226,16 +250,21 @@ mod tests {
         fn render_phrase(
             &mut self,
             _: &VoiceSettings,
-            notes: &[TimedNote<'_>],
+            phrase: &Phrase<'_>,
             rate: u32,
-        ) -> Result<Vec<f32>, BackendError> {
-            self.starts.push(notes[0].start);
-            let end = notes.last().unwrap().end;
-            Ok(vec![
-                1.0;
-                ((end - notes[0].start) * f64::from(rate)).round()
-                    as usize
-            ])
+            _: &CancelToken,
+        ) -> Result<PhraseAudio, BackendError> {
+            self.starts.push(phrase.notes[0].start);
+            let end = phrase.notes.last().unwrap().end;
+            Ok(PhraseAudio {
+                start: phrase.notes[0].start,
+                samples: vec![
+                    1.0;
+                    ((end - phrase.notes[0].start) * f64::from(rate)).round()
+                        as usize
+                ],
+                sample_rate: rate,
+            })
         }
     }
 
