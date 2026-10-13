@@ -70,6 +70,16 @@ impl<B: VoiceBackend> Renderer<B> {
         Self { backend }
     }
 
+    /// The singing backend (which keeps its caches across renders).
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Mutable access to the singing backend.
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
     /// Renders `project` at `sample_rate`.
     ///
     /// Each track is sung as a single phrase by the backend, then panned and summed.
