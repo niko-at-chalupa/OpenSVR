@@ -1,14 +1,18 @@
 //! Neural singing-voice stages: the DNNI-backed half of Phase 5.
 //!
 //! This is the Rust counterpart of OpenSV's `src/synthesis/PhonemeTiming.*`,
-//! `src/synthesis/FeatureNormalizer.*`, `src/synthesis/Pitch*.{h,cpp}` and
-//! `src/synthesis/Acoustic*.{h,cpp}` (namespace `sv::synthesis`). Timing turns [`TimingSyllable`]s
+//! `src/synthesis/FeatureNormalizer.*`, `src/synthesis/Pitch*.{h,cpp}`,
+//! `src/synthesis/Acoustic*.{h,cpp}` and `src/synthesis/{NeuralVocoder,
+//! VocoderFilterBank,VocoderResidual,VocoderSpectralHeads,
+//! PeriodicExcitation,LipRadiation}.{h,cpp}` (namespace `sv::synthesis`).
+//! Timing turns [`TimingSyllable`]s
 //! (re-exported from [`opensvr_g2p`], where the
 //! types already live) into per-phoneme durations in seconds, then quantizes
 //! them into acoustic [`TimedPhoneme`] frames; the pitch stage predicts the
 //! automatic per-frame F0 curve from score [`PitchNote`]s plus phoneme
 //! durations; the acoustic stage predicts vocoder-ready frames from timed
-//! phonemes plus the log-F0 curve.
+//! phonemes plus the log-F0 curve; the vocoder stage renders waveform
+//! samples from the acoustic frames.
 //!
 //! Error strings reproduce the C++ `juce::Result` failure text verbatim so
 //! golden tests can compare messages. Dependency direction follows the
@@ -17,18 +21,32 @@
 
 mod acoustic_features;
 mod acoustic_model;
-mod normalizer;
+mod excitation;
+mod fft;
+mod filter_bank;
+mod lip_radiation;
 mod noise;
+mod normalizer;
 mod pitch_context;
 mod pitch_curve;
 mod pitch_decoder;
 mod pitch_features;
 mod pitch_model;
 mod pitch_postprocess;
+mod residual;
+mod spectral_heads;
 mod timing;
+mod vocoder;
 
 pub use acoustic_features::{AcousticFeatureConfig, AcousticFeatures};
 pub use acoustic_model::{AcousticFrameInterval, AcousticModel, AcousticModelState};
+pub use excitation::{
+    PeriodicExcitationFrame, render_periodic_excitation, render_periodic_modulation,
+};
+pub use filter_bank::VocoderFilterBank;
+pub use lip_radiation::{
+    LipRadiationResponse, apply_lip_radiation_to_harmonics, lip_radiation_response,
+};
 pub use normalizer::FeatureNormalizer;
 pub use opensvr_g2p::{PhonemeDuration, TimingSyllable};
 pub use pitch_context::{PitchContext, PitchContextState};
@@ -40,7 +58,10 @@ pub use pitch_decoder::{PitchDecoder, PitchDecoderNotes};
 pub use pitch_features::{PitchFeatureOutput, PitchFeatures, PitchNote};
 pub use pitch_model::{PitchModel, PitchModelState};
 pub use pitch_postprocess::{PitchFrameInterval, apply_pitch_postprocess};
+pub use residual::{VocoderResidual, VocoderResidualState};
+pub use spectral_heads::{VocoderSpectralHeads, VocoderSpectralHeadsState};
 pub use timing::{PhonemeTiming, TimedPhoneme, quantize_phoneme_durations};
+pub use vocoder::{NeuralVocoder, NeuralVocoderOutput, NeuralVocoderState};
 
 use opensvr_dnni::DnniError;
 use opensvr_g2p::G2pError;
