@@ -202,7 +202,9 @@ fn write_vlq(out: &mut Vec<u8>, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use opensvr_core::{BLICKS_PER_QUARTER as Q, Note, NoteGroup, TempoChange, TempoMap, Track};
+    use opensvr_core::{
+        BLICKS_PER_QUARTER as Q, Note, NoteGroup, PitchAttributes, TempoChange, TempoMap, Track,
+    };
 
     use super::*;
 
@@ -214,6 +216,8 @@ mod tests {
             lyrics: "la".into(),
             phonemes: String::new(),
             detune: 0.0,
+            attributes: PitchAttributes::default(),
+            system_attributes: PitchAttributes::default(),
         };
         let group = NoteGroup {
             id: "main".into(),

@@ -14,8 +14,8 @@ pub use cancel::CancelToken;
 pub use curve::{AutomationPoint, Curve, Interpolation, ParseInterpolationError, sample_curve};
 
 pub use project::{
-    GroupReference, Language, Mixer, Note, NoteGroup, ParseLanguageError, PlacedNote, Project,
-    ProjectError, Track, VocalModeSetting, VoiceSettings,
+    GroupReference, Language, Mixer, Note, NoteGroup, ParseLanguageError, PitchAttribute,
+    PitchAttributes, PlacedNote, Project, ProjectError, Track, VocalModeSetting, VoiceSettings,
 };
 pub use tempo::{TempoChange, TempoMap, TimeSignature};
 

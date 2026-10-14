@@ -452,7 +452,8 @@ fn mix(
 #[cfg(test)]
 mod tests {
     use opensvr_core::{
-        BLICKS_PER_QUARTER as Q, GroupReference, Note, NoteGroup, Track, VoiceSettings,
+        BLICKS_PER_QUARTER as Q, GroupReference, Note, NoteGroup, PitchAttributes, Track,
+        VoiceSettings,
     };
 
     use super::*;
@@ -504,6 +505,8 @@ mod tests {
                 lyrics: "la".into(),
                 phonemes: String::new(),
                 detune: 0.0,
+                attributes: PitchAttributes::default(),
+                system_attributes: PitchAttributes::default(),
             }],
             ..NoteGroup::default()
         };
@@ -601,6 +604,8 @@ mod tests {
                 lyrics: "la".into(),
                 phonemes: String::new(),
                 detune: 0.0,
+                attributes: PitchAttributes::default(),
+                system_attributes: PitchAttributes::default(),
             })
             .collect();
         Track::new(

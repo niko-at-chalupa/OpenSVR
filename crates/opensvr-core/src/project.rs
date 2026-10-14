@@ -28,6 +28,233 @@ pub struct Note {
     pub phonemes: String,
     /// Microtonal offset in cents.
     pub detune: f64,
+    /// User-specified manual pitch/vibrato overrides.
+    pub attributes: PitchAttributes,
+    /// Automatically calculated pitch/vibrato defaults.
+    pub system_attributes: PitchAttributes,
+}
+
+/// One of the 14 table-driven pitch/vibrato attribute keys, mirroring the
+/// `pitchAttributeFields` table in OpenSV's `src/core/ProjectFile.cpp`.
+/// The key list lives in [`PitchAttribute::ALL`]; the JSON names and the
+/// [`PitchAttributes`] fields are mapped through the small macros below, so
+/// readers loop over the table instead of hand-writing 14 blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PitchAttribute {
+    TF0Offset,
+    TF0Left,
+    TF0Right,
+    DF0Left,
+    DF0Right,
+    TF0VbrStart,
+    TF0VbrLeft,
+    TF0VbrRight,
+    DF0Vbr,
+    PF0Vbr,
+    FF0Vbr,
+    DF0VbrMod,
+    RTone,
+    RIntonation,
+}
+
+/// Manual pitch/vibrato overrides, mirroring OpenSV's `PitchAttributes` in
+/// `src/core/Project.h` (14 `std::optional<double>`, without the
+/// preserved-fields JSON, which lands with the round-trip PR). Absent stays
+/// `None`: `normaliseProject` never fills defaults. Inert until the pitch
+/// builder lands.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PitchAttributes {
+    pub t_f0_offset: Option<f64>,
+    pub t_f0_left: Option<f64>,
+    pub t_f0_right: Option<f64>,
+    pub d_f0_left: Option<f64>,
+    pub d_f0_right: Option<f64>,
+    pub t_f0_vbr_start: Option<f64>,
+    pub t_f0_vbr_left: Option<f64>,
+    pub t_f0_vbr_right: Option<f64>,
+    pub d_f0_vbr: Option<f64>,
+    pub p_f0_vbr: Option<f64>,
+    pub f_f0_vbr: Option<f64>,
+    pub d_f0_vbr_mod: Option<f64>,
+    pub r_tone: Option<f64>,
+    pub r_intonation: Option<f64>,
+}
+
+macro_rules! pitch_attribute_name {
+    (TF0Offset) => {
+        "tF0Offset"
+    };
+    (TF0Left) => {
+        "tF0Left"
+    };
+    (TF0Right) => {
+        "tF0Right"
+    };
+    (DF0Left) => {
+        "dF0Left"
+    };
+    (DF0Right) => {
+        "dF0Right"
+    };
+    (TF0VbrStart) => {
+        "tF0VbrStart"
+    };
+    (TF0VbrLeft) => {
+        "tF0VbrLeft"
+    };
+    (TF0VbrRight) => {
+        "tF0VbrRight"
+    };
+    (DF0Vbr) => {
+        "dF0Vbr"
+    };
+    (PF0Vbr) => {
+        "pF0Vbr"
+    };
+    (FF0Vbr) => {
+        "fF0Vbr"
+    };
+    (DF0VbrMod) => {
+        "dF0VbrMod"
+    };
+    (RTone) => {
+        "rTone"
+    };
+    (RIntonation) => {
+        "rIntonation"
+    };
+}
+
+macro_rules! pitch_attribute_field {
+    ($self:expr, TF0Offset) => {
+        $self.t_f0_offset
+    };
+    ($self:expr, TF0Left) => {
+        $self.t_f0_left
+    };
+    ($self:expr, TF0Right) => {
+        $self.t_f0_right
+    };
+    ($self:expr, DF0Left) => {
+        $self.d_f0_left
+    };
+    ($self:expr, DF0Right) => {
+        $self.d_f0_right
+    };
+    ($self:expr, TF0VbrStart) => {
+        $self.t_f0_vbr_start
+    };
+    ($self:expr, TF0VbrLeft) => {
+        $self.t_f0_vbr_left
+    };
+    ($self:expr, TF0VbrRight) => {
+        $self.t_f0_vbr_right
+    };
+    ($self:expr, DF0Vbr) => {
+        $self.d_f0_vbr
+    };
+    ($self:expr, PF0Vbr) => {
+        $self.p_f0_vbr
+    };
+    ($self:expr, FF0Vbr) => {
+        $self.f_f0_vbr
+    };
+    ($self:expr, DF0VbrMod) => {
+        $self.d_f0_vbr_mod
+    };
+    ($self:expr, RTone) => {
+        $self.r_tone
+    };
+    ($self:expr, RIntonation) => {
+        $self.r_intonation
+    };
+}
+
+impl PitchAttribute {
+    /// Every key, in the C++ table order.
+    pub const ALL: [PitchAttribute; 14] = [
+        PitchAttribute::TF0Offset,
+        PitchAttribute::TF0Left,
+        PitchAttribute::TF0Right,
+        PitchAttribute::DF0Left,
+        PitchAttribute::DF0Right,
+        PitchAttribute::TF0VbrStart,
+        PitchAttribute::TF0VbrLeft,
+        PitchAttribute::TF0VbrRight,
+        PitchAttribute::DF0Vbr,
+        PitchAttribute::PF0Vbr,
+        PitchAttribute::FF0Vbr,
+        PitchAttribute::DF0VbrMod,
+        PitchAttribute::RTone,
+        PitchAttribute::RIntonation,
+    ];
+
+    /// The SVP JSON key, e.g. `"tF0Offset"`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            PitchAttribute::TF0Offset => pitch_attribute_name!(TF0Offset),
+            PitchAttribute::TF0Left => pitch_attribute_name!(TF0Left),
+            PitchAttribute::TF0Right => pitch_attribute_name!(TF0Right),
+            PitchAttribute::DF0Left => pitch_attribute_name!(DF0Left),
+            PitchAttribute::DF0Right => pitch_attribute_name!(DF0Right),
+            PitchAttribute::TF0VbrStart => pitch_attribute_name!(TF0VbrStart),
+            PitchAttribute::TF0VbrLeft => pitch_attribute_name!(TF0VbrLeft),
+            PitchAttribute::TF0VbrRight => pitch_attribute_name!(TF0VbrRight),
+            PitchAttribute::DF0Vbr => pitch_attribute_name!(DF0Vbr),
+            PitchAttribute::PF0Vbr => pitch_attribute_name!(PF0Vbr),
+            PitchAttribute::FF0Vbr => pitch_attribute_name!(FF0Vbr),
+            PitchAttribute::DF0VbrMod => pitch_attribute_name!(DF0VbrMod),
+            PitchAttribute::RTone => pitch_attribute_name!(RTone),
+            PitchAttribute::RIntonation => pitch_attribute_name!(RIntonation),
+        }
+    }
+}
+
+impl PitchAttributes {
+    /// Reads one field by key.
+    pub fn get(&self, field: PitchAttribute) -> Option<f64> {
+        match field {
+            PitchAttribute::TF0Offset => pitch_attribute_field!(self, TF0Offset),
+            PitchAttribute::TF0Left => pitch_attribute_field!(self, TF0Left),
+            PitchAttribute::TF0Right => pitch_attribute_field!(self, TF0Right),
+            PitchAttribute::DF0Left => pitch_attribute_field!(self, DF0Left),
+            PitchAttribute::DF0Right => pitch_attribute_field!(self, DF0Right),
+            PitchAttribute::TF0VbrStart => {
+                pitch_attribute_field!(self, TF0VbrStart)
+            }
+            PitchAttribute::TF0VbrLeft => pitch_attribute_field!(self, TF0VbrLeft),
+            PitchAttribute::TF0VbrRight => {
+                pitch_attribute_field!(self, TF0VbrRight)
+            }
+            PitchAttribute::DF0Vbr => pitch_attribute_field!(self, DF0Vbr),
+            PitchAttribute::PF0Vbr => pitch_attribute_field!(self, PF0Vbr),
+            PitchAttribute::FF0Vbr => pitch_attribute_field!(self, FF0Vbr),
+            PitchAttribute::DF0VbrMod => pitch_attribute_field!(self, DF0VbrMod),
+            PitchAttribute::RTone => pitch_attribute_field!(self, RTone),
+            PitchAttribute::RIntonation => pitch_attribute_field!(self, RIntonation),
+        }
+    }
+
+    /// Stores one field by key.
+    pub fn set(&mut self, field: PitchAttribute, value: f64) {
+        let slot = match field {
+            PitchAttribute::TF0Offset => &mut self.t_f0_offset,
+            PitchAttribute::TF0Left => &mut self.t_f0_left,
+            PitchAttribute::TF0Right => &mut self.t_f0_right,
+            PitchAttribute::DF0Left => &mut self.d_f0_left,
+            PitchAttribute::DF0Right => &mut self.d_f0_right,
+            PitchAttribute::TF0VbrStart => &mut self.t_f0_vbr_start,
+            PitchAttribute::TF0VbrLeft => &mut self.t_f0_vbr_left,
+            PitchAttribute::TF0VbrRight => &mut self.t_f0_vbr_right,
+            PitchAttribute::DF0Vbr => &mut self.d_f0_vbr,
+            PitchAttribute::PF0Vbr => &mut self.p_f0_vbr,
+            PitchAttribute::FF0Vbr => &mut self.f_f0_vbr,
+            PitchAttribute::DF0VbrMod => &mut self.d_f0_vbr_mod,
+            PitchAttribute::RTone => &mut self.r_tone,
+            PitchAttribute::RIntonation => &mut self.r_intonation,
+        };
+        *slot = Some(value);
+    }
 }
 
 /// A vocal-mode (singing-style) setting on a note group, mirroring OpenSV's
@@ -90,6 +317,8 @@ pub struct GroupReference {
     pub vocal_mode_preset: String,
     /// Per-mode weight overrides (`std::map`, hence ordered).
     pub vocal_mode_params: BTreeMap<String, f64>,
+    /// Track/reference-level default pitch attributes (`voicePitch`).
+    pub voice_pitch: PitchAttributes,
 }
 
 impl Default for GroupReference {
@@ -104,6 +333,7 @@ impl Default for GroupReference {
             vocal_mode_inherited: true,
             vocal_mode_preset: String::new(),
             vocal_mode_params: BTreeMap::new(),
+            voice_pitch: PitchAttributes::default(),
         }
     }
 }
@@ -333,6 +563,8 @@ mod tests {
             lyrics: "la".into(),
             phonemes: String::new(),
             detune: 0.0,
+            attributes: PitchAttributes::default(),
+            system_attributes: PitchAttributes::default(),
         }
     }
 
@@ -464,5 +696,44 @@ mod tests {
             assert_eq!(language.to_string().parse(), Ok(language));
         }
         assert!("klingon".parse::<Language>().is_err());
+    }
+
+    #[test]
+    fn pitch_attributes_default_to_none_and_round_trip_by_key() {
+        let empty = PitchAttributes::default();
+        for field in PitchAttribute::ALL {
+            assert_eq!(empty.get(field), None, "{}", field.name());
+        }
+        // JSON names are unique and in the C++ table order.
+        let names: Vec<_> = PitchAttribute::ALL
+            .iter()
+            .map(|field| field.name())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "tF0Offset",
+                "tF0Left",
+                "tF0Right",
+                "dF0Left",
+                "dF0Right",
+                "tF0VbrStart",
+                "tF0VbrLeft",
+                "tF0VbrRight",
+                "dF0Vbr",
+                "pF0Vbr",
+                "fF0Vbr",
+                "dF0VbrMod",
+                "rTone",
+                "rIntonation",
+            ]
+        );
+        let mut filled = PitchAttributes::default();
+        for (index, field) in PitchAttribute::ALL.iter().enumerate() {
+            filled.set(*field, index as f64 + 0.5);
+        }
+        for (index, field) in PitchAttribute::ALL.iter().enumerate() {
+            assert_eq!(filled.get(*field), Some(index as f64 + 0.5));
+        }
     }
 }
