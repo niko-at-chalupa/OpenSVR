@@ -15,8 +15,8 @@ use std::{
 
 use opensvr_core::{
     AutomationPoint, Blick, Curve, GroupReference, Interpolation, MAX_FILE_BLICK, Mixer, Note,
-    NoteGroup, Project, TempoChange, TempoMap, TimeSignature, Track, VocalModeSetting,
-    VoiceSettings,
+    NoteGroup, PitchAttribute, PitchAttributes, Project, TempoChange, TempoMap, TimeSignature,
+    Track, VocalModeSetting, VoiceSettings,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -234,6 +234,15 @@ struct RawNote {
     phonemes: String,
     #[serde(default)]
     detune: f64,
+    /// Note `attributes` stays as [`Value`] so a non-object fails with the
+    /// same `Invalid` error OpenSV's `readPitchAttributes` reports, rather
+    /// than a JSON error. (`None`/JSON null both mean absent, as JUCE parses
+    /// null to void.)
+    #[serde(default)]
+    attributes: Option<Value>,
+    /// Note `systemAttributes`, read with the same table.
+    #[serde(default, rename = "systemAttributes")]
+    system_attributes: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -324,6 +333,11 @@ impl RawNote {
                 lyrics: self.lyrics,
                 phonemes: self.phonemes,
                 detune: self.detune,
+                attributes: read_pitch_attributes(self.attributes.as_ref(), "note attributes")?,
+                system_attributes: read_pitch_attributes(
+                    self.system_attributes.as_ref(),
+                    "note systemAttributes",
+                )?,
             }),
             _ => invalid("a note has invalid timing, pitch, or detune"),
         }
@@ -489,6 +503,41 @@ fn read_voice_overrides(raw: Option<&Value>) -> Result<(bool, String, BTreeMap<S
     Ok((inherited, preset, params))
 }
 
+/// Reads pitch/vibrato attributes exactly like OpenSV's `readPitchAttributes`
+/// in `src/core/ProjectFile.cpp`: absent (or JSON null, which JUCE parses to
+/// void) keeps the defaults; a non-object is an error; each present field
+/// must be a finite number. The loop runs over the [`PitchAttribute::ALL`]
+/// table, so the 14 keys live in `opensvr-core` rather than in 14 blocks
+/// here. (Preserved unknown fields land with the round-trip PR, so there is
+/// nothing to strip yet.)
+fn read_pitch_attributes(raw: Option<&Value>, context: &str) -> Result<PitchAttributes> {
+    let mut out = PitchAttributes::default();
+    let Some(raw) = raw else {
+        return Ok(out);
+    };
+    if raw.is_null() {
+        return Ok(out);
+    }
+    let Value::Object(fields) = raw else {
+        return invalid(format!("{context} must be an object."));
+    };
+    for field in PitchAttribute::ALL {
+        let Some(value) = fields.get(field.name()) else {
+            continue;
+        };
+        match value.as_f64() {
+            Some(amount) if amount.is_finite() => out.set(field, amount),
+            _ => {
+                return invalid(format!(
+                    "{context}.{} must be a finite number.",
+                    field.name()
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Reads one automation curve exactly like OpenSV's `readCurve` in
 /// `src/core/ProjectFile.cpp`: an absent curve is OK and keeps the default
 /// (cubic, empty); otherwise the mode must be known, the points must form
@@ -590,6 +639,9 @@ impl RawReference {
         }
         let (vocal_mode_inherited, vocal_mode_preset, vocal_mode_params) =
             read_voice_overrides(self.voice.as_ref())?;
+        // Reference pitch attributes come from the SAME `voice` object, which
+        // doubles as the `voicePitch` container in the C++ `readReference`.
+        let voice_pitch = read_pitch_attributes(self.voice.as_ref(), "reference voice")?;
         Ok(GroupReference {
             group_id: self.group_id,
             time_offset: blick(self.blick_offset, "a group offset")?,
@@ -600,6 +652,7 @@ impl RawReference {
             vocal_mode_inherited,
             vocal_mode_preset,
             vocal_mode_params,
+            voice_pitch,
         })
     }
 }
@@ -966,6 +1019,126 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1000, 1.0), (0, 2.0), (1000, 3.0)]
         );
+    }
+
+    #[test]
+    fn missing_pitch_attributes_keep_defaults() {
+        let project = parse_value(&sample()).unwrap();
+        let track = &project.tracks[0];
+        for note in &track.main_group.notes {
+            assert_eq!(note.attributes, PitchAttributes::default());
+            assert_eq!(note.system_attributes, PitchAttributes::default());
+        }
+        assert_eq!(track.main_ref.voice_pitch, PitchAttributes::default());
+        assert_eq!(track.groups[0].voice_pitch, PitchAttributes::default());
+        // JSON null parses to void in JUCE, i.e. absent.
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["notes"][0]["attributes"] = json!(null);
+        value["tracks"][0]["mainGroup"]["notes"][0]["systemAttributes"] = json!(null);
+        value["tracks"][0]["groups"][0]["voice"] = json!(null);
+        let project = parse_value(&value).unwrap();
+        assert_eq!(
+            project.tracks[0].main_group.notes[1].attributes,
+            PitchAttributes::default()
+        );
+        assert_eq!(
+            project.tracks[0].groups[0].voice_pitch,
+            PitchAttributes::default()
+        );
+    }
+
+    #[test]
+    fn loads_pitch_attributes_through_the_shared_table() {
+        use opensvr_core::PitchAttribute;
+        let mut fields = serde_json::Map::new();
+        for (index, field) in PitchAttribute::ALL.iter().enumerate() {
+            fields.insert(field.name().into(), json!(index as f64 + 0.5));
+        }
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["notes"][0]["attributes"] = json!(fields.clone());
+        value["tracks"][0]["mainGroup"]["notes"][0]["systemAttributes"] = json!(fields.clone());
+        // The reference `voice` object carries vocal-mode keys and pitch
+        // attributes side by side, as in the C++ `readReference`.
+        let mut voice = fields.clone();
+        voice.insert("vocalModeInherited".into(), json!(false));
+        voice.insert("vocalModePreset".into(), json!("Chest"));
+        value["tracks"][0]["groups"][0]["voice"] = json!(voice);
+        let project = parse_value(&value).unwrap();
+        let track = &project.tracks[0];
+        for attributes in [
+            &track.main_group.notes[1].attributes,
+            &track.main_group.notes[1].system_attributes,
+            &track.groups[0].voice_pitch,
+        ] {
+            for (index, field) in PitchAttribute::ALL.iter().enumerate() {
+                assert_eq!(attributes.get(*field), Some(index as f64 + 0.5));
+            }
+        }
+        // The vocal-mode keys on the same object still parse.
+        assert!(!track.groups[0].vocal_mode_inherited);
+        assert_eq!(track.groups[0].vocal_mode_preset, "Chest");
+        // Integer JSON counts as a finite number, as in C++ `readNumber`.
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["notes"][0]["attributes"] = json!({ "tF0Offset": 1 });
+        let project = parse_value(&value).unwrap();
+        assert_eq!(
+            project.tracks[0].main_group.notes[1].attributes.t_f0_offset,
+            Some(1.0)
+        );
+        // Unlisted keys stay ignored until preserved fields land.
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["notes"][0]["attributes"] =
+            json!({ "tF0Offset": 0.25, "futureVendorKey": 1.0 });
+        let project = parse_value(&value).unwrap();
+        assert_eq!(
+            project.tracks[0].main_group.notes[1].attributes.t_f0_offset,
+            Some(0.25)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_pitch_attributes() {
+        // One case per rule family (not 14 copies): non-object containers
+        // and non-finite entries on each of the three paths.
+        let bad_containers = [json!(5.0), json!([1.0])];
+        for bad in bad_containers {
+            let mut value = sample();
+            value["tracks"][0]["mainGroup"]["notes"][0]["attributes"] = bad.clone();
+            assert!(
+                parse_value(&value).is_err(),
+                "malformed note attributes should be rejected"
+            );
+            let mut value = sample();
+            value["tracks"][0]["mainGroup"]["notes"][0]["systemAttributes"] = bad.clone();
+            assert!(
+                parse_value(&value).is_err(),
+                "malformed note systemAttributes should be rejected"
+            );
+        }
+        // A non-object `voice` is already rejected by the vocal-mode block;
+        // here the object is fine but one pitch field is not a number.
+        let mut value = sample();
+        value["tracks"][0]["groups"][0]["voice"] =
+            json!({ "vocalModeInherited": true, "tF0Offset": [1.0] });
+        assert!(
+            parse_value(&value).is_err(),
+            "malformed reference voice pitch attributes should be rejected"
+        );
+        let bad_values = [json!("loud"), json!(true), json!(null), json!([0.5])];
+        for bad in bad_values {
+            let mut value = sample();
+            value["tracks"][0]["mainGroup"]["notes"][0]["attributes"] = json!({ "dF0Vbr": bad });
+            assert!(
+                parse_value(&value).is_err(),
+                "non-numeric pitch attribute should be rejected"
+            );
+            let mut value = sample();
+            value["tracks"][0]["groups"][0]["voice"] = json!({ "fF0Vbr": bad });
+            assert!(
+                parse_value(&value).is_err(),
+                "non-numeric reference voice attribute should be rejected"
+            );
+        }
     }
 
     #[test]
