@@ -505,6 +505,7 @@ mod tests {
                 phonemes: String::new(),
                 detune: 0.0,
             }],
+            ..NoteGroup::default()
         };
         let mut track = Track::new(
             name,
@@ -512,6 +513,7 @@ mod tests {
                 id: format!("{name}-main"),
                 name: name.into(),
                 notes: Vec::new(),
+                ..NoteGroup::default()
             },
         );
         track.groups.push(GroupReference {
@@ -606,6 +608,7 @@ mod tests {
                 id: name.into(),
                 name: name.into(),
                 notes,
+                ..NoteGroup::default()
             },
         )
     }

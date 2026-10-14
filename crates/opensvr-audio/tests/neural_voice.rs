@@ -212,6 +212,7 @@ fn repeated_phrases_load_once_and_match_fresh_renders() {
             id: "two-phrase-main".to_owned(),
             name: String::new(),
             notes,
+            ..NoteGroup::default()
         },
     );
     track.mixer = source.mixer.clone();
@@ -290,6 +291,7 @@ fn parallel_tracks_share_one_voice_load() {
                 id: format!("{name}-main"),
                 name: String::new(),
                 notes: source.main_group.notes.clone(),
+                ..NoteGroup::default()
             },
         );
         track.mixer = source.mixer.clone();
@@ -350,6 +352,7 @@ fn windowed(basic: &Project, source: &Track, end: Option<Blick>) -> Project {
         id: "windowed-lib".to_owned(),
         name: "windowed".to_owned(),
         notes: source.main_group.notes.clone(),
+        ..NoteGroup::default()
     });
     let mut track = Track::new(
         "lead",
@@ -357,6 +360,7 @@ fn windowed(basic: &Project, source: &Track, end: Option<Blick>) -> Project {
             id: "empty-main".to_owned(),
             name: String::new(),
             notes: Vec::new(),
+            ..NoteGroup::default()
         },
     );
     track.mixer = source.mixer.clone();

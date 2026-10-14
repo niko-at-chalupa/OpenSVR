@@ -5,10 +5,13 @@
 //! mixer state, voice settings and the tempo map.
 
 mod cancel;
+mod curve;
 mod project;
 mod tempo;
 
 pub use cancel::CancelToken;
+
+pub use curve::{AutomationPoint, Curve, Interpolation, ParseInterpolationError, sample_curve};
 
 pub use project::{
     GroupReference, Language, Mixer, Note, NoteGroup, ParseLanguageError, PlacedNote, Project,
