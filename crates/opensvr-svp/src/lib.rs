@@ -2,8 +2,10 @@
 //!
 //! The file is JSON. It is first deserialized into private "raw" structs that
 //! mirror the file layout, then validated and converted into the domain types of
-//! [`opensvr_core`]. Fields the command-line tools do not use (parameter curves,
-//! vocal modes, take lists, ...) are ignored; see `ROADMAP.md` for lossless saving.
+//! [`opensvr_core`]. Group automation curves (`parameters.pitchDelta` and
+//! `parameters.vibratoEnv`) are read with the same validation as OpenSV's
+//! `readCurve`; fields the command-line tools do not use yet (vocal modes,
+//! take lists, ...) are ignored; see `ROADMAP.md` for lossless saving.
 
 use std::{
     collections::HashSet,
@@ -12,10 +14,11 @@ use std::{
 };
 
 use opensvr_core::{
-    Blick, GroupReference, MAX_FILE_BLICK, Mixer, Note, NoteGroup, Project, TempoChange, TempoMap,
-    TimeSignature, Track, VoiceSettings,
+    AutomationPoint, Blick, Curve, GroupReference, Interpolation, MAX_FILE_BLICK, Mixer, Note,
+    NoteGroup, Project, TempoChange, TempoMap, TimeSignature, Track, VoiceSettings,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 
 /// The only project format version this reader understands (Synthesizer V Studio 1.11.2).
@@ -192,6 +195,27 @@ struct RawGroup {
     #[serde(default)]
     name: String,
     notes: Vec<RawNote>,
+    #[serde(default)]
+    parameters: Option<RawParameters>,
+}
+
+/// The `parameters` object of a group: only the two automation curves the
+/// engine consumes are read, the rest is left for the lossless-saving PR.
+#[derive(Debug, Default, Deserialize)]
+struct RawParameters {
+    #[serde(default, rename = "pitchDelta")]
+    pitch_delta: Option<RawCurve>,
+    #[serde(default, rename = "vibratoEnv")]
+    vibrato_env: Option<RawCurve>,
+}
+
+/// A `{"mode": ..., "points": [pos0, val0, ...]}` automation curve.
+/// Points stay as [`Value`] so non-numeric entries fail with the same
+/// `Invalid` error OpenSV's `readCurve` reports, rather than a JSON error.
+#[derive(Debug, Deserialize)]
+struct RawCurve {
+    mode: String,
+    points: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -306,15 +330,87 @@ impl RawGroup {
             .map(RawNote::into_note)
             .collect::<Result<Vec<_>>>()?;
         notes.sort_by_key(|note| note.onset);
+        let parameters = self.parameters.unwrap_or_default();
         Ok(NoteGroup {
             id: self.uuid,
             name: self.name,
             notes,
-            // Curves land in the SVP-reading follow-up; until then every
-            // group carries empty (inert) automation.
-            ..NoteGroup::default()
+            pitch_delta: read_curve(parameters.pitch_delta, "pitchDelta")?,
+            vibrato_env: read_curve(parameters.vibrato_env, "vibratoEnv")?,
         })
     }
+}
+
+/// Reads one automation curve exactly like OpenSV's `readCurve` in
+/// `src/core/ProjectFile.cpp`: an absent curve is OK and keeps the default
+/// (cubic, empty); otherwise the mode must be known, the points must form
+/// time/value pairs, positions must be finite integers within
+/// [`MAX_FILE_BLICK`], and values must be finite. Sorting and duplicate
+/// handling mirror `normaliseCurve` (via `normaliseProject` after load):
+/// points are stable-sorted by position and the last point at each position
+/// wins, matching the editor behavior where later edits overwrite.
+fn read_curve(raw: Option<RawCurve>, name: &str) -> Result<Curve> {
+    let Some(raw) = raw else {
+        return Ok(Curve::default());
+    };
+    let mode: Interpolation = raw
+        .mode
+        .parse()
+        .map_err(|_| SvpError::Invalid(format!("{name} has an unsupported interpolation mode.")))?;
+    if raw.points.len() % 2 != 0 {
+        return invalid(format!("{name} points must contain time/value pairs."));
+    }
+    let mut points = Vec::with_capacity(raw.points.len() / 2);
+    for pair in raw.points.chunks_exact(2) {
+        if pair[0].as_i64().is_none() && pair[0].as_f64().is_none()
+            || pair[1].as_i64().is_none() && pair[1].as_f64().is_none()
+        {
+            return invalid(format!("{name} contains non-numeric points."));
+        }
+        let position = match pair[0].as_i64() {
+            // Integer JSON keeps its exact value, as in the C++
+            // `static_cast<Blick>(position)` of the original `juce::var`.
+            Some(exact) if exact.unsigned_abs() <= MAX_FILE_BLICK.unsigned_abs() => exact,
+            Some(_) => return invalid(format!("{name} contains an invalid point.")),
+            // Doubles must be finite integers in range, as in the C++
+            // `trunc`/`maximumFileBlick` checks on `positionNumber`.
+            None => match pair[0].as_f64() {
+                Some(number)
+                    if number.is_finite()
+                        && number.trunc() == number
+                        && number.abs() <= MAX_FILE_BLICK as f64 =>
+                {
+                    number as Blick
+                }
+                _ => return invalid(format!("{name} contains an invalid point.")),
+            },
+        };
+        match pair[1].as_f64() {
+            Some(value) if value.is_finite() => points.push(AutomationPoint { position, value }),
+            _ => return invalid(format!("{name} contains an invalid point.")),
+        }
+    }
+    if points.len() > 1
+        && points
+            .windows(2)
+            .any(|pair| pair[0].position > pair[1].position)
+    {
+        points.sort_by_key(|point| point.position);
+    }
+    // Deduplicate keeping the last point at each position: after the stable
+    // sort above, file-later duplicates come later, so a reverse pass keeps
+    // them, exactly like the reverse `std::unique` in `normaliseCurve`.
+    let mut deduped = Vec::with_capacity(points.len());
+    for point in points.into_iter().rev() {
+        if deduped.last().map(|last: &AutomationPoint| last.position) != Some(point.position) {
+            deduped.push(point);
+        }
+    }
+    deduped.reverse();
+    Ok(Curve {
+        mode,
+        points: deduped,
+    })
 }
 
 impl RawReference {
@@ -392,7 +488,7 @@ impl RawTrack {
 
 #[cfg(test)]
 mod tests {
-    use opensvr_core::{BLICKS_PER_QUARTER as Q, Language};
+    use opensvr_core::{BLICKS_PER_QUARTER as Q, Language, sample_curve};
     use serde_json::{Value, json};
 
     use super::*;
@@ -496,6 +592,122 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_parameters_keep_empty_curves() {
+        let project = parse_value(&sample()).unwrap();
+        for group in project
+            .library
+            .iter()
+            .chain(std::iter::once(&project.tracks[0].main_group))
+        {
+            assert_eq!(group.pitch_delta, Curve::default());
+            assert_eq!(group.vibrato_env, Curve::default());
+            assert_eq!(group.pitch_delta.mode, Interpolation::Cubic);
+        }
+    }
+
+    #[test]
+    fn loads_group_curves() {
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["parameters"] = json!({
+            "pitchDelta": { "mode": "linear", "points": [0, 0.0, 1000, 10.0] },
+            "vibratoEnv": { "mode": "cosine", "points": [0, 1.0, 500, 3.0] },
+        });
+        let project = parse_value(&value).unwrap();
+        let group = &project.tracks[0].main_group;
+        assert_eq!(group.pitch_delta.mode, Interpolation::Linear);
+        assert_eq!(
+            group.pitch_delta.points,
+            vec![
+                AutomationPoint {
+                    position: 0,
+                    value: 0.0
+                },
+                AutomationPoint {
+                    position: 1000,
+                    value: 10.0
+                },
+            ]
+        );
+        assert_eq!(group.vibrato_env.mode, Interpolation::Cosine);
+        // Linear midpoint is exact arithmetic, so this checks the wiring
+        // from file bytes to evaluated curve (interpolation itself is
+        // covered by `opensvr-core` differential fixtures).
+        assert_eq!(sample_curve(&group.pitch_delta, 500, 0.0), 5.0);
+        // Library groups without `parameters` stay empty and inert.
+        assert_eq!(project.library[0].pitch_delta, Curve::default());
+    }
+
+    #[test]
+    fn rejects_malformed_curves() {
+        let cases: [(&str, Value); 8] = [
+            // Odd-length arrays are not time/value pairs.
+            (
+                "pitchDelta",
+                json!({ "mode": "linear", "points": [0, 1.0, 500] }),
+            ),
+            // Non-numeric entries.
+            (
+                "pitchDelta",
+                json!({ "mode": "linear", "points": [0, 1.0, "500", 2.0] }),
+            ),
+            (
+                "vibratoEnv",
+                json!({ "mode": "linear", "points": [0, "loud"] }),
+            ),
+            // Non-integer positions.
+            (
+                "pitchDelta",
+                json!({ "mode": "linear", "points": [0.5, 1.0, 100, 2.0] }),
+            ),
+            // Positions beyond `maximumFileBlick`.
+            (
+                "pitchDelta",
+                json!({ "mode": "linear", "points": [0, 1.0, 4_611_686_018_427_387_904i64, 2.0] }),
+            ),
+            // Unknown interpolation modes.
+            (
+                "pitchDelta",
+                json!({ "mode": "smooth", "points": [0, 1.0, 100, 2.0] }),
+            ),
+            // Curves must be objects with a mode and points array.
+            ("pitchDelta", json!(5.0)),
+            ("vibratoEnv", json!({ "mode": "linear" })),
+        ];
+        for (name, replacement) in cases {
+            let mut value = sample();
+            value["tracks"][0]["mainGroup"]["parameters"][name] = replacement;
+            assert!(parse_value(&value).is_err(), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn curves_normalise_like_the_cpp() {
+        // `readCurve` accepts unsorted and duplicated positions; the later
+        // `normaliseCurve` stable-sorts them and lets the last point at each
+        // position win (later editor edits overwrite).
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["parameters"] = json!({
+            "pitchDelta": {
+                "mode": "linear",
+                "points": [1000, 1.0, 0, 2.0, 1000, 3.0],
+            },
+        });
+        let project = parse_value(&value).unwrap();
+        assert_eq!(
+            project.tracks[0].main_group.pitch_delta.points,
+            vec![
+                AutomationPoint {
+                    position: 0,
+                    value: 2.0
+                },
+                AutomationPoint {
+                    position: 1000,
+                    value: 3.0
+                },
+            ]
+        );
+    }
     #[test]
     fn crop_sentinel_means_unbounded() {
         let mut value = sample();
