@@ -20,3 +20,9 @@ It's very minimal and implements little-to-nothing, for now.
 > `.nofs` file through the neural voice (voice, dictionary and phrase files are cached by file stamp); without one,
 > notes fall back to sine tones. `info` does read voice databases (`opensvr-nofs`): it prints the singer name, vendor and vocal
 > modes when `--voice` points at a `.nofs` file. See [ROADMAP.md](ROADMAP.md) for what remains of the synthesis port.
+
+Porting is cross-checked against a second reference, OpenSV+ (used with permission):
+MysticLD's research engine with additional fixes, which has no public
+repository of its own. Credit and thanks to MysticLD for letting this project use that research.
+Where the two references disagree, behavior is verified by measurement against committed golden
+tests, never copied sight unseen.
