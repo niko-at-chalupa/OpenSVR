@@ -15,7 +15,7 @@ pub use curve::{AutomationPoint, Curve, Interpolation, ParseInterpolationError, 
 
 pub use project::{
     GroupReference, Language, Mixer, Note, NoteGroup, ParseLanguageError, PlacedNote, Project,
-    ProjectError, Track, VoiceSettings,
+    ProjectError, Track, VocalModeSetting, VoiceSettings,
 };
 pub use tempo::{TempoChange, TempoMap, TimeSignature};
 
