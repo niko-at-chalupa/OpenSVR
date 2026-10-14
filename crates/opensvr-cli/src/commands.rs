@@ -6,7 +6,8 @@ use std::{
 };
 
 use opensvr_audio::{
-    CancelToken, NeuralBackend, RenderError, Renderer, ToneBackend, WavError, write_wav,
+    CancelToken, NeuralBackend, NoProgress, ProgressSink, RenderError, Renderer, ToneBackend,
+    WavError, write_wav,
 };
 use opensvr_core::Project;
 use opensvr_midi::MidiError;
@@ -60,6 +61,25 @@ fn info(args: &InfoArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// A [`ProgressSink`] that drives an `indicatif` bar on stderr.
+///
+/// The bar starts without a length (the phrase total is only known inside the
+/// renderer) and learns it from the first report. `indicatif` hides the bar
+/// when stderr is piped, so scripts never see it; `--quiet` never creates one.
+#[derive(Debug, Clone)]
+struct BarProgress {
+    bar: indicatif::ProgressBar,
+}
+
+impl ProgressSink for BarProgress {
+    fn report(&self, done: usize, total: usize) {
+        if self.bar.length().is_none() {
+            self.bar.set_length(total as u64);
+        }
+        self.bar.set_position(done as u64);
+    }
+}
+
 fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
     let project = load(&args.project, &args.overrides)?;
     if !args.quiet {
@@ -82,14 +102,41 @@ fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
     let voiced = project.tracks.iter().any(|track| {
         track.voice.database.as_deref().is_some_and(Path::is_file)
     });
-    let audio = if voiced {
-        Renderer::new(NeuralBackend::new()).render(&project, args.rate, cancel)?
+    // Phrase progress goes to an `indicatif` bar on stderr unless `--quiet`.
+    // The total is only known inside the renderer, so the bar starts without
+    // a length and learns it from the first report; quiet renders pass the
+    // no-op sink, keeping their output byte-identical.
+    let bar = if args.quiet {
+        None
+    } else {
+        Some(indicatif::ProgressBar::new(0))
+    };
+    let sink = bar.clone().map(|bar| BarProgress { bar });
+    let progress: &dyn ProgressSink = sink.as_ref().map_or(&NoProgress, |sink| sink);
+    let result = if voiced {
+        Renderer::new(NeuralBackend::new())
+            .render_with_progress(&project, args.rate, cancel, progress)
     } else {
         // Not progress output, so `--quiet` does not hide it: the result is not singing.
         eprintln!(
             "opensvr: note: no voice database found; notes are rendered as placeholder tones"
         );
-        Renderer::new(ToneBackend::default()).render(&project, args.rate, cancel)?
+        Renderer::new(ToneBackend::default())
+            .render_with_progress(&project, args.rate, cancel, progress)
+    };
+    let audio = match result {
+        Ok(audio) => {
+            if let Some(bar) = &bar {
+                bar.finish_and_clear();
+            }
+            audio
+        }
+        Err(error) => {
+            if let Some(bar) = &bar {
+                bar.abandon();
+            }
+            return Err(error.into());
+        }
     };
     write_wav(&args.output, &audio, args.rate, cancel)?;
     if !args.quiet {
@@ -391,5 +438,18 @@ mod tests {
             CliError::Load(SvpError::UnsupportedVersion(1)).exit_code(),
             2
         );
+    }
+
+    #[test]
+    fn the_bar_sink_learns_its_total_from_the_first_report() {
+        let sink = BarProgress {
+            bar: indicatif::ProgressBar::hidden(),
+        };
+        assert_eq!(sink.bar.length(), None);
+        sink.report(1, 3);
+        assert_eq!(sink.bar.length(), Some(3));
+        assert_eq!(sink.bar.position(), 1);
+        sink.report(3, 3);
+        assert_eq!(sink.bar.position(), 3);
     }
 }
