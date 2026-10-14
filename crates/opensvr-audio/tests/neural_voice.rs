@@ -137,7 +137,7 @@ fn neural_backend_sings_the_basic_phrase_deterministically() {
     }
 
     let cancel = CancelToken::new();
-    let mut renderer = Renderer::new(NeuralBackend::new());
+    let renderer = Renderer::new(NeuralBackend::new());
     let first = renderer
         .render(&project, SAMPLE_RATE, &cancel)
         .expect("neural render must succeed");
@@ -220,7 +220,7 @@ fn repeated_phrases_load_once_and_match_fresh_renders() {
     project.tracks.push(track);
 
     let cancel = CancelToken::new();
-    let mut cached = Renderer::new(NeuralBackend::new());
+    let cached = Renderer::new(NeuralBackend::new());
     let first = cached
         .render(&project, SAMPLE_RATE, &cancel)
         .expect("cached render must succeed");
@@ -264,6 +264,80 @@ fn repeated_phrases_load_once_and_match_fresh_renders() {
         .render(&project, SAMPLE_RATE, &cancel)
         .expect("fresh render must succeed");
     assert_eq!(first, fresh, "cached renders must match fresh renders");
+}
+
+/// A two-track project sings concurrently through one shared backend.
+///
+/// Both tracks carry the same `neural-basic` notes and voice, so one render
+/// still loads the voice file once and every phrase synthesizes or hits;
+/// re-renders are bitwise identical and serve both phrases from the cache.
+#[test]
+fn parallel_tracks_share_one_voice_load() {
+    let Some(voice) = voice_path() else {
+        return;
+    };
+    let basic =
+        opensvr_svp::load(&golden_dir().join("neural-basic.svp")).expect("basic SVP must parse");
+    assert_eq!(basic.tracks.len(), 1);
+    let source = basic.tracks[0].clone();
+
+    let mut project = basic.clone();
+    project.tracks.clear();
+    for name in ["lead", "harmony"] {
+        let mut track = Track::new(
+            name,
+            NoteGroup {
+                id: format!("{name}-main"),
+                name: String::new(),
+                notes: source.main_group.notes.clone(),
+            },
+        );
+        track.mixer = source.mixer.clone();
+        track.voice = source.voice.clone();
+        track.voice.database = Some(voice.clone());
+        project.tracks.push(track);
+    }
+
+    let cancel = CancelToken::new();
+    let renderer = Renderer::new(NeuralBackend::new());
+    let first = renderer
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("parallel render must succeed");
+    assert_eq!(
+        renderer.backend().voice_loads(),
+        1,
+        "one parallel render loads the voice once"
+    );
+    assert_eq!(renderer.backend().dictionary_loads(), 0);
+    assert_eq!(
+        renderer.backend().phrase_hits() + renderer.backend().phrase_misses(),
+        2,
+        "two identical phrases synthesize or hit"
+    );
+
+    let (hits_before, misses_before) = (
+        renderer.backend().phrase_hits(),
+        renderer.backend().phrase_misses(),
+    );
+    let second = renderer
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("re-render must succeed");
+    assert_eq!(first, second, "re-renders must be bitwise identical");
+    assert_eq!(
+        renderer.backend().voice_loads(),
+        1,
+        "re-renders must not reload the voice"
+    );
+    assert_eq!(
+        renderer.backend().phrase_hits(),
+        hits_before + 2,
+        "both re-rendered phrases must hit"
+    );
+    assert_eq!(
+        renderer.backend().phrase_misses(),
+        misses_before,
+        "re-renders must not re-synthesize"
+    );
 }
 
 /// Rehosts `source`'s main-group notes behind a library reference with the
@@ -325,7 +399,7 @@ fn group_windows_crop_the_neural_release_tail() {
 
     let tail_start = (1.5 * f64::from(SAMPLE_RATE)) as usize;
     let cancel = CancelToken::new();
-    let mut renderer = Renderer::new(NeuralBackend::new());
+    let renderer = Renderer::new(NeuralBackend::new());
 
     // Control: without a window the voice emits audible tail audio, so the
     // cropped render's exact zeros below are a sensitive assertion.

@@ -1,9 +1,9 @@
 use std::f64::consts::FRAC_PI_4;
 
-use opensvr_core::{Blick, Mixer, PlacedNote, Project, ProjectError};
+use opensvr_core::{Blick, Mixer, PlacedNote, Project, ProjectError, Track};
 use thiserror::Error;
 
-use crate::{BackendError, CancelToken, TimedNote, VoiceBackend, split_phrases};
+use crate::{BackendError, CancelToken, PhraseAudio, TimedNote, VoiceBackend, split_phrases};
 
 pub const MIN_SAMPLE_RATE: u32 = 8_000;
 pub const MAX_SAMPLE_RATE: u32 = 384_000;
@@ -60,12 +60,16 @@ impl StereoBuffer {
 }
 
 /// Mixes every audible track of a project into one stereo buffer.
+///
+/// Tracks sing concurrently on scoped threads through one shared backend and
+/// are summed in track order, so multi-track renders stay bitwise identical
+/// no matter how the workers interleave.
 #[derive(Debug)]
 pub struct Renderer<B> {
     backend: B,
 }
 
-impl<B: VoiceBackend> Renderer<B> {
+impl<B: VoiceBackend + Sync> Renderer<B> {
     pub fn new(backend: B) -> Self {
         Self { backend }
     }
@@ -82,11 +86,14 @@ impl<B: VoiceBackend> Renderer<B> {
 
     /// Renders `project` at `sample_rate`.
     ///
-    /// Each track is sung as a single phrase by the backend, then panned and summed.
-    /// Muted and non-soloed tracks are skipped but still count towards the project length,
-    /// so the mixer never changes the timeline.
+    /// Each audible track is sung on its own scoped thread as one phrase per
+    /// rest-bounded phrase by the shared backend, then panned and summed in
+    /// track order. Muted and non-soloed tracks are skipped but still count
+    /// towards the project length, so the mixer never changes the timeline.
+    /// A cancelled render publishes no audio, exactly as before: workers only
+    /// return phrase audio, and mixing happens after they all join.
     pub fn render(
-        &mut self,
+        &self,
         project: &Project,
         sample_rate: u32,
         cancel: &CancelToken,
@@ -130,7 +137,10 @@ impl<B: VoiceBackend> Renderer<B> {
         }
 
         let has_solo = project.tracks.iter().any(|track| track.mixer.solo);
-        let mut output = StereoBuffer::silent(frames);
+        // Audible work in track order. The cancellation check stays ahead of
+        // the skips, exactly as in the sequential loop, so a cancelled token
+        // fails even when every track is silent.
+        let mut work = Vec::new();
         for (track, placed) in &tracks {
             if cancel.is_cancelled() {
                 return Err(RenderError::Cancelled);
@@ -138,38 +148,43 @@ impl<B: VoiceBackend> Renderer<B> {
             if placed.is_empty() || !is_audible(&track.mixer, has_solo) {
                 continue;
             }
-            let notes = timed_notes(project, placed);
-            let backend_error = |source| RenderError::Backend {
-                track: track.name.clone(),
-                source,
-            };
-            for phrase in split_phrases(&notes) {
-                let audio = self
-                    .backend
-                    .render_phrase(&track.voice, &phrase, sample_rate, cancel)
-                    .map_err(backend_error)?;
-                if audio.samples.iter().any(|sample| !sample.is_finite()) {
-                    let error =
-                        BackendError("the voice backend returned a non-finite sample".into());
-                    return Err(backend_error(error));
-                }
-                // Per-phrase group-window crop, exactly as in C++: the front
-                // note's `absoluteBegin` bounds the mixed output on the left
-                // (model-input context is kept), the back note's `absoluteEnd`
-                // clamps the release tail on the right.
-                let (Some(first), Some(last)) = (phrase.notes.first(), phrase.notes.last()) else {
-                    continue;
-                };
-                let release_end = last.end + REST_CONTEXT_SECONDS;
-                let stop = last
-                    .window_end
-                    .map_or(release_end, |end| release_end.min(end));
+            work.push((track, placed));
+        }
+
+        // Sing tracks concurrently; workers only return phrase audio, never
+        // touching the shared output buffer.
+        let mut sung = Vec::with_capacity(work.len());
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(work.len());
+            for (track, placed) in &work {
+                handles.push(scope.spawn(|| {
+                    sing_track(&self.backend, project, track, placed, sample_rate, cancel)
+                }));
+            }
+            // Join in track order so the first error in track order wins,
+            // exactly as the sequential loop reported it.
+            for (handle, (track, _)) in handles.into_iter().zip(&work) {
+                sung.push(handle.join().unwrap_or_else(|_| {
+                    Err(RenderError::Backend {
+                        track: track.name.clone(),
+                        source: BackendError("a render worker panicked".into()),
+                    })
+                })?);
+            }
+            Ok::<_, RenderError>(())
+        })?;
+
+        // Sum in track order through the single mixing path, so scheduling
+        // never changes a sample.
+        let mut output = StereoBuffer::silent(frames);
+        for ((track, _), phrases) in work.iter().zip(&sung) {
+            for phrase in phrases {
                 mix(
                     &mut output,
-                    &audio.samples,
-                    audio.start,
-                    first.window_start,
-                    stop,
+                    &phrase.audio.samples,
+                    phrase.audio.start,
+                    phrase.crop_start,
+                    phrase.stop,
                     sample_rate,
                     &track.mixer,
                     cancel,
@@ -184,6 +199,61 @@ impl<B: VoiceBackend> Renderer<B> {
         }
         Ok(output)
     }
+}
+
+/// One track's sung phrases: the audio plus its group-window crop bounds.
+///
+/// Per-phrase group-window crop, exactly as in C++: the front note's
+/// `absoluteBegin` bounds the mixed output on the left (model-input context
+/// is kept), the back note's `absoluteEnd` clamps the release tail on the
+/// right.
+struct SungPhrase {
+    audio: PhraseAudio,
+    crop_start: f64,
+    stop: f64,
+}
+
+/// Sings one track's phrases on a worker thread: timeline geometry plus the
+/// shared backend, without touching the mixed output.
+fn sing_track<B: VoiceBackend>(
+    backend: &B,
+    project: &Project,
+    track: &Track,
+    placed: &[PlacedNote<'_>],
+    sample_rate: u32,
+    cancel: &CancelToken,
+) -> Result<Vec<SungPhrase>, RenderError> {
+    let notes = timed_notes(project, placed);
+    let backend_error = |source| RenderError::Backend {
+        track: track.name.clone(),
+        source,
+    };
+    let mut sung = Vec::new();
+    for phrase in split_phrases(&notes) {
+        if cancel.is_cancelled() {
+            return Err(RenderError::Cancelled);
+        }
+        let audio = backend
+            .render_phrase(&track.voice, &phrase, sample_rate, cancel)
+            .map_err(backend_error)?;
+        if audio.samples.iter().any(|sample| !sample.is_finite()) {
+            let error = BackendError("the voice backend returned a non-finite sample".into());
+            return Err(backend_error(error));
+        }
+        let (Some(first), Some(last)) = (phrase.notes.first(), phrase.notes.last()) else {
+            continue;
+        };
+        let release_end = last.end + REST_CONTEXT_SECONDS;
+        let stop = last
+            .window_end
+            .map_or(release_end, |end| release_end.min(end));
+        sung.push(SungPhrase {
+            audio,
+            crop_start: first.window_start,
+            stop,
+        });
+    }
+    Ok(sung)
 }
 
 fn is_audible(mixer: &Mixer, has_solo: bool) -> bool {
@@ -283,7 +353,7 @@ mod tests {
 
     impl VoiceBackend for FullSpan {
         fn render_phrase(
-            &mut self,
+            &self,
             _: &VoiceSettings,
             phrase: &Phrase<'_>,
             rate: u32,
@@ -353,7 +423,7 @@ mod tests {
             library: vec![lead_lib, tail_lib],
             ..Project::default()
         };
-        let mut renderer = Renderer::new(FullSpan);
+        let renderer = Renderer::new(FullSpan);
         let audio = renderer
             .render(&project, 8000, &CancelToken::new())
             .unwrap();
@@ -376,18 +446,21 @@ mod tests {
     /// Fills each phrase with 1.0 and records where phrases start.
     #[derive(Default)]
     struct Constant {
-        starts: Vec<f64>,
+        starts: std::sync::Mutex<Vec<f64>>,
     }
 
     impl VoiceBackend for Constant {
         fn render_phrase(
-            &mut self,
+            &self,
             _: &VoiceSettings,
             phrase: &Phrase<'_>,
             rate: u32,
             _: &CancelToken,
         ) -> Result<PhraseAudio, BackendError> {
-            self.starts.push(phrase.notes[0].start);
+            self.starts
+                .lock()
+                .expect("test backend is never poisoned")
+                .push(phrase.notes[0].start);
             let end = phrase.notes.last().unwrap().end;
             Ok(PhraseAudio {
                 start: phrase.notes[0].start,
@@ -431,7 +504,7 @@ mod tests {
             tracks,
             ..Project::default()
         };
-        let mut renderer = Renderer::new(backend);
+        let renderer = Renderer::new(backend);
         let result = renderer.render(&project, 8000, &CancelToken::new());
         (result, renderer.backend)
     }
@@ -446,7 +519,7 @@ mod tests {
 
         // 120 BPM: the note spans 0.5 s..1.0 s, plus 0.1 s of rest context.
         assert_eq!(audio.frames(), 8800);
-        assert!((backend.starts[0] - 0.5).abs() < 1e-9);
+        assert!((backend.starts.lock().unwrap()[0] - 0.5).abs() < 1e-9);
         assert!((audio.left[4000] - 0.5).abs() < 1e-6);
         assert!(audio.right[4000].abs() < 1e-6);
         assert_eq!(audio.left[3999], 0.0);
@@ -469,7 +542,7 @@ mod tests {
         let mut long = track("long", &[0, 2 * Q]);
         long.mixer.mute = true;
         let (audio, backend) = render(vec![short, long], Constant::default());
-        assert_eq!(backend.starts.len(), 1);
+        assert_eq!(backend.starts.lock().unwrap().len(), 1);
         assert_eq!(
             audio.unwrap().frames(),
             12_800,
@@ -491,11 +564,11 @@ mod tests {
             library,
             ..Project::default()
         };
-        let mut renderer = Renderer::new(Constant::default());
+        let renderer = Renderer::new(Constant::default());
         renderer
             .render(&project, 8000, &CancelToken::new())
             .unwrap();
-        assert!((renderer.backend.starts[0] - 1.0).abs() < 1e-9);
+        assert!((renderer.backend.starts.lock().unwrap()[0] - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -504,7 +577,7 @@ mod tests {
         assert!(matches!(result, Err(RenderError::Overlap { .. })));
 
         let project = Project::default();
-        let mut renderer = Renderer::new(Constant::default());
+        let renderer = Renderer::new(Constant::default());
         let error = renderer
             .render(&project, 100, &CancelToken::new())
             .unwrap_err();
@@ -526,6 +599,73 @@ mod tests {
     fn an_empty_project_renders_no_audio() {
         let (audio, backend) = render(Vec::new(), Constant::default());
         assert_eq!(audio.unwrap().frames(), 0);
-        assert!(backend.starts.is_empty());
+        assert!(backend.starts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parallel_tracks_sum_in_track_order_like_isolated_sums() {
+        // Two identical centered tracks at half gain: the clamp stays out of
+        // the way, so the joint render must equal the sample-wise sum of the
+        // isolated renders no matter how the worker threads interleave.
+        let mut lead = track("lead", &[0]);
+        lead.mixer.gain = 0.5;
+        let mut harmony = track("harmony", &[0]);
+        harmony.mixer.gain = 0.5;
+
+        let muted = |audible: &Track, silent: &Track| {
+            let mut silent = silent.clone();
+            silent.mixer.mute = true;
+            Project {
+                tracks: vec![audible.clone(), silent],
+                ..Project::default()
+            }
+        };
+        let cancel = CancelToken::new();
+        let single = |project: &Project| {
+            Renderer::new(Constant::default())
+                .render(project, 8000, &cancel)
+                .unwrap()
+        };
+        let first = single(&muted(&lead, &harmony));
+        let second = single(&muted(&harmony, &lead));
+        assert_eq!(first.frames(), second.frames());
+
+        let joint = Project {
+            tracks: vec![lead, harmony],
+            ..Project::default()
+        };
+        // Repeated joint renders pin determinism: same bits every time.
+        let mut previous = None;
+        for _ in 0..3 {
+            let audio = single(&joint);
+            assert_eq!(audio.frames(), first.frames());
+            for ((got, a), b) in audio
+                .left
+                .iter()
+                .zip(&first.left)
+                .zip(&second.left)
+                .chain(audio.right.iter().zip(&first.right).zip(&second.right))
+            {
+                assert_eq!(*got, *a + *b, "joint tracks must sum in track order");
+            }
+            if let Some(previous) = previous {
+                assert_eq!(audio, previous, "re-renders must be bitwise identical");
+            }
+            previous = Some(audio);
+        }
+    }
+
+    #[test]
+    fn a_cancelled_multi_track_render_publishes_nothing() {
+        let token = CancelToken::new();
+        token.cancel();
+        let project = Project {
+            tracks: vec![track("lead", &[0]), track("harmony", &[Q])],
+            ..Project::default()
+        };
+        assert!(matches!(
+            Renderer::new(Constant::default()).render(&project, 8000, &token),
+            Err(RenderError::Cancelled)
+        ));
     }
 }
