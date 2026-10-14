@@ -16,6 +16,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use opensvr_core::Language;
 use opensvr_g2p::{DictionarySet, TimingSyllable};
@@ -87,31 +88,36 @@ pub struct VoiceCache {
 #[derive(Debug)]
 struct VoiceEntry {
     stamp: FileStamp,
-    synthesizer: VoiceSynthesizer,
+    synthesizer: Arc<VoiceSynthesizer>,
 }
 
 impl VoiceCache {
     /// Returns the synthesizer for `stamp`, loading it on a miss.
     ///
-    /// `load` runs only on a miss; its error propagates without caching.
+    /// `load` runs only on a miss; its error propagates without caching. The
+    /// synthesizer is shared by reference count so worker threads can drop
+    /// the cache lock before singing: synthesis itself only needs `&self`.
     pub fn get_or_load(
         &mut self,
         stamp: FileStamp,
         load: impl FnOnce() -> Result<VoiceSynthesizer, BackendError>,
-    ) -> Result<&mut VoiceSynthesizer, BackendError> {
+    ) -> Result<Arc<VoiceSynthesizer>, BackendError> {
         if let Some(position) = self.entries.iter().position(|entry| entry.stamp == stamp) {
             let entry = self.entries.remove(position);
+            let synthesizer = entry.synthesizer.clone();
             self.entries.push(entry);
-        } else {
-            let synthesizer = load()?;
-            if self.entries.len() == MAX_CACHED_VOICES {
-                self.entries.remove(0);
-            }
-            self.entries.push(VoiceEntry { stamp, synthesizer });
-            self.loads += 1;
+            return Ok(synthesizer);
         }
-        let index = self.entries.len() - 1;
-        Ok(&mut self.entries[index].synthesizer)
+        let synthesizer = Arc::new(load()?);
+        if self.entries.len() == MAX_CACHED_VOICES {
+            self.entries.remove(0);
+        }
+        self.entries.push(VoiceEntry {
+            stamp,
+            synthesizer: synthesizer.clone(),
+        });
+        self.loads += 1;
+        Ok(synthesizer)
     }
 
     /// Successful voice loads so far (misses that loaded).

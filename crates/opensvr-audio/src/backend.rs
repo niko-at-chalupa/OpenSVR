@@ -49,6 +49,11 @@ pub struct PhraseAudio {
 pub struct BackendError(pub String);
 
 /// Something that can sing: the seam where OpenSV's neural synthesis plugs in.
+///
+/// Backends are shared across the render worker threads (one thread per
+/// track), so phrase rendering takes a shared reference: any caches live
+/// behind interior mutability and concurrent phrases must sing identical
+/// bits to sequential ones.
 pub trait VoiceBackend {
     /// Synthesizes one `phrase` of non-overlapping, time-ordered notes as mono audio.
     ///
@@ -56,7 +61,7 @@ pub trait VoiceBackend {
     /// note so the release is not cut off; the renderer crops anything beyond the
     /// phrase's group window (and the project end).
     fn render_phrase(
-        &mut self,
+        &self,
         voice: &VoiceSettings,
         phrase: &Phrase<'_>,
         sample_rate: u32,
@@ -83,7 +88,7 @@ impl ToneBackend {
 
 impl VoiceBackend for ToneBackend {
     fn render_phrase(
-        &mut self,
+        &self,
         _voice: &VoiceSettings,
         phrase: &Phrase<'_>,
         sample_rate: u32,

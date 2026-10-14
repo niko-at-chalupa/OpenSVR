@@ -18,6 +18,8 @@
 //! synthesis inputs, so repeated identical phrases resample the cached audio
 //! instead of running the vocoder again.
 
+use std::sync::{Mutex, MutexGuard};
+
 use opensvr_core::{CancelToken, Language, VoiceSettings};
 use opensvr_g2p::{
     DictionarySet, NoteResolver, TimingSyllable, dictionary_stem, load_dictionaries,
@@ -218,11 +220,24 @@ fn stamp_voice(database: &std::path::Path) -> Result<FileStamp, BackendError> {
 /// render loads each file once. The counters below expose that sharing for
 /// tests; cached audio is always resampled and cropped exactly like a fresh
 /// render, so hits stay sample-identical.
+///
+/// The caches sit behind locks so tracks can sing on scoped threads through
+/// one shared backend: lookups clone an `Arc` (voices), a set (dictionaries)
+/// or the samples (phrases) under a brief lock and sing without holding it,
+/// so concurrent phrases synthesize in parallel while each file still loads
+/// once.
 #[derive(Debug, Default)]
 pub struct NeuralBackend {
-    voices: VoiceCache,
-    dictionaries: DictionaryCache,
-    phrases: PhraseCache,
+    voices: Mutex<VoiceCache>,
+    dictionaries: Mutex<DictionaryCache>,
+    phrases: Mutex<PhraseCache>,
+}
+
+/// Recovers a cache lock after a panicking worker: cache entries stay valid.
+fn lock_cache<T>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl NeuralBackend {
@@ -232,22 +247,22 @@ impl NeuralBackend {
 
     /// Successful voice-database loads so far (one per distinct file stamp).
     pub fn voice_loads(&self) -> usize {
-        self.voices.loads()
+        lock_cache(&self.voices).loads()
     }
 
     /// Successful dictionary loads so far (one per distinct stamp set).
     pub fn dictionary_loads(&self) -> usize {
-        self.dictionaries.loads()
+        lock_cache(&self.dictionaries).loads()
     }
 
     /// Phrase renders served from the cache so far.
     pub fn phrase_hits(&self) -> usize {
-        self.phrases.hits()
+        lock_cache(&self.phrases).hits()
     }
 
     /// Phrase renders synthesized (and retained) so far.
     pub fn phrase_misses(&self) -> usize {
-        self.phrases.misses()
+        lock_cache(&self.phrases).misses()
     }
 
     /// Returns the track dictionaries, loading them once per stamp set.
@@ -256,7 +271,7 @@ impl NeuralBackend {
     /// filesystem and bypass the cache, exactly as in C++ (where
     /// `resolvePhonemes` returns before the directory check for them).
     fn dictionaries_for(
-        &mut self,
+        &self,
         voice: &VoiceSettings,
         notes: &[crate::TimedNote<'_>],
     ) -> Result<DictionarySet, BackendError> {
@@ -281,7 +296,7 @@ impl NeuralBackend {
         }
         let stamps = dictionary_stamps(directory, voice.language)?;
         let key = DictionaryKey::new(directory.to_owned(), voice.language, stamps);
-        self.dictionaries
+        lock_cache(&self.dictionaries)
             .get_or_load(key, || {
                 load_dictionaries(directory, voice.language)
                     .map_err(|error| backend_error(error.to_string()))
@@ -292,7 +307,7 @@ impl NeuralBackend {
 
 impl VoiceBackend for NeuralBackend {
     fn render_phrase(
-        &mut self,
+        &self,
         voice: &VoiceSettings,
         phrase: &Phrase<'_>,
         sample_rate: u32,
@@ -325,18 +340,21 @@ impl VoiceBackend for NeuralBackend {
                 backend_error("Select a voice.nofs database before playing singing notes.")
             })?;
         let voice_stamp = stamp_voice(database)?;
-        let synthesizer = self.voices.get_or_load(voice_stamp.clone(), || {
+        // Clone the shared synthesizer out of the cache before singing: the
+        // lock is only held for the stamp lookup (or the single load), never
+        // for prediction or vocoding, so tracks synthesize in parallel.
+        let synthesizer = lock_cache(&self.voices).get_or_load(voice_stamp.clone(), || {
             let mut loaded = VoiceSynthesizer::new();
             loaded
                 .load(database)
                 .map_err(|error| backend_error(error.to_string()))?;
             Ok(loaded)
         })?;
-        let synthesis = predict_phrase(synthesizer, &inputs, phrase.notes, start_seconds, cancel)?;
+        let synthesis = predict_phrase(&synthesizer, &inputs, phrase.notes, start_seconds, cancel)?;
 
         // Empty vibrato envelope means unity; empty vocal-mode weights mean defaults.
         let vocal_mode_weights: Vec<f32> = Vec::new();
-        if let Some((native_rate, native)) = self.phrases.lookup(
+        if let Some((native_rate, native)) = lock_cache(&self.phrases).lookup(
             &voice_stamp,
             &inputs.syllables,
             &synthesis.log_f0,
@@ -351,7 +369,7 @@ impl VoiceBackend for NeuralBackend {
         }
 
         let (native_rate, native) = render_native(
-            synthesizer,
+            &synthesizer,
             &synthesis.timed,
             &synthesis.log_f0,
             &vocal_mode_weights,
@@ -360,7 +378,7 @@ impl VoiceBackend for NeuralBackend {
         // Cache the native-rate mono output before resampling: placement,
         // project rate and mixer never participate in synthesis, so a hit
         // resamples and crops exactly like this fresh render did.
-        self.phrases.retain(
+        lock_cache(&self.phrases).retain(
             voice_stamp,
             inputs.syllables.clone(),
             synthesis.log_f0.clone(),
@@ -704,7 +722,7 @@ mod tests {
     #[test]
     fn thirty_second_phrases_are_rejected() {
         let notes = [note(0.0, 31.0, 60, "ka")];
-        let mut backend = NeuralBackend::new();
+        let backend = NeuralBackend::new();
         let error = backend
             .render_phrase(
                 &VoiceSettings::default(),
@@ -718,7 +736,7 @@ mod tests {
 
     #[test]
     fn empty_phrases_render_no_audio() {
-        let mut backend = NeuralBackend::new();
+        let backend = NeuralBackend::new();
         let audio = backend
             .render_phrase(
                 &VoiceSettings::default(),
