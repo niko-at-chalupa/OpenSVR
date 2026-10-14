@@ -2,7 +2,7 @@ use std::{fmt, path::PathBuf, str::FromStr};
 
 use thiserror::Error;
 
-use crate::{Blick, TempoMap};
+use crate::{Blick, TempoMap, curve::Curve};
 
 /// Errors raised while resolving a project's notes onto the timeline.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -37,6 +37,10 @@ pub struct NoteGroup {
     pub name: String,
     /// Sorted by onset.
     pub notes: Vec<Note>,
+    /// Continuous pitch-bend curve in semitones (offset from note pitch).
+    pub pitch_delta: Curve,
+    /// Dynamic vibrato depth envelope curve.
+    pub vibrato_env: Curve,
 }
 
 /// Placement of a [`NoteGroup`] on a track timeline.
@@ -288,6 +292,7 @@ mod tests {
             id: id.into(),
             name: id.into(),
             notes,
+            ..NoteGroup::default()
         }
     }
 

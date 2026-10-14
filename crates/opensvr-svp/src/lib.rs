@@ -310,6 +310,9 @@ impl RawGroup {
             id: self.uuid,
             name: self.name,
             notes,
+            // Curves land in the SVP-reading follow-up; until then every
+            // group carries empty (inert) automation.
+            ..NoteGroup::default()
         })
     }
 }

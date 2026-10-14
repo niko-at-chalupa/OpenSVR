@@ -382,6 +382,7 @@ mod tests {
                         detune: 0.0,
                     },
                 ],
+                ..NoteGroup::default()
             },
         );
         track.voice.dictionary = Some(dir);
@@ -414,6 +415,7 @@ mod tests {
                     phonemes: String::new(),
                     detune: 0.0,
                 }],
+                ..NoteGroup::default()
             },
         );
         track.voice.dictionary = Some(PathBuf::from("/definitely/not/here"));

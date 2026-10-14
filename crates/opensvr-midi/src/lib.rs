@@ -219,6 +219,7 @@ mod tests {
             id: "main".into(),
             name: "main".into(),
             notes: vec![note],
+            ..NoteGroup::default()
         };
         Project {
             name: "song".into(),
