@@ -372,6 +372,7 @@ fn windowed(basic: &Project, source: &Track, end: Option<Blick>) -> Project {
         begin: 0,
         end,
         instrumental: false,
+        ..GroupReference::default()
     });
     project.tracks.push(track);
     project

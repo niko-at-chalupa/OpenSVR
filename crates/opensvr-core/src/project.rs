@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf, str::FromStr};
+use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr};
 
 use thiserror::Error;
 
@@ -30,6 +30,31 @@ pub struct Note {
     pub detune: f64,
 }
 
+/// A vocal-mode (singing-style) setting on a note group, mirroring OpenSV's
+/// `VocalModeSetting` in `src/core/Project.h`: `enabled` defaults to true,
+/// `amount` is the static weight, and `has_curve` marks a dynamic automation
+/// curve read through the same `readCurve` validation as the group curves.
+/// Per-mode curves are stored as read: unlike `pitch_delta`/`vibrato_env`,
+/// OpenSV's `normaliseProject` does not normalise them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VocalModeSetting {
+    pub enabled: bool,
+    pub amount: f64,
+    pub has_curve: bool,
+    pub curve: Curve,
+}
+
+impl Default for VocalModeSetting {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            amount: 0.0,
+            has_curve: false,
+            curve: Curve::default(),
+        }
+    }
+}
+
 /// An ordered collection of notes, either a track's own group or a shared library group.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NoteGroup {
@@ -41,10 +66,12 @@ pub struct NoteGroup {
     pub pitch_delta: Curve,
     /// Dynamic vibrato depth envelope curve.
     pub vibrato_env: Curve,
+    /// Vocal-style weights keyed by mode name (`std::map`, hence ordered).
+    pub vocal_modes: BTreeMap<String, VocalModeSetting>,
 }
 
 /// Placement of a [`NoteGroup`] on a track timeline.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroupReference {
     pub group_id: String,
     /// Where the group's origin sits on the track.
@@ -57,6 +84,28 @@ pub struct GroupReference {
     pub end: Option<Blick>,
     /// An instrumental (audio backing) reference carries no singing notes.
     pub instrumental: bool,
+    /// If true, inherit vocal-mode settings from the parent track.
+    pub vocal_mode_inherited: bool,
+    /// Name of the applied vocal-mode preset.
+    pub vocal_mode_preset: String,
+    /// Per-mode weight overrides (`std::map`, hence ordered).
+    pub vocal_mode_params: BTreeMap<String, f64>,
+}
+
+impl Default for GroupReference {
+    fn default() -> Self {
+        Self {
+            group_id: String::new(),
+            time_offset: 0,
+            pitch_offset: 0,
+            begin: 0,
+            end: None,
+            instrumental: false,
+            vocal_mode_inherited: true,
+            vocal_mode_preset: String::new(),
+            vocal_mode_params: BTreeMap::new(),
+        }
+    }
 }
 
 /// Singing language used for grapheme-to-phoneme conversion.
@@ -321,6 +370,7 @@ mod tests {
             begin: 4 * Q + Q / 2,
             end: Some(6 * Q),
             instrumental: false,
+            ..GroupReference::default()
         });
         let library = vec![group(
             "lib",
@@ -348,6 +398,7 @@ mod tests {
             begin: 4 * Q + Q / 2,
             end: Some(6 * Q),
             instrumental: false,
+            ..GroupReference::default()
         });
         let library = vec![group("lib", vec![note(0, Q, 60)])];
         let project = Project {

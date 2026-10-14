@@ -523,6 +523,7 @@ mod tests {
             begin,
             end,
             instrumental: false,
+            ..GroupReference::default()
         });
         (track, library)
     }
