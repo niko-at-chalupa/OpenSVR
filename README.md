@@ -15,7 +15,8 @@ tested/deterministic output, and CPU-efficient offline synthesis at parity with 
 It's very minimal and implements little-to-nothing, for now.
 
 > [!IMPORTANT]
-> **The neural voice engine is not ported yet.** `render` mixes the project correctly (timeline, tempo map, group
-> placement, transposition, cropping, gain, pan, solo/mute) but sings sine tones instead of using a voice
-> database. `info` does read voice databases (`opensvr-nofs`): it prints the singer name, vendor and vocal
-> modes when `--voice` points at a `.nofs` file. See [ROADMAP.md](ROADMAP.md) for how to port the neural synthesis.
+> **The neural voice engine sings when it has a voice.** `render` mixes the project correctly (timeline, tempo map, group
+> placement, transposition, cropping, gain, pan, solo/mute) and sings tracks whose voice database resolves to a real
+> `.nofs` file through the neural voice (voice, dictionary and phrase files are cached by file stamp); without one,
+> notes fall back to sine tones. `info` does read voice databases (`opensvr-nofs`): it prints the singer name, vendor and vocal
+> modes when `--voice` points at a `.nofs` file. See [ROADMAP.md](ROADMAP.md) for what remains of the synthesis port.

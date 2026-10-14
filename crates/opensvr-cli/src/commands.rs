@@ -87,7 +87,7 @@ fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
     } else {
         // Not progress output, so `--quiet` does not hide it: the result is not singing.
         eprintln!(
-            "opensvr: note: the neural voice engine is not ported yet; notes are rendered as placeholder tones"
+            "opensvr: note: no voice database found; notes are rendered as placeholder tones"
         );
         Renderer::new(ToneBackend::default()).render(&project, args.rate, cancel)?
     };
