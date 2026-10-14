@@ -3,19 +3,20 @@
 //! The file is JSON. It is first deserialized into private "raw" structs that
 //! mirror the file layout, then validated and converted into the domain types of
 //! [`opensvr_core`]. Group automation curves (`parameters.pitchDelta` and
-//! `parameters.vibratoEnv`) are read with the same validation as OpenSV's
-//! `readCurve`; fields the command-line tools do not use yet (vocal modes,
-//! take lists, ...) are ignored; see `ROADMAP.md` for lossless saving.
+//! `parameters.vibratoEnv`) and per-mode vocal-mode curves are read with the
+//! same validation as OpenSV's `readCurve`; fields the command-line tools do
+//! not use yet (take lists, ...) are ignored; see `ROADMAP.md` for lossless saving.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
 };
 
 use opensvr_core::{
     AutomationPoint, Blick, Curve, GroupReference, Interpolation, MAX_FILE_BLICK, Mixer, Note,
-    NoteGroup, Project, TempoChange, TempoMap, TimeSignature, Track, VoiceSettings,
+    NoteGroup, Project, TempoChange, TempoMap, TimeSignature, Track, VocalModeSetting,
+    VoiceSettings,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -197,6 +198,11 @@ struct RawGroup {
     notes: Vec<RawNote>,
     #[serde(default)]
     parameters: Option<RawParameters>,
+    /// `vocalModes` stays as [`Value`] so a non-object fails with the same
+    /// `Invalid` error OpenSV's `readGroup` reports, rather than a JSON error.
+    /// (`None`/JSON null both mean absent, as JUCE parses null to void.)
+    #[serde(default, rename = "vocalModes")]
+    vocal_modes: Option<Value>,
 }
 
 /// The `parameters` object of a group: only the two automation curves the
@@ -243,6 +249,11 @@ struct RawReference {
     blick_absolute_end: i64,
     #[serde(default)]
     is_instrumental: bool,
+    /// Reference `voice` overrides (`vocalModeInherited`, `vocalModePreset`,
+    /// `vocalModeParams`). Kept as [`Value`] so a non-object is an `Invalid`
+    /// error like the C++ block; absent/null means defaults.
+    #[serde(default)]
+    voice: Option<Value>,
 }
 
 /// Sentinel the format uses for "no right crop boundary".
@@ -337,8 +348,145 @@ impl RawGroup {
             notes,
             pitch_delta: read_curve(parameters.pitch_delta, "pitchDelta")?,
             vibrato_env: read_curve(parameters.vibrato_env, "vibratoEnv")?,
+            vocal_modes: read_vocal_modes(self.vocal_modes.as_ref())?,
         })
     }
+}
+
+/// Reads the `vocalModes` object of a group exactly like the vocal-mode block
+/// of OpenSV's `readGroup` in `src/core/ProjectFile.cpp`: absent (or JSON
+/// null, which JUCE parses to void) stays empty; a non-object is an error; a
+/// per-mode number is a static amount; a per-mode object carries an optional
+/// `enabled` boolean, an optional finite `amount`, and an optional automation
+/// curve (either `mode` or `points` present) read with `readCurve` validation.
+/// Anything else is an error.
+fn read_vocal_modes(raw: Option<&Value>) -> Result<BTreeMap<String, VocalModeSetting>> {
+    let Some(raw) = raw else {
+        return Ok(BTreeMap::new());
+    };
+    if raw.is_null() {
+        return Ok(BTreeMap::new());
+    }
+    let Value::Object(modes) = raw else {
+        return invalid("vocalModes must be an object of mode curves.");
+    };
+    let mut out = BTreeMap::new();
+    for (name, mode_value) in modes {
+        if mode_value.is_null()
+            || mode_value.is_boolean()
+            || mode_value.is_string()
+            || mode_value.is_array()
+        {
+            return invalid(format!(
+                "vocalModes.{name} must be an amount or settings object."
+            ));
+        }
+        if mode_value.is_number() {
+            match mode_value.as_f64() {
+                Some(amount) if amount.is_finite() => {
+                    out.insert(
+                        name.clone(),
+                        VocalModeSetting {
+                            enabled: true,
+                            amount,
+                            has_curve: false,
+                            curve: Curve::default(),
+                        },
+                    );
+                }
+                _ => return invalid(format!("vocalModes.{name} must have a finite amount.")),
+            }
+            continue;
+        }
+        // Per-mode settings object.
+        let Value::Object(fields) = mode_value else {
+            return invalid(format!(
+                "vocalModes.{name} must be an amount or settings object."
+            ));
+        };
+        let mut setting = VocalModeSetting::default();
+        if let Some(enabled) = fields.get("enabled") {
+            match enabled.as_bool() {
+                Some(value) => setting.enabled = value,
+                None => {
+                    return invalid(format!("vocalModes.{name}.enabled must be a boolean."));
+                }
+            }
+        }
+        if let Some(amount) = fields.get("amount") {
+            match amount.as_f64() {
+                Some(value) if value.is_finite() => setting.amount = value,
+                _ => {
+                    return invalid(format!("vocalModes.{name}.amount must be a finite number."));
+                }
+            }
+        }
+        if fields.contains_key("mode") || fields.contains_key("points") {
+            let curve_name = format!("vocalModes.{name}");
+            let raw_curve: RawCurve = serde_json::from_value(mode_value.clone()).map_err(|_| {
+                SvpError::Invalid(format!(
+                    "{curve_name} must contain a mode and points array."
+                ))
+            })?;
+            // Unlike `pitchDelta`/`vibratoEnv`, `normaliseProject` never
+            // normalises per-mode curves, so the points stay in file order.
+            setting.curve = read_curve_inner(Some(raw_curve), &curve_name, false)?;
+            setting.has_curve = true;
+        }
+        out.insert(name.clone(), setting);
+    }
+    Ok(out)
+}
+
+/// Reads the `voice` overrides of a group reference exactly like the `voice`
+/// block of OpenSV's `readReference`: absent/null keeps the C++ defaults
+/// (`vocalModeInherited = true`, empty preset/params); a non-object is an
+/// error; `vocalModeParams` must be an object of finite numbers.
+fn read_voice_overrides(raw: Option<&Value>) -> Result<(bool, String, BTreeMap<String, f64>)> {
+    let Some(raw) = raw else {
+        return Ok((true, String::new(), BTreeMap::new()));
+    };
+    if raw.is_null() {
+        return Ok((true, String::new(), BTreeMap::new()));
+    }
+    let Value::Object(voice) = raw else {
+        return invalid("a group reference's voice settings must be an object.");
+    };
+    let mut inherited = true;
+    if let Some(value) = voice.get("vocalModeInherited") {
+        match value.as_bool() {
+            Some(value) => inherited = value,
+            None => return invalid("vocalModeInherited must be a boolean."),
+        }
+    }
+    let mut preset = String::new();
+    if let Some(value) = voice.get("vocalModePreset") {
+        match value.as_str() {
+            Some(value) => value.clone_into(&mut preset),
+            None => return invalid("vocalModePreset must be a string."),
+        }
+    }
+    let mut params = BTreeMap::new();
+    if let Some(mode_params) = voice.get("vocalModeParams") {
+        if mode_params.is_null() {
+            // JUCE parses JSON null to void, i.e. absent.
+        } else {
+            let Value::Object(entries) = mode_params else {
+                return invalid("vocalModeParams must be an object of mode amounts.");
+            };
+            for (name, amount) in entries {
+                match amount.as_f64() {
+                    Some(value) if value.is_finite() => {
+                        params.insert(name.clone(), value);
+                    }
+                    _ => {
+                        return invalid(format!("vocalModeParams.{name} must be a finite number."));
+                    }
+                }
+            }
+        }
+    }
+    Ok((inherited, preset, params))
 }
 
 /// Reads one automation curve exactly like OpenSV's `readCurve` in
@@ -349,7 +497,15 @@ impl RawGroup {
 /// handling mirror `normaliseCurve` (via `normaliseProject` after load):
 /// points are stable-sorted by position and the last point at each position
 /// wins, matching the editor behavior where later edits overwrite.
+///
+/// Per-mode vocal curves bypass the sort/dedup via [`read_curve_inner`] with
+/// `normalise = false`, because the C++ `normaliseProject` never normalises
+/// them (only `pitchDelta`/`vibratoEnv`/`systemPitchDelta`).
 fn read_curve(raw: Option<RawCurve>, name: &str) -> Result<Curve> {
+    read_curve_inner(raw, name, true)
+}
+
+fn read_curve_inner(raw: Option<RawCurve>, name: &str, normalise: bool) -> Result<Curve> {
     let Some(raw) = raw else {
         return Ok(Curve::default());
     };
@@ -390,6 +546,9 @@ fn read_curve(raw: Option<RawCurve>, name: &str) -> Result<Curve> {
             _ => return invalid(format!("{name} contains an invalid point.")),
         }
     }
+    if !normalise {
+        return Ok(Curve { mode, points });
+    }
     if points.len() > 1
         && points
             .windows(2)
@@ -429,6 +588,8 @@ impl RawReference {
         if begin < 0 || end.is_some_and(|end| end <= begin) {
             return invalid("a group reference has invalid crop boundaries");
         }
+        let (vocal_mode_inherited, vocal_mode_preset, vocal_mode_params) =
+            read_voice_overrides(self.voice.as_ref())?;
         Ok(GroupReference {
             group_id: self.group_id,
             time_offset: blick(self.blick_offset, "a group offset")?,
@@ -436,6 +597,9 @@ impl RawReference {
             begin,
             end,
             instrumental: self.is_instrumental,
+            vocal_mode_inherited,
+            vocal_mode_preset,
+            vocal_mode_params,
         })
     }
 }
@@ -720,5 +884,130 @@ mod tests {
             (track.groups[0].begin, track.groups[0].end),
             (Q, Some(3 * Q))
         );
+    }
+
+    #[test]
+    fn missing_vocal_modes_keep_defaults() {
+        let project = parse_value(&sample()).unwrap();
+        let track = &project.tracks[0];
+        assert!(track.main_group.vocal_modes.is_empty());
+        assert!(project.library[0].vocal_modes.is_empty());
+        assert!(track.main_ref.vocal_mode_inherited);
+        assert_eq!(track.main_ref.vocal_mode_preset, "");
+        assert!(track.main_ref.vocal_mode_params.is_empty());
+        assert!(track.groups[0].vocal_mode_inherited);
+    }
+
+    #[test]
+    fn loads_vocal_modes_and_voice_overrides() {
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["vocalModes"] = json!({
+            "Power": 0.8,
+            "Soft": { "enabled": false, "amount": 0.3 },
+            "Airy": {
+                "enabled": true,
+                "amount": 0.5,
+                "mode": "linear",
+                "points": [0, 0.0, 1000, 1.0],
+            },
+        });
+        value["tracks"][0]["groups"][0]["voice"] = json!({
+            "vocalModeInherited": false,
+            "vocalModePreset": "Chest",
+            "vocalModeParams": { "Power": 0.9 },
+        });
+        let project = parse_value(&value).unwrap();
+        let group = &project.tracks[0].main_group;
+        assert_eq!(group.vocal_modes["Power"].amount, 0.8);
+        assert!(group.vocal_modes["Power"].enabled);
+        assert!(!group.vocal_modes["Power"].has_curve);
+        assert!(!group.vocal_modes["Soft"].enabled);
+        assert_eq!(group.vocal_modes["Soft"].amount, 0.3);
+        let airy = &group.vocal_modes["Airy"];
+        assert!(airy.has_curve);
+        assert_eq!(sample_curve(&airy.curve, 500, 0.0), 0.5);
+        // `std::map` ordering is mirrored with `BTreeMap`.
+        let names: Vec<_> = group.vocal_modes.keys().cloned().collect();
+        assert_eq!(names, ["Airy", "Power", "Soft"]);
+
+        let reference = &project.tracks[0].groups[0];
+        assert!(!reference.vocal_mode_inherited);
+        assert_eq!(reference.vocal_mode_preset, "Chest");
+        assert_eq!(reference.vocal_mode_params["Power"], 0.9);
+    }
+
+    #[test]
+    fn vocal_mode_curves_stay_unnormalised() {
+        // `normaliseProject` sorts `pitchDelta` but leaves per-mode curves in
+        // file order, duplicates included.
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["parameters"] = json!({
+            "pitchDelta": {
+                "mode": "linear",
+                "points": [1000, 1.0, 0, 2.0],
+            },
+        });
+        value["tracks"][0]["mainGroup"]["vocalModes"] = json!({
+            "Power": {
+                "amount": 0.5,
+                "mode": "linear",
+                "points": [1000, 1.0, 0, 2.0, 1000, 3.0],
+            },
+        });
+        let project = parse_value(&value).unwrap();
+        let group = &project.tracks[0].main_group;
+        assert_eq!(group.pitch_delta.points[0].position, 0);
+        assert_eq!(
+            group.vocal_modes["Power"]
+                .curve
+                .points
+                .iter()
+                .map(|point| (point.position, point.value))
+                .collect::<Vec<_>>(),
+            [(1000, 1.0), (0, 2.0), (1000, 3.0)]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_vocal_modes() {
+        // Group-level shapes: non-object, non-boolean `enabled`,
+        // neither-number-nor-object entries, and bad curves. (Plain JSON
+        // numbers are always finite, so the finite-amount guard is
+        // unreachable from text and needs no fixture.)
+        let bad_groups = [
+            json!(5.0),
+            json!({ "Power": true }),
+            json!({ "Power": null }),
+            json!({ "Power": [0.5] }),
+            json!({ "Power": { "enabled": "yes" } }),
+            json!({ "Power": { "amount": "loud" } }),
+            json!({ "Power": { "mode": "smooth", "points": [0, 1.0] } }),
+            json!({ "Power": { "mode": "linear", "points": [0] } }),
+        ];
+        for bad in bad_groups {
+            let mut value = sample();
+            value["tracks"][0]["mainGroup"]["vocalModes"] = bad;
+            assert!(
+                parse_value(&value).is_err(),
+                "malformed vocalModes should be rejected"
+            );
+        }
+        // Reference-level shapes: non-object voice, non-boolean inherited,
+        // non-string preset, non-object params, non-finite param.
+        let bad_voices = [
+            json!(5.0),
+            json!({ "vocalModeInherited": "yes" }),
+            json!({ "vocalModePreset": 3 }),
+            json!({ "vocalModeParams": 3.0 }),
+            json!({ "vocalModeParams": { "Power": "loud" } }),
+        ];
+        for bad in bad_voices {
+            let mut value = sample();
+            value["tracks"][0]["groups"][0]["voice"] = bad;
+            assert!(
+                parse_value(&value).is_err(),
+                "malformed voice overrides should be rejected"
+            );
+        }
     }
 }
