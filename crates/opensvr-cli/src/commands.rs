@@ -364,6 +364,8 @@ mod tests {
                         lyrics: "か".into(),
                         phonemes: String::new(),
                         detune: 0.0,
+                        attributes: opensvr_core::PitchAttributes::default(),
+                        system_attributes: opensvr_core::PitchAttributes::default(),
                     },
                     opensvr_core::Note {
                         onset: 1,
@@ -372,6 +374,8 @@ mod tests {
                         lyrics: "-".into(),
                         phonemes: String::new(),
                         detune: 0.0,
+                        attributes: opensvr_core::PitchAttributes::default(),
+                        system_attributes: opensvr_core::PitchAttributes::default(),
                     },
                     opensvr_core::Note {
                         onset: 2,
@@ -380,6 +384,8 @@ mod tests {
                         lyrics: "zzz".into(),
                         phonemes: String::new(),
                         detune: 0.0,
+                        attributes: opensvr_core::PitchAttributes::default(),
+                        system_attributes: opensvr_core::PitchAttributes::default(),
                     },
                 ],
                 ..NoteGroup::default()
@@ -414,6 +420,8 @@ mod tests {
                     lyrics: "ka".into(),
                     phonemes: String::new(),
                     detune: 0.0,
+                    attributes: opensvr_core::PitchAttributes::default(),
+                    system_attributes: opensvr_core::PitchAttributes::default(),
                 }],
                 ..NoteGroup::default()
             },
