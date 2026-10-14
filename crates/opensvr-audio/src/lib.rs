@@ -21,7 +21,8 @@ pub use opensvr_core::CancelToken;
 pub use phrase::{PHRASE_BREAK_SECONDS, Phrase, split_phrases};
 pub use pitch::{build_log_f0, merge_continuation_phones};
 pub use render::{
-    MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, REST_CONTEXT_SECONDS, RenderError, Renderer, StereoBuffer,
+    MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, NoProgress, ProgressSink, REST_CONTEXT_SECONDS, RenderError,
+    Renderer, StereoBuffer,
 };
 pub use resample::resample_mono;
 pub use wav::{WavError, write_wav};
