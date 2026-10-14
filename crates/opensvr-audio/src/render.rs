@@ -39,6 +39,56 @@ pub enum RenderError {
     Cancelled,
 }
 
+/// Reports phrase completions during a render.
+///
+/// There is no C++ counterpart to port: OpenSV's `render` takes only a cancel
+/// callback plus an optional editor-only `RenderVisualization` (out of scope
+/// per the roadmap), and OpenSV+'s CLI prints JSON with no progress at all.
+/// Workers report each completed phrase against a total known up front; they
+/// never report audio, and a cancelled phrase reports nothing.
+pub trait ProgressSink: Sync {
+    /// Records that `done` of `total` phrases have completed.
+    fn report(&self, done: usize, total: usize);
+}
+
+/// A [`ProgressSink`] that discards every report.
+///
+/// [`Renderer::render`] uses this, so library callers that pass nothing keep
+/// today's behavior.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoProgress;
+
+impl ProgressSink for NoProgress {
+    fn report(&self, _done: usize, _total: usize) {}
+}
+
+/// Shared phrase-completion reporting for the render workers.
+///
+/// Reports are serialized so sinks observe monotone `done` counts even though
+/// worker threads complete phrases in nondeterministic order.
+struct Reporter<'a> {
+    sink: &'a dyn ProgressSink,
+    completed: &'a std::sync::atomic::AtomicUsize,
+    order: &'a std::sync::Mutex<()>,
+    total: usize,
+}
+
+impl Reporter<'_> {
+    /// Records one completed phrase. Callers return before reaching here for
+    /// cancelled phrases, so cancellation never reports a completion.
+    fn report_one(&self) {
+        let _guard = self
+            .order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let done = self
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.sink.report(done, self.total);
+    }
+}
+
 /// Planar stereo audio.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StereoBuffer {
@@ -84,7 +134,20 @@ impl<B: VoiceBackend + Sync> Renderer<B> {
         &mut self.backend
     }
 
-    /// Renders `project` at `sample_rate`.
+    /// Renders `project` at `sample_rate`, discarding phrase-progress reports.
+    ///
+    /// This is [`render_with_progress`][Self::render_with_progress] with a
+    /// [`NoProgress`] sink, so the samples are bitwise identical either way.
+    pub fn render(
+        &self,
+        project: &Project,
+        sample_rate: u32,
+        cancel: &CancelToken,
+    ) -> Result<StereoBuffer, RenderError> {
+        self.render_with_progress(project, sample_rate, cancel, &NoProgress)
+    }
+
+    /// Renders `project` at `sample_rate`, reporting each completed phrase.
     ///
     /// Each audible track is sung on its own scoped thread as one phrase per
     /// rest-bounded phrase by the shared backend, then panned and summed in
@@ -92,11 +155,15 @@ impl<B: VoiceBackend + Sync> Renderer<B> {
     /// towards the project length, so the mixer never changes the timeline.
     /// A cancelled render publishes no audio, exactly as before: workers only
     /// return phrase audio, and mixing happens after they all join.
-    pub fn render(
+    /// Progress reporting never moves, skips or reorders any synthesis or
+    /// summation: workers only report completions, so the samples are
+    /// bitwise identical with any sink.
+    pub fn render_with_progress(
         &self,
         project: &Project,
         sample_rate: u32,
         cancel: &CancelToken,
+        progress: &dyn ProgressSink,
     ) -> Result<StereoBuffer, RenderError> {
         if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
             return Err(RenderError::InvalidSampleRate(sample_rate));
@@ -148,31 +215,35 @@ impl<B: VoiceBackend + Sync> Renderer<B> {
             if placed.is_empty() || !is_audible(&track.mixer, has_solo) {
                 continue;
             }
-            work.push((track, placed));
+            work.push((*track, placed.as_slice()));
         }
 
-        // Sing tracks concurrently; workers only return phrase audio, never
-        // touching the shared output buffer.
-        let mut sung = Vec::with_capacity(work.len());
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(work.len());
-            for (track, placed) in &work {
-                handles.push(scope.spawn(|| {
-                    sing_track(&self.backend, project, track, placed, sample_rate, cancel)
-                }));
-            }
-            // Join in track order so the first error in track order wins,
-            // exactly as the sequential loop reported it.
-            for (handle, (track, _)) in handles.into_iter().zip(&work) {
-                sung.push(handle.join().unwrap_or_else(|_| {
-                    Err(RenderError::Backend {
-                        track: track.name.clone(),
-                        source: BackendError("a render worker panicked".into()),
-                    })
-                })?);
-            }
-            Ok::<_, RenderError>(())
-        })?;
+        // The audible phrase total is known before spawning, so every report
+        // carries a fixed total. Splitting is pure timeline geometry, and the
+        // workers re-split identically when they sing.
+        let total = work
+            .iter()
+            .map(|(_, placed)| split_phrases(&timed_notes(project, placed)).len())
+            .sum();
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+        let order = std::sync::Mutex::new(());
+        let reporter = Reporter {
+            sink: progress,
+            completed: &completed,
+            order: &order,
+            total,
+        };
+
+        // Sing every audible track on its own scoped thread; workers only
+        // return phrase audio, never touching the shared output buffer.
+        let sung = sing_all(
+            &self.backend,
+            project,
+            &work,
+            sample_rate,
+            cancel,
+            &reporter,
+        )?;
 
         // Sum in track order through the single mixing path, so scheduling
         // never changes a sample.
@@ -201,6 +272,47 @@ impl<B: VoiceBackend + Sync> Renderer<B> {
     }
 }
 
+/// Sings every track in `work` on its own scoped thread.
+///
+/// Workers only return phrase audio, never touching the shared output buffer.
+/// Joins in track order so the first error in track order wins, exactly as
+/// the sequential loop reported it.
+fn sing_all<B: VoiceBackend + Sync>(
+    backend: &B,
+    project: &Project,
+    work: &[(&Track, &[PlacedNote<'_>])],
+    sample_rate: u32,
+    cancel: &CancelToken,
+    reporter: &Reporter<'_>,
+) -> Result<Vec<Vec<SungPhrase>>, RenderError> {
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(work.len());
+        for (track, placed) in work {
+            handles.push(scope.spawn(|| {
+                sing_track(
+                    backend,
+                    project,
+                    track,
+                    placed,
+                    sample_rate,
+                    cancel,
+                    reporter,
+                )
+            }));
+        }
+        let mut sung = Vec::with_capacity(work.len());
+        for (handle, (track, _)) in handles.into_iter().zip(work) {
+            sung.push(handle.join().unwrap_or_else(|_| {
+                Err(RenderError::Backend {
+                    track: track.name.clone(),
+                    source: BackendError("a render worker panicked".into()),
+                })
+            })?);
+        }
+        Ok(sung)
+    })
+}
+
 /// One track's sung phrases: the audio plus its group-window crop bounds.
 ///
 /// Per-phrase group-window crop, exactly as in C++: the front note's
@@ -222,6 +334,7 @@ fn sing_track<B: VoiceBackend>(
     placed: &[PlacedNote<'_>],
     sample_rate: u32,
     cancel: &CancelToken,
+    reporter: &Reporter<'_>,
 ) -> Result<Vec<SungPhrase>, RenderError> {
     let notes = timed_notes(project, placed);
     let backend_error = |source| RenderError::Backend {
@@ -252,6 +365,7 @@ fn sing_track<B: VoiceBackend>(
             crop_start: first.window_start,
             stop,
         });
+        reporter.report_one();
     }
     Ok(sung)
 }
@@ -667,5 +781,58 @@ mod tests {
             Renderer::new(Constant::default()).render(&project, 8000, &token),
             Err(RenderError::Cancelled)
         ));
+    }
+
+    /// A sink that records every report behind a mutex.
+    #[derive(Debug, Default)]
+    struct Recording {
+        reports: std::sync::Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl ProgressSink for Recording {
+        fn report(&self, done: usize, total: usize) {
+            self.reports
+                .lock()
+                .expect("test sink is never poisoned")
+                .push((done, total));
+        }
+    }
+
+    #[test]
+    fn progress_reports_every_phrase_against_a_fixed_total() {
+        // Lead sings one phrase; harmony's two notes sit a rest apart, so two
+        // more: three phrases in total across two worker threads.
+        let project = Project {
+            tracks: vec![track("lead", &[0]), track("harmony", &[0, 2 * Q])],
+            ..Project::default()
+        };
+        let sink = Recording::default();
+        let audio = Renderer::new(Constant::default())
+            .render_with_progress(&project, 8000, &CancelToken::new(), &sink)
+            .unwrap();
+        // Reports are serialized, so the observed order stays monotone even
+        // though the workers race.
+        assert_eq!(*sink.reports.lock().unwrap(), vec![(1, 3), (2, 3), (3, 3)]);
+        // Reporting must not move a sample.
+        let plain = Renderer::new(Constant::default())
+            .render(&project, 8000, &CancelToken::new())
+            .unwrap();
+        assert_eq!(audio, plain);
+    }
+
+    #[test]
+    fn a_cancelled_render_reports_no_completion() {
+        let token = CancelToken::new();
+        token.cancel();
+        let project = Project {
+            tracks: vec![track("lead", &[0]), track("harmony", &[Q])],
+            ..Project::default()
+        };
+        let sink = Recording::default();
+        assert!(matches!(
+            Renderer::new(Constant::default()).render_with_progress(&project, 8000, &token, &sink),
+            Err(RenderError::Cancelled)
+        ));
+        assert!(sink.reports.lock().unwrap().is_empty());
     }
 }

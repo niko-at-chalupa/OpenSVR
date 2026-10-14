@@ -19,6 +19,7 @@ opensvr-nofs.workspace = true
 opensvr-g2p.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+indicatif = "0.18"
 thiserror.workspace = true
 
 [dev-dependencies]

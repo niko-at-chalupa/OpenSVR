@@ -139,6 +139,23 @@ fn quiet_hides_progress_but_not_the_placeholder_warning() {
 }
 
 #[test]
+fn the_progress_bar_changes_no_sample() {
+    // The bar draws to a terminal only (hidden when piped), but the render
+    // behind it must still be bitwise identical to the quiet one.
+    let loud = scratch("loud.wav");
+    let quiet = scratch("progress-quiet.wav");
+    let loud_output = opensvr(&["render", EXAMPLE, "-o", loud.to_str().unwrap()]);
+    assert_eq!(loud_output.status.code(), Some(0));
+    let quiet_output = opensvr(&["render", EXAMPLE, "-o", quiet.to_str().unwrap(), "-q"]);
+    assert_eq!(quiet_output.status.code(), Some(0));
+    assert_eq!(fs::read(&loud).unwrap(), fs::read(&quiet).unwrap());
+    let stderr = String::from_utf8_lossy(&loud_output.stderr);
+    assert!(stderr.contains("Rendering") && stderr.contains("Wrote"));
+    fs::remove_file(loud).unwrap();
+    fs::remove_file(quiet).unwrap();
+}
+
+#[test]
 fn midi_export_writes_a_standard_midi_file() {
     let path = scratch("export.mid");
     let output = opensvr(&["midi", EXAMPLE, "-o", path.to_str().unwrap()]);
