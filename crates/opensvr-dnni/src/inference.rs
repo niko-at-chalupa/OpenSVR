@@ -407,6 +407,15 @@ impl DnniInference {
     ///
     /// The plain [`run`](Self::run) delegates here with no cache, so the two
     /// paths share validation and cancel checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics only on an internal invariant violation (a cache that reported
+    /// output but reads back disarmed); all fallible conditions return
+    /// [`DnniError`] instead.
+    // Cache orchestration mirrors the C++ dirty-range flow; keep the
+    // snapshot protocol in one reviewable pass.
+    #[allow(clippy::too_many_lines)]
     pub fn run_with_cache(
         &self,
         input: &Tensor,
@@ -436,10 +445,7 @@ impl DnniInference {
         // Cache-gating mirrors C++ lines 718–719:
         // canCache ⟺ cache armed ∧ finite radius ∧ (no condition OR
         // condition frames match input frames).
-        let radius = match self.context_radius {
-            Some(radius) => radius,
-            None => 0,
-        };
+        let radius = self.context_radius.unwrap_or_default();
         let can_cache = cache.is_some()
             && self.context_radius.is_some()
             && condition.is_none_or(|tensor| tensor.frames == input.frames);
@@ -511,10 +517,8 @@ impl DnniInference {
                     local
                 } else {
                     let local_input = slice_frames(input, window.first, window.end);
-                    let local_condition = match condition {
-                        Some(condition) => Some(slice_frames(condition, window.first, window.end)),
-                        None => None,
-                    };
+                    let local_condition = condition
+                        .map(|condition| slice_frames(condition, window.first, window.end));
                     let mut local = Tensor::default();
                     run_layer(
                         root,
@@ -534,8 +538,7 @@ impl DnniInference {
                 }
                 // Paste only the changed centre ranges; halos are computed
                 // but not written back.
-                for index in first_range..end_range {
-                    let range = output_ranges[index];
+                for range in &output_ranges[first_range..end_range] {
                     let source_start = (range.first - window.first) * local_output.channels;
                     let destination_start = range.first * replacement.channels;
                     let span = (range.end - range.first) * replacement.channels;
@@ -567,7 +570,7 @@ impl DnniInference {
             {
                 let updated = DnniCache {
                     input: input.clone(),
-                    condition: condition.map_or(Tensor::default(), |t| t.clone()),
+                    condition: condition.map_or_else(Tensor::default, Tensor::clone),
                     output: replacement.clone(),
                     model_identity: self.model_identity,
                     has_condition: condition.is_some(),
@@ -676,7 +679,7 @@ pub fn multiply_matrix(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) 
         // on AVX2, paired SSE ops otherwise) without changing the per-element
         // column order. `VECTORS_PER_BLOCK` documents the C++ `WeightBlock`
         // correspondence: lanes `[4k, 4k+4)` are the k-th SIMD register.
-        debug_assert!(BLOCK == 4 * VECTORS_PER_BLOCK);
+        debug_assert_eq!(BLOCK, 4 * VECTORS_PER_BLOCK);
         let mut acc = [0.0_f32; BLOCK];
         // Bounds checks are hoisted to one per block; the column loop runs
         // over iterators with no per-lane checks, which is what lets LLVM
@@ -705,10 +708,11 @@ fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32
     for block in 0..block_count {
         let first_channel = block * BLOCK;
         let row_count = (matrix.rows - first_channel).min(BLOCK);
+        let block_weights = &matrix.values[block * matrix.columns..][..matrix.columns];
         for row in 0..row_count {
             let mut sum = 0.0_f32;
-            for column in 0..matrix.columns {
-                sum += matrix.values[block * matrix.columns + column][row] * input[column];
+            for (weights, input) in block_weights.iter().zip(input.iter()) {
+                sum += weights[row] * input;
             }
             output[first_channel + row] = sum;
         }
@@ -721,10 +725,7 @@ fn load_matrix(
     parameter_count: &mut usize,
 ) -> Result<DenseMatrix, DnniError> {
     let offset = reader.nodes().get(node_index).map_or(0, |node| node.offset);
-    let decoded = match reader.read_float_matrix(node_index) {
-        Ok(matrix) => matrix,
-        Err(error) => return Err(error),
-    };
+    let decoded = reader.read_float_matrix(node_index)?;
     let rows = decoded.rows as usize;
     let columns = decoded.columns as usize;
     if rows == 0 || !valid_shape(rows, columns) || decoded.values.len() != rows * columns {
@@ -733,7 +734,7 @@ fn load_matrix(
     // C++ `loadMatrix`: transpose row-major → per-column [f32; BLOCK] blocks,
     // zero-padded on the tail. The padded element count (blockCount * columns)
     // is what the C++ loader accounts against `maximumElements`.
-    let block_count = (rows + BLOCK - 1) / BLOCK;
+    let block_count = rows.div_ceil(BLOCK);
     let padded_rows = block_count * BLOCK;
     if columns > (MAXIMUM_ELEMENTS - *parameter_count) / padded_rows {
         return Err(node_error(
@@ -747,8 +748,8 @@ fn load_matrix(
         let row_count = (rows - first_row).min(BLOCK);
         for column in 0..columns {
             let slot = &mut values[block * columns + column];
-            for row in 0..row_count {
-                slot[row] = decoded.values[(first_row + row) * columns + column];
+            for (row, lane) in slot.iter_mut().enumerate().take(row_count) {
+                *lane = decoded.values[(first_row + row) * columns + column];
             }
         }
     }
@@ -1080,10 +1081,7 @@ fn load_layer(
                 ));
             }
             layer.matrices.push(matrix);
-            let bias = match reader.read_float_vector(bias_index) {
-                Ok(bias) => bias,
-                Err(error) => return Err(error),
-            };
+            let bias = reader.read_float_vector(bias_index)?;
             if bias.len() != layer.gate_channels || bias.len() > MAXIMUM_ELEMENTS - *parameter_count
             {
                 return Err(node_error(
@@ -1156,9 +1154,9 @@ fn load_layer(
                         "unexpected or duplicate bias vector.",
                     ));
                 }
-                match reader.read_float_vector(child_index) {
-                    Ok(bias) => layer.bias = bias,
-                    Err(error) => return Err(error),
+                {
+                    let bias = reader.read_float_vector(child_index)?;
+                    layer.bias = bias;
                 }
                 has_bias = true;
                 if layer.bias.len() > MAXIMUM_ELEMENTS - *parameter_count {
@@ -1386,6 +1384,9 @@ fn run_gru(
     Ok(())
 }
 
+// Layer dispatch mirrors the C++ operator switch; one branch per operator,
+// kept whole so summation order stays auditable in a single pass.
+#[allow(clippy::too_many_lines)]
 fn run_layer(
     layer: &Layer,
     input: &Tensor,
@@ -1635,6 +1636,9 @@ fn run_layer(
             // per tap is accumulated and added back in order, mirroring the C++
             // 2-frame unrolling (which keeps independent accumulators per frame).
             for (kernel, matrix) in layer.matrices.iter().enumerate() {
+                // Tensor dimensions are bounded by the memory limit, so the
+                // signed tap arithmetic cannot wrap; the sign carries padding.
+                #[allow(clippy::cast_possible_wrap)]
                 let tap = frame as i64 * layer.stride as i64
                     + kernel as i64 * layer.dilation as i64
                     - layer.padding as i64;
@@ -1676,13 +1680,11 @@ fn run_layer(
                 Operation::LeakyRelu => {
                     *value *= if *value > 0.0 { 1.0 } else { layer.alpha };
                 }
-                Operation::Elu => {
+                Operation::Elu if layer.alpha < 0.0 || *value < 0.0 => {
                     // Preserve the reference formula for every finite alpha,
                     // including negative values. A non-negative alpha leaves
                     // positive inputs unchanged without evaluating exp(x).
-                    if layer.alpha < 0.0 || *value < 0.0 {
-                        *value = value.max(0.0) + (layer.alpha * value.exp_m1()).min(0.0);
-                    }
+                    *value = value.max(0.0) + (layer.alpha * value.exp_m1()).min(0.0);
                 }
                 _ => {}
             }
@@ -1813,6 +1815,9 @@ mod tests {
         node_bytes("modl0", &[], &children)
     }
 
+    // Test fixture mirroring the 4-int32 modl1 payload plus taps, channels
+    // and an optional bias.
+    #[allow(clippy::too_many_arguments)]
     fn conv_model(
         kernel: i32,
         stride: i32,
@@ -1886,7 +1891,7 @@ mod tests {
         frames: usize,
         channels: usize,
         values: &[f32],
-        condition: Option<Tensor>,
+        condition: Option<&Tensor>,
     ) -> Tensor {
         let input = Tensor {
             frames,
@@ -1895,7 +1900,7 @@ mod tests {
         };
         let mut output = Tensor::default();
         engine
-            .run(&input, &mut output, condition.as_ref(), &test_token())
+            .run(&input, &mut output, condition, &test_token())
             .expect("run must succeed");
         output
     }
@@ -1932,10 +1937,7 @@ mod tests {
             .run(&input, &mut output, None, &test_token())
             .unwrap_err()
             .to_string();
-        assert_eq!(
-            error.to_string(),
-            "No DNNI inference model has been loaded."
-        );
+        assert_eq!(error, "No DNNI inference model has been loaded.");
         assert!(output.values.is_empty());
     }
 
@@ -1944,10 +1946,7 @@ mod tests {
         let reader = load_reader(&leaf("moda5", &[]));
         let mut engine = DnniInference::new();
         let error = engine.load(&reader, 7).unwrap_err().to_string();
-        assert_eq!(
-            error.to_string(),
-            "DNNI inference root or child node is out of range."
-        );
+        assert_eq!(error, "DNNI inference root or child node is out of range.");
         assert!(!engine.is_loaded());
     }
 
@@ -1970,7 +1969,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert_eq!(
-                error.to_string(),
+                error,
                 "DNNI input must contain finite frame-major values with valid dimensions within 64 Mi elements."
             );
             // Output is left untouched on failure.
@@ -1999,7 +1998,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert_eq!(
-                error.to_string(),
+                error,
                 "DNNI input must contain finite frame-major values with valid dimensions within 64 Mi elements."
             );
         }
@@ -2024,7 +2023,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(
-            error.to_string(),
+            error,
             "DNNI condition must contain finite frame-major values with valid dimensions within 64 Mi elements."
         );
     }
@@ -2348,10 +2347,7 @@ mod tests {
         let reader = load_reader(&leaf("moda5", &[]));
         let mut engine = DnniInference::new();
         let error = engine.load(&reader, 99).unwrap_err().to_string();
-        assert_eq!(
-            error.to_string(),
-            "DNNI inference root or child node is out of range."
-        );
+        assert_eq!(error, "DNNI inference root or child node is out of range.");
     }
 
     #[test]
@@ -2421,14 +2417,15 @@ mod tests {
 
     #[test]
     fn activations_apply_elementwise() {
-        let cases: &[(&str, Option<f32>, &[f32], &[f32])] = &[
+        type ActivationCase<'a> = (&'a str, Option<f32>, &'a [f32], &'a [f32]);
+        let cases: &[ActivationCase<'_>] = &[
             ("moda0", None, &[-2.0, 0.0, 3.0], &[0.0, 0.0, 3.0]),
             ("moda1", None, &[0.0, 10.0], &[0.0, 1.0]),
             ("moda2", None, &[0.0], &[0.5]),
             ("moda5", None, &[-1.5, 2.5], &[-1.5, 2.5]),
             ("moda3", Some(0.1), &[-2.0, 3.0], &[-0.2, 3.0]),
-            ("moda4", Some(1.0), &[-1.0, 2.0], &[-0.63212055, 2.0]),
-            ("moda7", None, &[0.0, 2.0], &[0.0, 1.7615942]),
+            ("moda4", Some(1.0), &[-1.0, 2.0], &[-0.632_120_55, 2.0]),
+            ("moda7", None, &[0.0, 2.0], &[0.0, 1.761_594_2]),
         ];
         for (name, alpha, input, expected) in cases {
             let payload = alpha.map_or(Vec::new(), alpha_payload);
@@ -2492,7 +2489,7 @@ mod tests {
         let mut engine = DnniInference::new();
         let error = engine.load(&reader, 0).unwrap_err().to_string();
         assert_eq!(
-            error.to_string(),
+            error,
             "DNNI inference at 0x8: unsupported operator 0x123456789abcdef0."
         );
     }
@@ -2544,7 +2541,7 @@ mod tests {
         let engine = load_engine(&root);
         assert_eq!(engine.context_radius(), Some(0));
         let output = run_ok(&engine, 1, 2, &[2.0, 3.0]);
-        assert_close(&output.values, &[0.91830772], 1e-5);
+        assert_close(&output.values, &[0.918_307_7], 1e-5);
     }
 
     #[test]
@@ -2558,7 +2555,7 @@ mod tests {
             channels: 1,
             values: vec![1.0],
         };
-        let output = run_cond_ok(&engine, 1, 1, &[1.0], Some(condition));
+        let output = run_cond_ok(&engine, 1, 1, &[1.0], Some(&condition));
         assert_close(&output.values, &[1.0], 1e-5);
     }
 
@@ -2969,8 +2966,8 @@ mod tests {
     #[test]
     fn residual_run_needs_matching_condition() {
         let gate_conv = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
-        let gate_cond = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
-        let gate = node_bytes("_gnc1v0", &dims3(1, 1, 1), &[gate_conv, gate_cond]);
+        let cond_conv = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
+        let gate = node_bytes("_gnc1v0", &dims3(1, 1, 1), &[gate_conv, cond_conv]);
         let skip = conv_model(1, 1, 0, 1, &[vec![1.0]], 1, 1, None);
         let residual = conv_model(1, 1, 0, 1, &[vec![1.0]], 1, 1, None);
         let projection = conv_model(1, 1, 0, 1, &[vec![1.0]], 1, 1, None);
@@ -3019,8 +3016,8 @@ mod tests {
     #[test]
     fn residual_run_with_condition_accumulates_projection() {
         let gate_conv = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
-        let gate_cond = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
-        let gate = node_bytes("_gnc1v0", &dims3(1, 1, 1), &[gate_conv, gate_cond]);
+        let cond_conv = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
+        let gate = node_bytes("_gnc1v0", &dims3(1, 1, 1), &[gate_conv, cond_conv]);
         let skip = conv_model(1, 1, 0, 1, &[vec![1.0]], 1, 1, None);
         let residual = conv_model(1, 1, 0, 1, &[vec![0.0]], 1, 1, None);
         // Condition projection gain 5: output starts at [5], gate is zero so
@@ -3038,7 +3035,7 @@ mod tests {
             channels: 1,
             values: vec![1.0],
         };
-        let output = run_cond_ok(&engine, 1, 1, &[7.0], Some(condition));
+        let output = run_cond_ok(&engine, 1, 1, &[7.0], Some(&condition));
         assert_eq!(output.values, vec![5.0]);
     }
 
@@ -3050,7 +3047,7 @@ mod tests {
         let engine = load_engine(&gru_model(&[1.0, 1.0, 1.0, 0.5, 0.5, 0.5]));
         assert_eq!(engine.context_radius(), None);
         let output = run_ok(&engine, 2, 1, &[1.0, 0.0]);
-        assert_close(&output.values, &[0.20482419, 0.13316301], 1e-5);
+        assert_close(&output.values, &[0.204_824_2, 0.133_163], 1e-5);
     }
 
     #[test]
@@ -3295,8 +3292,8 @@ mod tests {
 
     fn lcg(state: &mut u64) -> f32 {
         *state = state
-            .wrapping_mul(6364_1362_2384_6793_005)
-            .wrapping_add(1_4426_9504_0889_6634_07);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         ((*state >> 33) as f32 / u32::MAX as f32 - 0.5) * 4.0
     }
 
@@ -3661,7 +3658,7 @@ mod tests {
         let mut cache = DnniCache::default();
         run_cache_ok(&engine, &input, None, Some(&mut cache), None);
         // Capacity-based accounting always covers at least the live lengths.
-        assert!(cache.get_bytes() >= (4 + 0 + 4) * size_of::<f32>());
+        assert!(cache.get_bytes() >= (4 + 4) * size_of::<f32>());
         assert_ne!(cache.model_identity, 0);
         cache.clear();
         assert_eq!(cache.model_identity, 0);
@@ -3804,7 +3801,7 @@ mod tests {
             Some(&mut cache),
             None,
         );
-        let fresh = run_cond_ok(&engine, 3, 1, &[1.0, 2.0, 3.0], Some(edited_condition));
+        let fresh = run_cond_ok(&engine, 3, 1, &[1.0, 2.0, 3.0], Some(&edited_condition));
         assert_eq!(third.values, fresh.values);
     }
 
