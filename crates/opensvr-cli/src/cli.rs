@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use opensvr_audio::{MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use opensvr_core::Language;
 
@@ -28,6 +28,10 @@ pub enum Command {
     Midi(MidiArgs),
     /// Convert between project formats (.svp and .mid, matched case-insensitively)
     Convert(ConvertArgs),
+    /// Print a shell completion script to stdout
+    Complete(CompleteArgs),
+    /// Print a troff man page to stdout (see `opensvr.1`)
+    Man,
 }
 
 /// Settings that replace what the project file says, on every track.
@@ -98,6 +102,38 @@ pub struct ConvertArgs {
     pub output: PathBuf,
 }
 
+/// Target shell for `complete` (one of bash, elvish, fish, powershell, zsh).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Args)]
+pub struct CompleteArgs {
+    /// The shell to print completions for
+    pub shell: clap_complete::Shell,
+}
+
+/// Renders the checked-in man page (`opensvr.1`) from the CLI definition.
+///
+/// `clap_mangen` leaves the date empty unless set, so this output is fully
+/// deterministic and the sync test can compare it byte for byte. The
+/// exit-code table and env-var lines ride along via `AFTER_HELP`, which the
+/// renderer keeps as an extra section.
+pub fn man_page() -> Vec<u8> {
+    let mut page = Vec::new();
+    clap_mangen::Man::new(Cli::command())
+        .title("OPENSVR")
+        .section("1")
+        .render(&mut page)
+        .expect("the man page renders into memory");
+    page
+}
+
+/// Renders a completion script for `shell` into memory; the `complete`
+/// subcommand streams these same bytes to stdout.
+pub fn completion_script(shell: clap_complete::Shell) -> Vec<u8> {
+    let mut script = Vec::new();
+    let mut command = Cli::command();
+    clap_complete::generate(shell, &mut command, "opensvr", &mut script);
+    script
+}
+
 const _: () = assert!(
     MAX_SAMPLE_RATE >= 192_000,
     "the CLI cap must not exceed the renderer's"
@@ -159,5 +195,30 @@ mod tests {
         };
         assert_eq!(args.input, PathBuf::from("song.svp"));
         assert_eq!(args.output, PathBuf::from("song.mid"));
+    }
+
+    #[test]
+    fn generated_artifacts_cover_the_cli_surface() {
+        let page = String::from_utf8(man_page()).unwrap();
+        for needle in [
+            ".TH OPENSVR 1",
+            "complete",
+            "convert",
+            "OPENSVR_VOICE",
+            "OPENSVR_DICT",
+            "Exit codes",
+        ] {
+            assert!(page.contains(needle), "the man page misses {needle}");
+        }
+        assert_eq!(man_page(), man_page(), "man output must be deterministic");
+        for shell in [clap_complete::Shell::Bash, clap_complete::Shell::Zsh] {
+            let script = String::from_utf8(completion_script(shell)).unwrap();
+            for subcommand in ["info", "render", "midi", "convert", "complete", "man"] {
+                assert!(
+                    script.contains(subcommand),
+                    "{shell:?} completions miss {subcommand}"
+                );
+            }
+        }
     }
 }

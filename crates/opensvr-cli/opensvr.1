@@ -1,0 +1,44 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH OPENSVR 1  "opensvr 0.1.0" 
+.SH NAME
+opensvr \- The opensvr command\-line tool
+.SH SYNOPSIS
+\fBopensvr\fR [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+The opensvr command\-line tool
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+opensvr\-info(1)
+List tracks, voices and whether their files exist
+.TP
+opensvr\-render(1)
+Render a project to a 24\-bit stereo WAV file
+.TP
+opensvr\-midi(1)
+Export notes, lyrics, tempo and meter as a Standard MIDI File
+.TP
+opensvr\-convert(1)
+Convert between project formats (.svp and .mid, matched case\-insensitively)
+.TP
+opensvr\-complete(1)
+Print a shell completion script to stdout
+.TP
+opensvr\-man(1)
+Print a troff man page to stdout (see `opensvr.1`)
+.TP
+opensvr\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH EXTRA
+Voice databases and dictionaries are not bundled; point to files you own.
+OPENSVR_VOICE and OPENSVR_DICT default \-\-voice and \-\-dict when those flags are absent; explicit flags win.
+Exit codes: 0 ok, 1 usage error, 2 load error, 3 render/write error, 130 cancelled.
+.SH VERSION
+v0.1.0

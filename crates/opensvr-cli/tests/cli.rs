@@ -464,6 +464,32 @@ fn flat_form_honors_env_vars() {
 }
 
 #[test]
+fn man_matches_the_checked_in_page() {
+    // `opensvr.1` lives beside the crate that owns the CLI definition; the
+    // binary must print exactly those bytes so distro packaging can redirect
+    // them (`opensvr man > opensvr.1` reproduces the file).
+    let output = opensvr(&["man"]);
+    assert_eq!(output.status.code(), Some(0));
+    let checked_in = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/opensvr.1")).unwrap();
+    assert_eq!(output.stdout, checked_in);
+}
+
+#[test]
+fn complete_prints_scripts_naming_every_subcommand() {
+    for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+        let output = opensvr(&["complete", shell]);
+        assert_eq!(output.status.code(), Some(0), "{shell}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        for subcommand in ["info", "render", "midi", "convert", "complete", "man"] {
+            assert!(
+                text.contains(subcommand),
+                "{shell} script misses {subcommand}"
+            );
+        }
+    }
+}
+
+#[test]
 fn flat_failures_exit_with_usage_errors() {
     // C++ texts, same exit status as the subcommand usage errors.
     let missing_output = opensvr(&[EXAMPLE]);

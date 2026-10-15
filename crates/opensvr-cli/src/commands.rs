@@ -1,5 +1,6 @@
 //! The three subcommands.
 
+use std::io::Write as _;
 use std::{
     fs, io,
     path::{self, Path, PathBuf},
@@ -14,7 +15,7 @@ use opensvr_midi::MidiError;
 use opensvr_svp::SvpError;
 use thiserror::Error;
 
-use crate::cli::{Command, ConvertArgs, InfoArgs, MidiArgs, Overrides, RenderArgs};
+use crate::cli::{Command, CompleteArgs, ConvertArgs, InfoArgs, MidiArgs, Overrides, RenderArgs};
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -63,6 +64,8 @@ pub fn run(command: Command, cancel: &CancelToken) -> Result<(), CliError> {
         Command::Render(args) => render(&args, cancel),
         Command::Midi(args) => midi(&args),
         Command::Convert(args) => convert(&args),
+        Command::Complete(args) => complete(args),
+        Command::Man => man(),
     }
 }
 
@@ -155,6 +158,23 @@ fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
         let seconds = audio.frames() as f64 / f64::from(args.rate);
         eprintln!("Wrote {} ({seconds:.2} s)", args.output.display());
     }
+    Ok(())
+}
+
+/// Prints a completion script for the requested shell to stdout.
+///
+/// The script is rendered into memory first so a closed stream surfaces as
+/// a write error (exit 3) instead of a panic.
+fn complete(args: CompleteArgs) -> Result<(), CliError> {
+    io::stdout()
+        .lock()
+        .write_all(&crate::cli::completion_script(args.shell))?;
+    Ok(())
+}
+
+/// Prints the troff man page (`opensvr.1`) to stdout.
+fn man() -> Result<(), CliError> {
+    io::stdout().lock().write_all(&crate::cli::man_page())?;
     Ok(())
 }
 
