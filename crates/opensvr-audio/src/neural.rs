@@ -534,8 +534,8 @@ mod tests {
             dict.as_bytes(),
             "phones.txt",
             "dict.txt",
-            "x-phones.txt".to_owned(),
-            "x-dict.txt".to_owned(),
+            "x-phones.txt",
+            "x-dict.txt",
         )
         .expect("synthetic dictionary parses")
     }
