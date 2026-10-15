@@ -1,10 +1,17 @@
-//! Standard MIDI File export (format 1, 9600 ticks per quarter note).
+//! Standard MIDI File export and import (format 1 out, formats 0 and 1 in,
+//! 9600 ticks per quarter note on export, any PPQ on import).
 //!
 //! Track 0 is a conductor track with the project name, tempo changes and meter
 //! changes; every project track follows with its notes and lyric events.
 
+use std::io;
+
 use opensvr_core::{BLICKS_PER_QUARTER, Blick, Project, ProjectError, TimeSignature};
 use thiserror::Error;
+
+mod import;
+
+pub use import::{load, parse};
 
 /// High resolution, so fine microtiming survives the trip.
 const TICKS_PER_QUARTER: u16 = 9600;
@@ -30,6 +37,30 @@ pub enum MidiError {
     InvalidTempo,
     #[error("a time signature is invalid or its position is out of range")]
     InvalidTimeSignature,
+    #[error("could not open the MIDI file")]
+    Io(#[from] io::Error),
+    #[error("the MIDI file is invalid or truncated")]
+    Truncated,
+    #[error("only MIDI formats 0 and 1 are supported")]
+    UnsupportedFormat,
+    #[error("SMPTE timing is not supported; the file must use ticks per quarter note")]
+    SmpteTiming,
+    #[error("an imported tempo event is invalid")]
+    InvalidTempoEvent,
+    #[error("an imported time signature event is invalid")]
+    InvalidMeterEvent,
+    #[error("an imported time signature change lands inside a bar")]
+    OffBarMeterChange,
+    #[error("an imported bar number exceeds the supported range")]
+    BarOverflow,
+    #[error("an imported event position exceeds the supported range")]
+    EventOutOfRange,
+    #[error("an imported note has zero or negative duration")]
+    ZeroDurationNote,
+    #[error("an imported note is missing its note-off event")]
+    MissingNoteOff,
+    #[error("the MIDI file contains no notes")]
+    NoNotes,
 }
 
 /// Serializes `project` to the bytes of a Standard MIDI File.
