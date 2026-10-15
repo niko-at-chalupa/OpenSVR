@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr};
 
 use thiserror::Error;
 
-use crate::{Blick, TempoMap, curve::Curve};
+use crate::{Blick, Extra, TempoMap, curve::Curve};
 
 /// Errors raised while resolving a project's notes onto the timeline.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -32,6 +32,8 @@ pub struct Note {
     pub attributes: PitchAttributes,
     /// Automatically calculated pitch/vibrato defaults.
     pub system_attributes: PitchAttributes,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 /// One of the 14 table-driven pitch/vibrato attribute keys, mirroring the
@@ -58,8 +60,8 @@ pub enum PitchAttribute {
 }
 
 /// Manual pitch/vibrato overrides, mirroring OpenSV's `PitchAttributes` in
-/// `src/core/Project.h` (14 `std::optional<double>`, without the
-/// preserved-fields JSON, which lands with the round-trip PR). Absent stays
+/// `src/core/Project.h` (14 `std::optional<double>` plus the
+/// preserved-fields JSON, carried here as [`Extra`]). Absent stays
 /// `None`: `normaliseProject` never fills defaults. Inert until the pitch
 /// builder lands.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -78,6 +80,8 @@ pub struct PitchAttributes {
     pub d_f0_vbr_mod: Option<f64>,
     pub r_tone: Option<f64>,
     pub r_intonation: Option<f64>,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 macro_rules! pitch_attribute_name {
@@ -269,6 +273,8 @@ pub struct VocalModeSetting {
     pub amount: f64,
     pub has_curve: bool,
     pub curve: Curve,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 impl Default for VocalModeSetting {
@@ -278,6 +284,7 @@ impl Default for VocalModeSetting {
             amount: 0.0,
             has_curve: false,
             curve: Curve::default(),
+            extra: Extra::default(),
         }
     }
 }
@@ -295,6 +302,8 @@ pub struct NoteGroup {
     pub vibrato_env: Curve,
     /// Vocal-style weights keyed by mode name (`std::map`, hence ordered).
     pub vocal_modes: BTreeMap<String, VocalModeSetting>,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 /// Placement of a [`NoteGroup`] on a track timeline.
@@ -325,6 +334,8 @@ pub struct GroupReference {
     pub vocal_mode_params: BTreeMap<String, f64>,
     /// Track/reference-level default pitch attributes (`voicePitch`).
     pub voice_pitch: PitchAttributes,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 impl Default for GroupReference {
@@ -342,6 +353,7 @@ impl Default for GroupReference {
             vocal_mode_preset: String::new(),
             vocal_mode_params: BTreeMap::new(),
             voice_pitch: PitchAttributes::default(),
+            extra: Extra::default(),
         }
     }
 }
@@ -437,6 +449,8 @@ pub struct Track {
     pub groups: Vec<GroupReference>,
     pub mixer: Mixer,
     pub voice: VoiceSettings,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 impl Track {
@@ -453,6 +467,7 @@ impl Track {
             groups: Vec::new(),
             mixer: Mixer::default(),
             voice: VoiceSettings::default(),
+            extra: Extra::default(),
         }
     }
 }
@@ -482,6 +497,8 @@ pub struct Project {
     /// Shared note groups that tracks may reference.
     pub library: Vec<NoteGroup>,
     pub tempo_map: TempoMap,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 impl Project {
@@ -573,6 +590,7 @@ mod tests {
             detune: 0.0,
             attributes: PitchAttributes::default(),
             system_attributes: PitchAttributes::default(),
+            extra: Extra::default(),
         }
     }
 
@@ -743,5 +761,18 @@ mod tests {
         for (index, field) in PitchAttribute::ALL.iter().enumerate() {
             assert_eq!(filled.get(*field), Some(index as f64 + 0.5));
         }
+    }
+
+    #[test]
+    fn fresh_domain_values_carry_no_preserved_fields() {
+        // Every struct with a C++ `preservedFieldsJson` counterpart starts
+        // with an empty `extra`; nothing populates it yet.
+        assert!(PitchAttributes::default().extra.is_empty());
+        assert!(note(0, Q, 60).extra.is_empty());
+        assert!(VocalModeSetting::default().extra.is_empty());
+        assert!(group("g", Vec::new()).extra.is_empty());
+        assert!(GroupReference::default().extra.is_empty());
+        assert!(Track::new("t", group("g", Vec::new())).extra.is_empty());
+        assert!(Project::default().extra.is_empty());
     }
 }

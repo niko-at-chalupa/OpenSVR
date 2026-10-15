@@ -108,7 +108,7 @@ fn conductor_track(project: &Project) -> Result<Vec<u8>, MidiError> {
             8,
         ];
         events.meta(ticks(position)?, META_TIME_SIGNATURE, &payload);
-        previous = *signature;
+        previous = signature.clone();
     }
     Ok(events.finish())
 }
@@ -203,7 +203,8 @@ fn write_vlq(out: &mut Vec<u8>, value: u32) {
 #[cfg(test)]
 mod tests {
     use opensvr_core::{
-        BLICKS_PER_QUARTER as Q, Note, NoteGroup, PitchAttributes, TempoChange, TempoMap, Track,
+        BLICKS_PER_QUARTER as Q, Extra, Note, NoteGroup, PitchAttributes, TempoChange, TempoMap,
+        Track,
     };
 
     use super::*;
@@ -218,6 +219,7 @@ mod tests {
             detune: 0.0,
             attributes: PitchAttributes::default(),
             system_attributes: PitchAttributes::default(),
+            extra: Extra::default(),
         };
         let group = NoteGroup {
             id: "main".into(),
@@ -294,8 +296,9 @@ mod tests {
         let tempo = TempoChange {
             position: 0,
             bpm: 90.0,
+            extra: Extra::default(),
         };
-        project.tempo_map = TempoMap::new(vec![tempo, tempo], Vec::new());
+        project.tempo_map = TempoMap::new(vec![tempo.clone(), tempo], Vec::new());
         assert!(matches!(export(&project), Err(MidiError::InvalidTempo)));
     }
 

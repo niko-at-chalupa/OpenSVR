@@ -6,12 +6,14 @@
 
 mod cancel;
 mod curve;
+mod extra;
 mod project;
 mod tempo;
 
 pub use cancel::CancelToken;
 
 pub use curve::{AutomationPoint, Curve, Interpolation, ParseInterpolationError, sample_curve};
+pub use extra::Extra;
 
 pub use project::{
     GroupReference, Language, Mixer, Note, NoteGroup, ParseLanguageError, PitchAttribute,
