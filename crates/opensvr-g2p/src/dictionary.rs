@@ -12,7 +12,7 @@ use std::{
     path::Path,
 };
 
-use crate::{Result, G2pError, invalid, line_error};
+use crate::{G2pError, Result, invalid, line_error};
 
 /// One phoneme of the active language: its token and phonetic category.
 ///
@@ -44,9 +44,32 @@ pub struct PhonemeDictionary {
 
 /// Spelled-out ARPABET for single English capital letters (`A` -> `EY`, ...).
 const ENGLISH_LETTER_NAMES: [&str; 26] = [
-    "ey", "b iy", "s iy", "d iy", "iy", "eh f", "jh iy", "ey ch", "ay", "jh ey", "k ey",
-    "eh l", "eh m", "eh n", "ow", "p iy", "k y uw", "aa r", "eh s", "t iy", "y uw",
-    "v iy", "d ah b ah l y uw", "eh k s", "w ay", "z iy",
+    "ey",
+    "b iy",
+    "s iy",
+    "d iy",
+    "iy",
+    "eh f",
+    "jh iy",
+    "ey ch",
+    "ay",
+    "jh ey",
+    "k ey",
+    "eh l",
+    "eh m",
+    "eh n",
+    "ow",
+    "p iy",
+    "k y uw",
+    "aa r",
+    "eh s",
+    "t iy",
+    "y uw",
+    "v iy",
+    "d ah b ah l y uw",
+    "eh k s",
+    "w ay",
+    "z iy",
 ];
 
 /// Hardcoded pronunciations for common English words missing from the files.
@@ -93,11 +116,10 @@ fn normalize_english_phone(symbol: &mut String) {
         "axr" => Some("er"),
         "el" => Some("l"),
         "em" => Some("m"),
-        "en" => Some("n"),
+        "en" | "nx" => Some("n"),
         "eng" => Some("ng"),
         "hv" => Some("hh"),
         "ix" => Some("ih"),
-        "nx" => Some("n"),
         "ux" => Some("uw"),
         "wh" => Some("w"),
         _ => None,
@@ -113,7 +135,9 @@ fn normalize_english_key(mut key: String) -> String {
     if key.ends_with(')')
         && let Some(open) = key.rfind('(')
         && open + 2 < key.len()
-        && key[open + 1..key.len() - 1].bytes().all(|b| b.is_ascii_digit())
+        && key[open + 1..key.len() - 1]
+            .bytes()
+            .all(|b| b.is_ascii_digit())
     {
         key.truncate(open);
     }
@@ -154,7 +178,7 @@ fn decode_text(bytes: &[u8], label: &str) -> Result<String> {
         .map_err(|_| invalid(format!("{label}: Text is not valid UTF-8.")))?;
     if text
         .bytes()
-        .any(|b| (b < 0x20 && ![b'\t', b'\r', b'\n'].contains(&b)) || b == 0x7f)
+        .any(|b| (b < 0x20 && !b"\t\r\n".contains(&b)) || b == 0x7f)
     {
         return Err(invalid(format!(
             "{label}: Text contains an unsupported control character."
@@ -184,7 +208,9 @@ fn split_lines(text: &str) -> Vec<&str> {
 }
 
 fn split_fields(line: &str) -> Vec<&str> {
-    line.split([' ', '\t']).filter(|field| !field.is_empty()).collect()
+    line.split([' ', '\t'])
+        .filter(|field| !field.is_empty())
+        .collect()
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
@@ -204,11 +230,11 @@ impl PhonemeDictionary {
             &dictionary_bytes,
             &phones_path.display().to_string(),
             &dictionary_path.display().to_string(),
-            phones_path
+            &phones_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            dictionary_path
+            &dictionary_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -292,7 +318,10 @@ impl PhonemeDictionary {
                 continue;
             };
             for headword in &headwords {
-                loaded.entries.entry(headword.clone()).or_insert_with(|| pronunciation.clone());
+                loaded
+                    .entries
+                    .entry(headword.clone())
+                    .or_insert_with(|| pronunciation.clone());
             }
             supported += 1;
         }
@@ -310,21 +339,25 @@ impl PhonemeDictionary {
     /// `phones_name` / `dictionary_name` are the file names, which select the
     /// English ARPABET and CMUDict handling; the `*_label` strings name the
     /// files in error messages.
+    // Mirrors the upstream C++ dictionary parsing flow, so keep it whole.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(
         phones_bytes: &[u8],
         dictionary_bytes: &[u8],
         phones_label: &str,
         dictionary_label: &str,
-        phones_name: String,
-        dictionary_name: String,
+        phones_name: &str,
+        dictionary_name: &str,
     ) -> Result<Self> {
         let phones_text = decode_text(phones_bytes, phones_label)?;
         let dictionary_text = decode_text(dictionary_bytes, dictionary_label)?;
         let phones_path = Path::new(phones_label).to_path_buf();
         let dictionary_path = Path::new(dictionary_label).to_path_buf();
 
-        let mut loaded = PhonemeDictionary::default();
-        loaded.is_english_arpabet = phones_name == "english-arpabet-phones.txt";
+        let mut loaded = PhonemeDictionary {
+            is_english_arpabet: phones_name == "english-arpabet-phones.txt",
+            ..Default::default()
+        };
         let is_cmu = loaded.is_english_arpabet && dictionary_name == "cmudict-07b.txt";
 
         let mut symbols = HashSet::new();
@@ -424,6 +457,14 @@ impl PhonemeDictionary {
     }
 
     /// Translates one lyric syllable into phoneme symbols.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic on valid `&str` input; the internal `expect` only fires
+    /// for a kana table entry that is not two chars, which is unreachable
+    /// for well-formed tables.
+    // Mirrors the upstream C++ lookup control flow, so keep it whole.
+    #[allow(clippy::too_many_lines)]
     pub fn lookup(&self, lyrics: &str) -> Result<Vec<String>> {
         if !self.is_loaded() {
             return Err(invalid("Phoneme dictionary is not loaded."));
@@ -433,7 +474,7 @@ impl PhonemeDictionary {
         }
         if lyrics
             .bytes()
-            .any(|b| (b < 0x20 && ![b'\t', b'\r', b'\n'].contains(&b)) || b == 0x7f)
+            .any(|b| (b < 0x20 && !b"\t\r\n".contains(&b)) || b == 0x7f)
         {
             return Err(invalid("Text contains an unsupported control character."));
         }
@@ -446,9 +487,7 @@ impl PhonemeDictionary {
             ));
         }
 
-        if self.is_english_arpabet
-            && lyrics.len() == 1
-            && lyrics.as_bytes()[0].is_ascii_uppercase()
+        if self.is_english_arpabet && lyrics.len() == 1 && lyrics.as_bytes()[0].is_ascii_uppercase()
         {
             let spelling = ENGLISH_LETTER_NAMES[(lyrics.as_bytes()[0] - b'A') as usize];
             let mut pronunciation = Vec::new();
@@ -501,7 +540,9 @@ impl PhonemeDictionary {
             }
         }
 
-        if self.is_mandarin && let Some(normalized) = normalize_pinyin(lyrics) {
+        if self.is_mandarin
+            && let Some(normalized) = normalize_pinyin(lyrics)
+        {
             key = normalized;
         }
 
@@ -520,7 +561,7 @@ impl PhonemeDictionary {
         }
         let stripped: String = candidate
             .bytes()
-            .filter(|b| b.is_ascii_alphanumeric())
+            .filter(u8::is_ascii_alphanumeric)
             .map(char::from)
             .collect();
         if stripped.is_empty() {
@@ -590,7 +631,10 @@ impl PhonemeDictionary {
         if !self.is_loaded() {
             return Err(invalid("Phoneme dictionary is not loaded."));
         }
-        let fields: Vec<&str> = text.split([' ', '\t', '\r', '\n']).filter(|field| !field.is_empty()).collect();
+        let fields: Vec<&str> = text
+            .split([' ', '\t', '\r', '\n'])
+            .filter(|field| !field.is_empty())
+            .collect();
         if fields.is_empty() {
             return Err(invalid("Explicit phoneme sequence is empty."));
         }
@@ -619,7 +663,7 @@ impl PhonemeDictionary {
         }
         let stripped: String = candidate
             .bytes()
-            .filter(|b| b.is_ascii_alphanumeric())
+            .filter(u8::is_ascii_alphanumeric)
             .map(char::from)
             .collect();
         !stripped.is_empty() && self.entries.contains_key(&stripped)
@@ -677,24 +721,24 @@ fn load_kana_mappings(
 }
 
 /// Parses one CC-CEDICT line: `trad simp [pin1 yin1] /defs/`.
-fn parse_cedict_entry(line: &str, headwords: &mut Vec<String>, reading: &mut Vec<String>) -> std::result::Result<(), String> {
-    let opening = line.find('[').ok_or_else(|| {
-        "Expected a CEDICT entry: traditional simplified [pinyin].".to_owned()
-    })?;
-    let closing = line.find(']').ok_or_else(|| {
-        "Expected a CEDICT entry: traditional simplified [pinyin].".to_owned()
-    })?;
-    if opening == 0
-        || closing <= opening
-        || !line[..opening].ends_with(|c: char| c.is_whitespace())
+fn parse_cedict_entry(
+    line: &str,
+    headwords: &mut Vec<String>,
+    reading: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    let opening = line
+        .find('[')
+        .ok_or_else(|| "Expected a CEDICT entry: traditional simplified [pinyin].".to_owned())?;
+    let closing = line
+        .find(']')
+        .ok_or_else(|| "Expected a CEDICT entry: traditional simplified [pinyin].".to_owned())?;
+    if opening == 0 || closing <= opening || !line[..opening].ends_with(|c: char| c.is_whitespace())
     {
         return Err("Expected a CEDICT entry: traditional simplified [pinyin].".to_owned());
     }
     let heads = split_fields(&line[..opening]);
     if heads.len() != 2 || heads.iter().any(|head| head.contains(['[', ']'])) {
-        return Err(
-            "Expected exactly two CEDICT headwords before the pinyin reading.".to_owned(),
-        );
+        return Err("Expected exactly two CEDICT headwords before the pinyin reading.".to_owned());
     }
     let pinyin = &line[opening + 1..closing];
     if pinyin.contains(['[', ']']) {
@@ -717,7 +761,10 @@ fn parse_cedict_entry(line: &str, headwords: &mut Vec<String>, reading: &mut Vec
         );
     }
     *headwords = heads.iter().map(|head| (*head).to_owned()).collect();
-    *reading = syllables.iter().map(|syllable| (*syllable).to_owned()).collect();
+    *reading = syllables
+        .iter()
+        .map(|syllable| (*syllable).to_owned())
+        .collect();
     Ok(())
 }
 
@@ -756,8 +803,8 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             dict.as_bytes(),
             "phones.txt",
             "dict.txt",
-            phones_name.to_owned(),
-            dict_name.to_owned(),
+            phones_name,
+            dict_name,
         )
     }
 
@@ -787,8 +834,8 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             MINI_ROMAJI_DICT.as_bytes(),
             "phones.txt",
             "dict.txt",
-            "japanese-romaji-phones.txt".to_owned(),
-            "japanese-romaji-dict.txt".to_owned(),
+            "japanese-romaji-phones.txt",
+            "japanese-romaji-dict.txt",
         )
         .expect("synthetic romaji dictionary parses")
     }
@@ -875,8 +922,8 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             b"hello hh ah l ow\n",
             "phones.txt",
             "dict.txt",
-            "english-arpabet-phones.txt".to_owned(),
-            "english-arpabet-dict.txt".to_owned(),
+            "english-arpabet-phones.txt",
+            "english-arpabet-dict.txt",
         )
         .unwrap();
         assert_eq!(dictionary.lookup("hello").unwrap(), ["hh", "ah", "l", "ow"]);
@@ -891,7 +938,10 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
     #[test]
     fn embedded_nul_is_rejected() {
         let error = arpabet("aa vo\0wel\n", "x aa\n", "p", "d").unwrap_err();
-        assert_eq!(error.to_string(), "phones.txt: Text contains an embedded NUL.");
+        assert_eq!(
+            error.to_string(),
+            "phones.txt: Text contains an embedded NUL."
+        );
     }
 
     #[test]
@@ -907,7 +957,8 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
     fn cmu_comments_variants_stress_and_aliases() {
         // Keys normalize to lowercase; phones are inventory symbols, so the
         // synthetic file uses the lowercase forms directly.
-        let dictionary = cmu(";;; comment\nHELLO hh ah l ow\nHELLO(2) hh eh l ow\nBAT b ae1 t\nOLD ax\n");
+        let dictionary =
+            cmu(";;; comment\nHELLO hh ah l ow\nHELLO(2) hh eh l ow\nBAT b ae1 t\nOLD ax\n");
         // First pronunciation variant wins; key lookup is case-insensitive.
         assert_eq!(dictionary.lookup("hello").unwrap(), ["hh", "ah", "l", "ow"]);
         // Stress digit stripped: AE1 -> AE.
@@ -927,7 +978,10 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
         let dictionary = cmu("WEIRD hh xx\nhello hh ah l ow\n");
         assert!(!dictionary.has_entry("weird"));
         // Falls through to the letter heuristics: w eh ih r d.
-        assert_eq!(dictionary.lookup("weird").unwrap(), ["w", "eh", "ih", "r", "d"]);
+        assert_eq!(
+            dictionary.lookup("weird").unwrap(),
+            ["w", "eh", "ih", "r", "d"]
+        );
         assert_eq!(dictionary.lookup("hello").unwrap(), ["hh", "ah", "l", "ow"]);
     }
 
@@ -947,7 +1001,10 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             "Text contains an embedded NUL."
         );
         assert_eq!(
-            PhonemeDictionary::default().lookup("hello").unwrap_err().to_string(),
+            PhonemeDictionary::default()
+                .lookup("hello")
+                .unwrap_err()
+                .to_string(),
             "Phoneme dictionary is not loaded."
         );
     }
@@ -1040,7 +1097,10 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             ["hh", "ah"]
         );
         assert_eq!(
-            dictionary.parse_explicit_phonemes("hh  xx").unwrap_err().to_string(),
+            dictionary
+                .parse_explicit_phonemes("hh  xx")
+                .unwrap_err()
+                .to_string(),
             "Unknown explicit phoneme 'xx'."
         );
         assert_eq!(
@@ -1115,7 +1175,12 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             &dir.join("sute.txt"),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("Conflicting romaji for kana 'か'."), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Conflicting romaji for kana 'か'."),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1135,7 +1200,9 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
         )
         .unwrap_err();
         assert!(
-            error.to_string().ends_with(":1: Expected exactly two fields: kana and romaji."),
+            error
+                .to_string()
+                .ends_with(":1: Expected exactly two fields: kana and romaji."),
             "{error}"
         );
     }
@@ -1143,7 +1210,10 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
     #[test]
     fn mandarin_normalizes_tones_and_hanzi() {
         let dir = temp_dir_for_tests("dict-zh");
-        write_test_file(&dir.join("phones.txt"), "a vowel\ni vowel\nn consonant\nl consonant\nv vowel\nsil silence\n");
+        write_test_file(
+            &dir.join("phones.txt"),
+            "a vowel\ni vowel\nn consonant\nl consonant\nv vowel\nsil silence\n",
+        );
         write_test_file(&dir.join("dict.txt"), "ni n i\nlü l v\n");
         write_test_file(
             &dir.join("cedict.txt"),
@@ -1163,7 +1233,13 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
         // Hanzi mapped through CEDICT to the pinyin pronunciation.
         assert_eq!(dictionary.lookup("你").unwrap(), ["n", "i"]);
         // Multi-syllable readings are skipped, not mapped.
-        assert!(dictionary.lookup("中国").unwrap_err().to_string().starts_with("No Mandarin pronunciation"));
+        assert!(
+            dictionary
+                .lookup("中国")
+                .unwrap_err()
+                .to_string()
+                .starts_with("No Mandarin pronunciation")
+        );
     }
 
     #[test]
@@ -1179,7 +1255,12 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
         )
         .unwrap();
         let error = dictionary.lookup("ma").unwrap_err().to_string();
-        assert!(error.starts_with("No Mandarin pronunciation for 'ma'. Use one dictionary-listed syllable per note"), "{error}");
+        assert!(
+            error.starts_with(
+                "No Mandarin pronunciation for 'ma'. Use one dictionary-listed syllable per note"
+            ),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1194,7 +1275,12 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             &dir.join("cedict.txt"),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("Conflicting pronunciations for normalized pinyin 'ni'."), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Conflicting pronunciations for normalized pinyin 'ni'."),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1209,7 +1295,12 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             &dir.join("cedict.txt"),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("CEDICT contains no supported single-syllable readings"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("CEDICT contains no supported single-syllable readings"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1224,7 +1315,12 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             &dir.join("cedict.txt"),
         )
         .unwrap_err();
-        assert!(error.to_string().ends_with(":1: Expected a CEDICT entry: traditional simplified [pinyin]."), "{error}");
+        assert!(
+            error
+                .to_string()
+                .ends_with(":1: Expected a CEDICT entry: traditional simplified [pinyin]."),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1234,7 +1330,12 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             Path::new("/definitely/not/here-dict.txt"),
         )
         .unwrap_err();
-        assert!(error.to_string().starts_with("could not read /definitely/not/here-phones.txt"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("could not read /definitely/not/here-phones.txt"),
+            "{error}"
+        );
     }
 
     #[test]

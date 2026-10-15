@@ -144,16 +144,13 @@ impl AcousticFeatures {
             }
         }
 
-        candidate
-            .phoneme_normalization
-            .load(reader, children[3])?;
+        candidate.phoneme_normalization.load(reader, children[3])?;
         candidate.pitch_normalization.load(reader, children[4])?;
-        candidate
-            .acoustic_normalization
-            .load(reader, children[5])?;
+        candidate.acoustic_normalization.load(reader, children[5])?;
         if candidate.phoneme_normalization.channel_count() != candidate.config.phoneme_channels
             || candidate.pitch_normalization.channel_count() != candidate.config.pitch_channels
-            || candidate.acoustic_normalization.channel_count() != candidate.config.acoustic_channels
+            || candidate.acoustic_normalization.channel_count()
+                != candidate.config.acoustic_channels
         {
             return Err(invalid(
                 "Acoustic normalization dimensions do not match the feature configuration.",
@@ -245,8 +242,10 @@ impl AcousticFeatures {
             }
             let language_index = self.find_language_index(&phoneme.language)?;
             let phone_set = &self.phone_sets[language_index];
-            let Some(source_index) =
-                phone_set.symbols.iter().position(|symbol| symbol == &phoneme.symbol)
+            let Some(source_index) = phone_set
+                .symbols
+                .iter()
+                .position(|symbol| symbol == &phoneme.symbol)
             else {
                 return Err(invalid(format!(
                     "Unknown acoustic phoneme '{}' for {}.",
@@ -265,8 +264,7 @@ impl AcousticFeatures {
                 ));
             };
             raw.values[index * channels + target_index] = 1.0;
-            let duration_seconds =
-                phoneme.frame_count as f32 * self.config.frame_interval_seconds;
+            let duration_seconds = phoneme.frame_count as f32 * self.config.frame_interval_seconds;
             raw.values[(index + 1) * channels - 1] = (duration_seconds + 0.05).ln();
         }
         self.phoneme_normalization.normalize(&raw, output, true)
@@ -312,7 +310,8 @@ impl AcousticFeatures {
             ));
         }
         let mut decoded = DnniTensor::default();
-        self.acoustic_normalization.denormalize(normalized, &mut decoded)?;
+        self.acoustic_normalization
+            .denormalize(normalized, &mut decoded)?;
         let channels = decoded.channels;
         let mut values = vec![0.0; decoded.frames * (channels + 1)];
         for frame in 0..decoded.frames {
@@ -478,16 +477,7 @@ mod tests {
     }
 
     fn valid_payload() -> [u32; 8] {
-        [
-            3,
-            1,
-            71,
-            2,
-            66,
-            0,
-            0.005_f32.to_bits(),
-            0,
-        ]
+        [3, 1, 71, 2, 66, 0, 0.005_f32.to_bits(), 0]
     }
 
     fn valid_reader() -> DnniReader {
@@ -652,8 +642,8 @@ mod tests {
     fn loader_rejects_a_bad_feature_width() {
         let mut payload = valid_payload();
         payload[2] = 70;
-        let reader = DnniReader::from_bytes(v2_file(&frontend_node(payload)))
-            .expect("blob must parse");
+        let reader =
+            DnniReader::from_bytes(v2_file(&frontend_node(payload))).expect("blob must parse");
         let mut features = AcousticFeatures::new();
         assert_eq!(
             features.load(&reader, 0).unwrap_err().to_string(),
@@ -700,8 +690,7 @@ mod tests {
                 cmpu_node(&vec![0.0; 71], &vec![1.0; 71], &[0.0, 1.0]),
             ],
         );
-        let reader =
-            DnniReader::from_bytes(v2_file(&root)).expect("blob must parse");
+        let reader = DnniReader::from_bytes(v2_file(&root)).expect("blob must parse");
         let mut features = AcousticFeatures::new();
         assert_eq!(
             features.load(&reader, 0).unwrap_err().to_string(),

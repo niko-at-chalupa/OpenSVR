@@ -5,8 +5,7 @@
 //! so golden tests can compare messages.
 
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -225,10 +224,7 @@ impl DnniReader {
         node_index: &mut usize,
     ) -> Result<()> {
         if depth > MAXIMUM_DEPTH || self.nodes.len() >= MAXIMUM_NODES {
-            return Err(malformed(
-                *position,
-                "node depth or count limit exceeded.",
-            ));
+            return Err(malformed(*position, "node depth or count limit exceeded."));
         }
         if self.data.len().saturating_sub(*position) < NODE_HEADER_BYTES {
             return Err(malformed(*position, "truncated node header."));
@@ -278,7 +274,12 @@ impl DnniReader {
         }
 
         let payload_size = read_u32(&self.data, header_at + 16) as usize;
-        if payload_size > self.data.len().saturating_sub(header_at + NODE_HEADER_BYTES) {
+        if payload_size
+            > self
+                .data
+                .len()
+                .saturating_sub(header_at + NODE_HEADER_BYTES)
+        {
             return Err(malformed(header_at + 16, "payload extends past the file."));
         }
         let payload_offset = header_at + NODE_HEADER_BYTES;
@@ -345,12 +346,10 @@ fn resolve_type(type_id: u64) -> String {
         0x0000_0062_6d6f_6379,
     ];
     const NAMES: [&str; 37] = [
-        "prim0", "prim1", "prim2", "prim3", "prim4", "prim5", "modm0", "modl0",
-        "modl1", "modl3", "modl4", "modl6", "moda0", "moda1", "moda2", "moda3",
-        "moda4", "moda5", "moda7", "_gnc1v0", "_ncwnv0", "cmpg1", "cmpu0",
-        "cmpu1", "_vocfv1", "_vocfv2", "_ppusv0", "_ppdsv0", "_psv2",
-        "_rldtg0", "_rldms0", "_stbkv1", "_vqctx1", "_didsv0", "_ftmfv2",
-        "_ftmfv3", "_dctov0",
+        "prim0", "prim1", "prim2", "prim3", "prim4", "prim5", "modm0", "modl0", "modl1", "modl3",
+        "modl4", "modl6", "moda0", "moda1", "moda2", "moda3", "moda4", "moda5", "moda7", "_gnc1v0",
+        "_ncwnv0", "cmpg1", "cmpu0", "cmpu1", "_vocfv1", "_vocfv2", "_ppusv0", "_ppdsv0", "_psv2",
+        "_rldtg0", "_rldms0", "_stbkv1", "_vqctx1", "_didsv0", "_ftmfv2", "_ftmfv3", "_dctov0",
     ];
 
     for name in NAMES {
@@ -384,9 +383,7 @@ fn decode_floats(bytes: &[u8], count: usize) -> Result<Vec<f32>> {
             bytes[index * 4 + 3],
         ]);
         if !value.is_finite() {
-            return Err(invalid(
-                "DNNI float tensor contains a non-finite value.",
-            ));
+            return Err(invalid("DNNI float tensor contains a non-finite value."));
         }
         values.push(value);
     }
@@ -436,9 +433,7 @@ fn decode_matrix(payload: &[u8], kind: &str) -> Result<DnniMatrix> {
         }
         let scale_count = read_u32(payload, 12) as usize;
         if scale_count > payload.len().saturating_sub(16) / 4 {
-            return Err(invalid(
-                "DNNI quantization scale array is truncated.",
-            ));
+            return Err(invalid("DNNI quantization scale array is truncated."));
         }
         scales = decode_floats(&payload[16..16 + scale_count * 4], scale_count)?;
         payload = &payload[16 + scale_count * 4..];
@@ -496,8 +491,7 @@ fn decode_matrix(payload: &[u8], kind: &str) -> Result<DnniMatrix> {
             for column in 0..columns as usize {
                 let offset = (column * rows as usize + row) * bytes_per_element;
                 let integer = read_quantized(payload, offset, bits);
-                values[row * columns as usize + column] =
-                    (integer as f32 / divisor) * scales[row];
+                values[row * columns as usize + column] = (integer as f32 / divisor) * scales[row];
             }
         }
         return Ok(DnniMatrix {
@@ -526,7 +520,8 @@ fn decode_matrix(payload: &[u8], kind: &str) -> Result<DnniMatrix> {
     let index_bytes = block_count as u64 * 2;
     let pointer_bytes = (block_row_count as u64 + 1) * 4;
     let block_elements = block_rows * block_columns;
-    if block_count as u64 > MAXIMUM_MODEL_BYTES as u64 / bytes_per_element as u64 / block_elements as u64
+    if block_count as u64
+        > MAXIMUM_MODEL_BYTES as u64 / bytes_per_element as u64 / block_elements as u64
     {
         return Err(invalid(
             "DNNI sparse coefficient array exceeds the memory limit.",
@@ -534,8 +529,7 @@ fn decode_matrix(payload: &[u8], kind: &str) -> Result<DnniMatrix> {
     }
     let coefficient_count = block_count * block_elements;
     if coefficient_count as u64 > MAXIMUM_MODEL_BYTES as u64 / bytes_per_element as u64
-        || 20 + index_bytes + pointer_bytes
-            + coefficient_count as u64 * bytes_per_element as u64
+        || 20 + index_bytes + pointer_bytes + coefficient_count as u64 * bytes_per_element as u64
             != payload.len() as u64
     {
         return Err(invalid(
@@ -547,12 +541,8 @@ fn decode_matrix(payload: &[u8], kind: &str) -> Result<DnniMatrix> {
     let indices = &payload[20..base];
     let pointers = &payload[base..pointers_at];
     let coefficients = &payload[pointers_at..];
-    if read_u32(pointers, 0) != 0
-        || read_u32(pointers, block_row_count * 4) != block_count as u32
-    {
-        return Err(invalid(
-            "DNNI sparse row pointers do not span all blocks.",
-        ));
+    if read_u32(pointers, 0) != 0 || read_u32(pointers, block_row_count * 4) != block_count as u32 {
+        return Err(invalid("DNNI sparse row pointers do not span all blocks."));
     }
     let mut values = vec![0.0_f32; element_count];
     for block_row in 0..block_row_count {
@@ -567,15 +557,11 @@ fn decode_matrix(payload: &[u8], kind: &str) -> Result<DnniMatrix> {
             let column_block =
                 indices[block * 2] as usize | ((indices[block * 2 + 1] as usize) << 8);
             if column_block >= columns as usize / block_columns {
-                return Err(invalid(
-                    "DNNI sparse block column is outside the matrix.",
-                ));
+                return Err(invalid("DNNI sparse block column is outside the matrix."));
             }
             for column in 0..block_columns {
                 for row in 0..block_rows {
-                    let at = (block * block_rows * block_columns
-                        + column * block_rows
-                        + row)
+                    let at = (block * block_rows * block_columns + column * block_rows + row)
                         * bytes_per_element;
                     let output_row = block_row * block_rows + row;
                     let output_column = column_block * block_columns + column;
@@ -590,8 +576,7 @@ fn decode_matrix(payload: &[u8], kind: &str) -> Result<DnniMatrix> {
                             coefficients[at + 3],
                         ])
                     };
-                    let destination =
-                        &mut values[output_row * columns as usize + output_column];
+                    let destination = &mut values[output_row * columns as usize + output_column];
                     *destination += value;
                     if !destination.is_finite() {
                         return Err(invalid(
@@ -657,11 +642,7 @@ mod tests {
     fn v2_node(type_id: u64, children: u32, payload: &[u8], child_bytes: &[u8]) -> Vec<u8> {
         let low = type_id as u32;
         let high = (type_id >> 32) as u32;
-        let encoded = children
-            .wrapping_mul(3)
-            ^ low
-            ^ high
-            ^ CHILD_COUNT_XOR_MASK;
+        let encoded = children.wrapping_mul(3) ^ low ^ high ^ CHILD_COUNT_XOR_MASK;
         let mut out = Vec::new();
         out.extend_from_slice(&0x7fca_41ff_u32.to_le_bytes());
         out.extend_from_slice(&type_id.to_le_bytes());
@@ -726,11 +707,14 @@ mod tests {
         let leaf = &reader.nodes()[1];
         assert_eq!(leaf.name, "prim1");
         assert!(leaf.children.is_empty());
-        assert_eq!(leaf.type_id, u64::from_le_bytes({
-            let mut id = [0_u8; 8];
-            id.copy_from_slice(&v1_tag("prim1"));
-            id
-        }));
+        assert_eq!(
+            leaf.type_id,
+            u64::from_le_bytes({
+                let mut id = [0_u8; 8];
+                id.copy_from_slice(&v1_tag("prim1"));
+                id
+            })
+        );
     }
 
     #[test]
@@ -761,7 +745,10 @@ mod tests {
         let mut bytes = file_bytes(1, &v1_leaf("prim1", b""));
         bytes[0] = 0x00;
         let error = DnniReader::from_bytes(bytes).unwrap_err();
-        assert_eq!(error.to_string(), "DNNI offset 0x0: unrecognised file signature.");
+        assert_eq!(
+            error.to_string(),
+            "DNNI offset 0x0: unrecognised file signature."
+        );
     }
 
     #[test]
@@ -787,7 +774,10 @@ mod tests {
         let mut node = v1_leaf("prim1", b"");
         node[0] = 0x00;
         let error = DnniReader::from_bytes(file_bytes(1, &node)).unwrap_err();
-        assert_eq!(error.to_string(), "DNNI offset 0x8: unrecognised node marker.");
+        assert_eq!(
+            error.to_string(),
+            "DNNI offset 0x8: unrecognised node marker."
+        );
     }
 
     #[test]
@@ -803,7 +793,10 @@ mod tests {
         let mut node = v1_leaf("prim1", b"abc");
         node.truncate(node.len() - 1);
         let error = DnniReader::from_bytes(file_bytes(1, &node)).unwrap_err();
-        assert_eq!(error.to_string(), "DNNI offset 0x18: payload extends past the file.");
+        assert_eq!(
+            error.to_string(),
+            "DNNI offset 0x18: payload extends past the file."
+        );
     }
 
     #[test]
@@ -897,8 +890,7 @@ mod tests {
 
     #[test]
     fn missing_file_reports_path() {
-        let error =
-            DnniReader::load(Path::new("/nonexistent-model-12345.dnni")).unwrap_err();
+        let error = DnniReader::load(Path::new("/nonexistent-model-12345.dnni")).unwrap_err();
         assert_eq!(
             error.to_string(),
             "DNNI file is missing or outside the supported size range: \
@@ -935,7 +927,10 @@ mod tests {
     fn prim1_truncated_size_is_rejected() {
         let reader = load_v1("prim1", &[0x01, 0x02]);
         let error = reader.read_float_vector(0).unwrap_err();
-        assert_eq!(error.to_string(), "DNNI offset 0x1c: truncated vector size.");
+        assert_eq!(
+            error.to_string(),
+            "DNNI offset 0x1c: truncated vector size."
+        );
     }
 
     #[test]
@@ -1202,7 +1197,15 @@ mod tests {
     fn sparse_quant_applies_row_scales() {
         // 2x2 with 1x1 blocks on the diagonal, 8-bit ints, scales [2.0, 4.0].
         let mut payload = quant_header(8, 0, &[2.0, 4.0]);
-        payload.extend(sparse_payload(2, 2, 1, 1, &[0, 0, 1, 0], &[0, 1, 2], &[64, 192]));
+        payload.extend(sparse_payload(
+            2,
+            2,
+            1,
+            1,
+            &[0, 0, 1, 0],
+            &[0, 1, 2],
+            &[64, 192],
+        ));
         let reader = load_v1("prim5", &payload);
         let matrix = reader.read_float_matrix(0).unwrap();
         // 192 as i8 is -64: -64 / 128 * 4.0 = -2.0.
@@ -1289,15 +1292,7 @@ mod tests {
 
     #[test]
     fn sparse_non_finite_accumulation_is_rejected() {
-        let payload = sparse_payload(
-            2,
-            2,
-            1,
-            1,
-            &[0, 0],
-            &[0, 1, 1],
-            &floats(&[f32::INFINITY]),
-        );
+        let payload = sparse_payload(2, 2, 1, 1, &[0, 0], &[0, 1, 1], &floats(&[f32::INFINITY]));
         let reader = load_v1("prim3", &payload);
         assert_eq!(
             reader.read_float_matrix(0).unwrap_err().to_string(),

@@ -4,13 +4,8 @@
 # are cut by automation and nothing publishes), so there is no release
 # pipeline to drive; `cargo dist` would add installers plus a config to
 # maintain for no current gain. Revisit it when publishing GitHub Releases
-# becomes routine. This workflow only tests, lints, and uploads binaries.
-#
-# Clippy stance: `-D clippy::correctness` denies likely-bug lints and is
-# green workspace-wide. Full `-D warnings` is NOT used: the style/pedantic
-# backlog (e.g. `opensvr-dnni`, `opensvr-g2p`) still warns and cleaning it
-# is its own generation, not release work. Pedantic lints stay warn-only
-# until that cleanup lands; do not widen this gate by accident.
+# becomes routine. This workflow tests, lints, checks formatting, and
+# uploads binaries.
 name: ci
 
 on:
@@ -31,8 +26,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace --locked
-      - name: Lint (correctness only; see the header comment)
-        run: cargo clippy --workspace --all-targets -- -D clippy::correctness
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Formatting
+        run: cargo fmt --check
       - name: Build release binaries
         run: cargo build --release --locked -p opensvr-cli
       - name: Upload release artifacts

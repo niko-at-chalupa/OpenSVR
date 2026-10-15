@@ -31,7 +31,11 @@ struct Golden {
 fn parse_syllable(words: &mut std::str::SplitWhitespace<'_>) -> opensvr_voice::TimingSyllable {
     let language = words.next().expect("syllable language").to_owned();
     let midi_pitch: i32 = words.next().expect("midi").parse().expect("midi int");
-    let duration_seconds: f64 = words.next().expect("seconds").parse().expect("seconds float");
+    let duration_seconds: f64 = words
+        .next()
+        .expect("seconds")
+        .parse()
+        .expect("seconds float");
     let phonemes: Vec<String> = words.map(str::to_owned).collect();
     assert!(!phonemes.is_empty(), "golden syllable needs phonemes");
     opensvr_voice::TimingSyllable {
@@ -58,7 +62,11 @@ fn parse_duration(entry: &str) -> PhonemeDuration {
             .expect("interval index")
             .parse()
             .expect("interval int"),
-        duration_seconds: fields.next().expect("seconds").parse().expect("seconds float"),
+        duration_seconds: fields
+            .next()
+            .expect("seconds")
+            .parse()
+            .expect("seconds float"),
     }
 }
 
@@ -84,13 +92,21 @@ fn parse_golden(path: &Path) -> Golden {
             Some("durations") => {
                 let count: usize = words.next().expect("count").parse().expect("count int");
                 for _ in 0..count {
-                    golden.durations.push(parse_duration(lines.next().expect("duration entry")));
+                    golden
+                        .durations
+                        .push(parse_duration(lines.next().expect("duration entry")));
                 }
             }
             Some("pitch") => {
                 let count: usize = words.next().expect("count").parse().expect("count int");
                 for _ in 0..count {
-                    golden.pitch.push(lines.next().expect("pitch entry").parse().expect("pitch float"));
+                    golden.pitch.push(
+                        lines
+                            .next()
+                            .expect("pitch entry")
+                            .parse()
+                            .expect("pitch float"),
+                    );
                 }
             }
             Some(other) => panic!("golden {} has unknown section {other}", path.display()),
@@ -163,12 +179,13 @@ fn real_pitch_model_matches_cpp_goldens() {
     let pitch_entry = db
         .find_entry("f0model-dds")
         .expect("voice must contain the pitch entry");
-    let pitch_bytes = db.read_entry(pitch_entry).expect("entry must read").to_vec();
+    let pitch_bytes = db
+        .read_entry(pitch_entry)
+        .expect("entry must read")
+        .to_vec();
     let pitch_reader = DnniReader::from_bytes(pitch_bytes).expect("pitch entry must parse");
     let mut pitch = PitchModel::new();
-    pitch
-        .load(&pitch_reader, 0)
-        .expect("pitch model must load");
+    pitch.load(&pitch_reader, 0).expect("pitch model must load");
     assert_eq!(pitch.frame_interval_seconds(), 0.005);
 
     let cases = golden_cases();
@@ -178,6 +195,8 @@ fn real_pitch_model_matches_cpp_goldens() {
     }
 }
 
+/// Data-heavy golden comparison; kept whole so each stage's assertions stay together.
+#[allow(clippy::too_many_lines)]
 fn check_case(timing: &PhonemeTiming, pitch: &PitchModel, case: &Path) {
     let golden = parse_golden(case);
 
@@ -192,15 +211,27 @@ fn check_case(timing: &PhonemeTiming, pitch: &PitchModel, case: &Path) {
         case.display()
     );
     for (index, (got, want)) in durations.iter().zip(&golden.durations).enumerate() {
-        assert_eq!(got.language, want.language, "{} phoneme {index} language", case.display());
-        assert_eq!(got.symbol, want.symbol, "{} phoneme {index} symbol", case.display());
         assert_eq!(
-            got.syllable_index, want.syllable_index,
+            got.language,
+            want.language,
+            "{} phoneme {index} language",
+            case.display()
+        );
+        assert_eq!(
+            got.symbol,
+            want.symbol,
+            "{} phoneme {index} symbol",
+            case.display()
+        );
+        assert_eq!(
+            got.syllable_index,
+            want.syllable_index,
             "{} phoneme {index} syllable",
             case.display()
         );
         assert_eq!(
-            got.timing_interval_index, want.timing_interval_index,
+            got.timing_interval_index,
+            want.timing_interval_index,
             "{} phoneme {index} interval",
             case.display()
         );
@@ -223,7 +254,16 @@ fn check_case(timing: &PhonemeTiming, pitch: &PitchModel, case: &Path) {
     let cancel = CancelToken::new();
     let mut midi_pitch = Vec::new();
     pitch
-        .run(&notes, &durations, &mut midi_pitch, 0, None, &cancel, None, &[])
+        .run(
+            &notes,
+            &durations,
+            &mut midi_pitch,
+            0,
+            None,
+            &cancel,
+            None,
+            &[],
+        )
         .unwrap_or_else(|error| panic!("{} pitch must predict: {error}", case.display()));
     assert_eq!(
         midi_pitch.len(),
@@ -243,12 +283,30 @@ fn check_case(timing: &PhonemeTiming, pitch: &PitchModel, case: &Path) {
     let mut state = PitchModelState::default();
     let mut rerun = Vec::new();
     pitch
-        .run(&notes, &durations, &mut rerun, 0, Some(&mut state), &cancel, None, &[])
+        .run(
+            &notes,
+            &durations,
+            &mut rerun,
+            0,
+            Some(&mut state),
+            &cancel,
+            None,
+            &[],
+        )
         .expect("first stateful run must predict");
     assert!(!state.reused_prediction, "first run computes");
     let mut cached = Vec::new();
     pitch
-        .run(&notes, &durations, &mut cached, 0, Some(&mut state), &cancel, None, &[])
+        .run(
+            &notes,
+            &durations,
+            &mut cached,
+            0,
+            Some(&mut state),
+            &cancel,
+            None,
+            &[],
+        )
         .expect("second stateful run must predict");
     assert!(state.reused_prediction, "second run reuses");
     assert_eq!(cached, rerun, "cached curve is verbatim");

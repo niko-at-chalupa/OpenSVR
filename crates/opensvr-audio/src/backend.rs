@@ -197,7 +197,11 @@ mod tests {
     fn a4_completes_440_cycles_per_second() {
         let audio = render(&[note(0.0, 1.0, 69)], 44_100);
         assert_eq!(audio.start, 0.0);
-        assert_eq!(audio.samples.len(), 48_510, "one second plus the release context");
+        assert_eq!(
+            audio.samples.len(),
+            48_510,
+            "one second plus the release context"
+        );
         let rising = audio.samples[..44_100]
             .windows(2)
             .filter(|w| w[0] < 0.0 && w[1] >= 0.0)

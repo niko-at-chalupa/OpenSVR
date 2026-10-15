@@ -101,9 +101,8 @@ impl VoiceSynthesizer {
         candidate
             .vocal_mode_names
             .clone_from(&database.metadata().timbre_styles);
-        candidate.rap_languages = split_rap_languages(
-            database.metadata().property(".feature_rap_languages"),
-        );
+        candidate.rap_languages =
+            split_rap_languages(database.metadata().property(".feature_rap_languages"));
         {
             let Some(entry) = database.find_entry("f0model-dds") else {
                 return Err(invalid(
@@ -127,24 +126,14 @@ impl VoiceSynthesizer {
             candidate.timing.load(&reader, 0)?;
         }
         {
-            let reader = read_model(
-                &database,
-                configuration.acoustic_model(),
-                "dds",
-                "acoustic",
-            )?;
+            let reader = read_model(&database, configuration.acoustic_model(), "dds", "acoustic")?;
             candidate
                 .acoustic
                 .load_with_vocal_modes(&reader, &candidate.vocal_mode_names, 0)?;
             candidate.frame_interval_seconds = read_frame_interval(&reader)?;
         }
         {
-            let reader = read_model(
-                &database,
-                configuration.vocoder_model(),
-                "nhv",
-                "vocoder",
-            )?;
+            let reader = read_model(&database, configuration.vocoder_model(), "nhv", "vocoder")?;
             candidate.vocoder.load(&reader, 0)?;
         }
         *self = candidate;
@@ -516,7 +505,14 @@ mod tests {
         let mut pitch = Vec::new();
         assert_eq!(
             synthesizer
-                .predict_pitch(&[note("japanese", 60, false)], &mut pitch, &CancelToken::new(), None, None, &[])
+                .predict_pitch(
+                    &[note("japanese", 60, false)],
+                    &mut pitch,
+                    &CancelToken::new(),
+                    None,
+                    None,
+                    &[]
+                )
                 .unwrap_err()
                 .to_string(),
             "Pitch prediction requires a loaded voice and score notes."
@@ -524,7 +520,16 @@ mod tests {
         let mut output = NeuralVocoderOutput::default();
         assert_eq!(
             synthesizer
-                .render(&[], &[], &mut output, DEFAULT_RENDER_SEED, &CancelToken::new(), None, None, &[])
+                .render(
+                    &[],
+                    &[],
+                    &mut output,
+                    DEFAULT_RENDER_SEED,
+                    &CancelToken::new(),
+                    None,
+                    None,
+                    &[]
+                )
                 .unwrap_err()
                 .to_string(),
             "Voice synthesizer: no voice has been loaded"
@@ -601,7 +606,10 @@ mod tests {
             vec!["japanese".to_owned(), "english".to_owned()]
         );
         assert!(split_rap_languages("").is_empty());
-        assert_eq!(split_rap_languages("japanese  english"), vec!["japanese".to_owned(), "english".to_owned()]);
+        assert_eq!(
+            split_rap_languages("japanese  english"),
+            vec!["japanese".to_owned(), "english".to_owned()]
+        );
     }
 
     // --- Minimal v2 blob builders for the interval-scan error paths ---
@@ -648,8 +656,7 @@ mod tests {
     #[test]
     fn interval_scan_rejects_a_missing_configuration() {
         let root = v2_node(named_id("modl0"), &[], &[]);
-        let reader =
-            DnniReader::from_bytes(v2_file(&root)).expect("synthetic blob must parse");
+        let reader = DnniReader::from_bytes(v2_file(&root)).expect("synthetic blob must parse");
         assert_eq!(
             read_frame_interval(&reader).unwrap_err().to_string(),
             "Voice synthesizer: acoustic model has no supported _ftmfv2/v3 feature configuration"
@@ -661,8 +668,7 @@ mod tests {
         let first = v2_node(named_id("_ftmfv2"), &[], &[]);
         let second = v2_node(named_id("_ftmfv3"), &[], &[]);
         let root = v2_node(named_id("modm0"), &[], &[first, second]);
-        let reader =
-            DnniReader::from_bytes(v2_file(&root)).expect("synthetic blob must parse");
+        let reader = DnniReader::from_bytes(v2_file(&root)).expect("synthetic blob must parse");
         assert_eq!(
             reader
                 .nodes()

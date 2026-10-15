@@ -125,7 +125,9 @@ fn build_phrase_inputs(
         pitch_notes.push(pitch_note);
         phoneme_count += sung.phonemes.len();
         if phoneme_count >= MAXIMUM_PHRASE_PHONEMES {
-            return Err(backend_error("The phrase exceeds the 4096-phoneme inference limit."));
+            return Err(backend_error(
+                "The phrase exceeds the 4096-phoneme inference limit.",
+            ));
         }
         cursor_seconds = note.end;
     }
@@ -445,10 +447,9 @@ fn predict_phrase(
     let first = notes.first().expect("phrases are never empty");
     let pitch_start = first.start - PITCH_CONTEXT_SECONDS;
     let pitch_interval = synthesizer.pitch_frame_interval_seconds();
-    let pitch_duration =
-        notes.last().expect("phrases are never empty").end - first.start + 2.0 * PITCH_CONTEXT_SECONDS;
-    let pitch_envelope_count =
-        (pitch_duration / f64::from(pitch_interval)).ceil() as usize + 2;
+    let pitch_duration = notes.last().expect("phrases are never empty").end - first.start
+        + 2.0 * PITCH_CONTEXT_SECONDS;
+    let pitch_envelope_count = (pitch_duration / f64::from(pitch_interval)).ceil() as usize + 2;
     let pitch_envelope =
         build_vibrato_envelope(notes, pitch_start, pitch_interval, pitch_envelope_count);
     let mut automatic_pitch = Vec::new();
@@ -533,8 +534,8 @@ mod tests {
             dict.as_bytes(),
             "phones.txt",
             "dict.txt",
-            "x-phones.txt".to_owned(),
-            "x-dict.txt".to_owned(),
+            "x-phones.txt",
+            "x-dict.txt",
         )
         .expect("synthetic dictionary parses")
     }
@@ -569,7 +570,11 @@ mod tests {
     }
 
     fn languages(inputs: &PhraseInputs) -> Vec<&str> {
-        inputs.syllables.iter().map(|s| s.language.as_str()).collect::<Vec<_>>()
+        inputs
+            .syllables
+            .iter()
+            .map(|s| s.language.as_str())
+            .collect::<Vec<_>>()
     }
 
     #[test]

@@ -43,10 +43,12 @@ fn parse_golden(path: &Path) -> Golden {
             Some("in") => {
                 let language = words.next().expect("syllable language").to_owned();
                 let midi_pitch: i32 = words.next().expect("midi").parse().expect("midi int");
-                let duration_seconds: f64 =
-                    words.next().expect("seconds").parse().expect("seconds float");
-                let phonemes: Vec<String> =
-                    words.map(str::to_owned).collect();
+                let duration_seconds: f64 = words
+                    .next()
+                    .expect("seconds")
+                    .parse()
+                    .expect("seconds float");
+                let phonemes: Vec<String> = words.map(str::to_owned).collect();
                 assert!(!phonemes.is_empty(), "golden syllable needs phonemes");
                 golden.syllables.push(TimingSyllable {
                     language,
@@ -57,8 +59,11 @@ fn parse_golden(path: &Path) -> Golden {
                 });
             }
             Some("interval") => {
-                golden.frame_interval =
-                    words.next().expect("interval").parse().expect("interval float");
+                golden.frame_interval = words
+                    .next()
+                    .expect("interval")
+                    .parse()
+                    .expect("interval float");
             }
             Some("durations") => {
                 let count: usize = words.next().expect("count").parse().expect("count int");
@@ -94,11 +99,7 @@ fn parse_golden(path: &Path) -> Golden {
                     golden.frames.push(TimedPhoneme {
                         language: fields.next().expect("language").to_owned(),
                         symbol: fields.next().expect("symbol").to_owned(),
-                        frame_count: fields
-                            .next()
-                            .expect("frames")
-                            .parse()
-                            .expect("frames int"),
+                        frame_count: fields.next().expect("frames").parse().expect("frames int"),
                     });
                 }
             }
@@ -167,15 +168,27 @@ fn real_duration_model_matches_cpp_goldens() {
             case.display()
         );
         for (index, (got, want)) in predicted.iter().zip(&golden.durations).enumerate() {
-            assert_eq!(got.language, want.language, "{} phoneme {index} language", case.display());
-            assert_eq!(got.symbol, want.symbol, "{} phoneme {index} symbol", case.display());
             assert_eq!(
-                got.syllable_index, want.syllable_index,
+                got.language,
+                want.language,
+                "{} phoneme {index} language",
+                case.display()
+            );
+            assert_eq!(
+                got.symbol,
+                want.symbol,
+                "{} phoneme {index} symbol",
+                case.display()
+            );
+            assert_eq!(
+                got.syllable_index,
+                want.syllable_index,
                 "{} phoneme {index} syllable",
                 case.display()
             );
             assert_eq!(
-                got.timing_interval_index, want.timing_interval_index,
+                got.timing_interval_index,
+                want.timing_interval_index,
                 "{} phoneme {index} interval",
                 case.display()
             );
@@ -192,7 +205,8 @@ fn real_duration_model_matches_cpp_goldens() {
         opensvr_voice::quantize_phoneme_durations(&predicted, golden.frame_interval, &mut timed)
             .expect("must quantize");
         assert_eq!(
-            timed, golden.frames,
+            timed,
+            golden.frames,
             "{} quantized frames must match exactly",
             case.display()
         );

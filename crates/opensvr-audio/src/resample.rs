@@ -33,7 +33,9 @@ pub fn resample_mono(
         return Ok(input.to_vec());
     }
     if input_rate == 0 || output_rate == 0 {
-        return Err(BackendError("the voice renderer returned invalid audio.".into()));
+        return Err(BackendError(
+            "the voice renderer returned invalid audio.".into(),
+        ));
     }
     if input.is_empty() {
         return Ok(Vec::new());

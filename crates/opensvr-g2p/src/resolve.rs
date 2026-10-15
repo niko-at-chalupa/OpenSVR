@@ -114,7 +114,10 @@ pub fn split_english_syllables(phonemes: &[String]) -> Vec<Vec<String>> {
 ///
 /// Only applies past the last vowel; vowel-less words keep every phone.
 fn defer_trailing_english_coda(phonemes: &mut Vec<String>, deferred: &mut Vec<String>) {
-    let Some(vowel) = phonemes.iter().rposition(|symbol| is_english_vowel_phoneme(symbol)) else {
+    let Some(vowel) = phonemes
+        .iter()
+        .rposition(|symbol| is_english_vowel_phoneme(symbol))
+    else {
         return;
     };
     if vowel + 1 < phonemes.len() {
@@ -148,8 +151,7 @@ fn last_vowel_or_tail(phonemes: &[String], dictionary: &PhonemeDictionary) -> St
 
 fn english_fallback_available(dir: &Path) -> bool {
     dir.join("english-arpabet-phones.txt").is_file()
-        && (dir.join("cmudict-07b.txt").is_file()
-            || dir.join("english-arpabet-dict.txt").is_file())
+        && (dir.join("cmudict-07b.txt").is_file() || dir.join("english-arpabet-dict.txt").is_file())
 }
 
 fn load_english(dir: &Path) -> Option<PhonemeDictionary> {
@@ -204,7 +206,13 @@ pub fn load_dictionaries(dir: &Path, language: Language) -> Result<DictionarySet
                     return Err(cannot_read(file));
                 }
             }
-            PhonemeDictionary::load_japanese(&phones, &dictionary, &hiragana, &katakana, &small_kana)?
+            PhonemeDictionary::load_japanese(
+                &phones,
+                &dictionary,
+                &hiragana,
+                &katakana,
+                &small_kana,
+            )?
         }
         _ => PhonemeDictionary::load(&phones, &dictionary)?,
     };
@@ -249,9 +257,12 @@ pub fn resolve(
         }
         let mut continuation = phonemes.last().cloned().unwrap_or_default();
         if language == Language::English
-            && let Some(vowel) = phonemes.iter().rev().find(|symbol| is_english_vowel_phoneme(symbol))
+            && let Some(vowel) = phonemes
+                .iter()
+                .rev()
+                .find(|symbol| is_english_vowel_phoneme(symbol))
         {
-            continuation = vowel.clone();
+            continuation.clone_from(vowel);
         }
         return Ok(Resolved {
             phonemes,
@@ -269,7 +280,10 @@ pub fn resolve(
         && let Some(english) = &dictionaries.english
     {
         let local_has = dictionaries.local.has_entry(lyrics);
-        let starts_uppercase = lyrics.as_bytes().first().is_some_and(u8::is_ascii_uppercase);
+        let starts_uppercase = lyrics
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_uppercase);
         if english.has_entry(lyrics) && (prefer_english || starts_uppercase || !local_has) {
             let phonemes = english.lookup(lyrics)?;
             let continuation = last_vowel_or_tail(&phonemes, english);
@@ -341,6 +355,12 @@ impl NoteResolver {
     }
 
     /// Resolves one note in sequence; state carries to the following note.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic on valid inputs; the internal `expect` only fires when
+    /// a prior `split_english_syllables` result is empty, which is
+    /// unreachable because that helper always returns at least one item.
     pub fn push(
         &mut self,
         lyrics: &str,
@@ -356,7 +376,13 @@ impl NoteResolver {
         } else if is_break {
             self.break_note(explicit, dictionaries, prefer_english)?
         } else {
-            resolve(lyrics, explicit, self.language, prefer_english, dictionaries)?
+            resolve(
+                lyrics,
+                explicit,
+                self.language,
+                prefer_english,
+                dictionaries,
+            )?
         };
 
         let automatic_english = resolved.language == Language::English
@@ -367,10 +393,14 @@ impl NoteResolver {
             self.word_language = resolved.language;
             self.pending_syllables.clear();
             self.next_syllable = 0;
-            if resolved.language == Language::English && !lyrics.is_empty() && !lyrics.starts_with('.') {
+            if resolved.language == Language::English
+                && !lyrics.is_empty()
+                && !lyrics.starts_with('.')
+            {
                 let mut word_phonemes = resolved.phonemes.clone();
                 if !explicit.is_empty()
-                    && let Ok(inferred) = resolve(lyrics, "", self.language, prefer_english, dictionaries)
+                    && let Ok(inferred) =
+                        resolve(lyrics, "", self.language, prefer_english, dictionaries)
                     && inferred.language == Language::English
                 {
                     word_phonemes = inferred.phonemes;
@@ -379,7 +409,8 @@ impl NoteResolver {
                 if syllables.len() > 1 {
                     self.pending_syllables = syllables[1..].to_vec();
                     if explicit.is_empty() {
-                        resolved.phonemes = syllables.into_iter().next().expect("split is nonempty");
+                        resolved.phonemes =
+                            syllables.into_iter().next().expect("split is nonempty");
                     }
                 }
             }
@@ -442,12 +473,12 @@ impl NoteResolver {
                     .rev()
                     .find(|symbol| is_english_vowel_phoneme(symbol))
                 {
-                    self.continuation = vowel.clone();
-                    resolved.continuation = vowel.clone();
+                    self.continuation.clone_from(vowel);
+                    resolved.continuation.clone_from(vowel);
                 }
             } else if let Some(last) = resolved.phonemes.last() {
-                self.continuation = last.clone();
-                resolved.continuation = last.clone();
+                self.continuation.clone_from(last);
+                resolved.continuation.clone_from(last);
             }
             return Ok(resolved);
         }
@@ -511,8 +542,8 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
             dict.as_bytes(),
             "phones.txt",
             "dict.txt",
-            "x-phones.txt".to_owned(),
-            "x-dict.txt".to_owned(),
+            "x-phones.txt",
+            "x-dict.txt",
         )
         .expect("synthetic dictionary parses")
     }
@@ -523,8 +554,8 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
             "hello hh ah l ow\ncats k ae t s\n".as_bytes(),
             "english-arpabet-phones.txt",
             "english-arpabet-dict.txt",
-            "english-arpabet-phones.txt".to_owned(),
-            "english-arpabet-dict.txt".to_owned(),
+            "english-arpabet-phones.txt",
+            "english-arpabet-dict.txt",
         )
         .expect("synthetic english dictionary parses")
     }
@@ -550,8 +581,8 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
     #[test]
     fn english_vowel_table() {
         for vowel in [
-            "aa", "ae", "ah", "ao", "aw", "ax", "ay", "eh", "er", "ey", "ih", "iy",
-            "ow", "oy", "uh", "uw",
+            "aa", "ae", "ah", "ao", "aw", "ax", "ay", "eh", "er", "ey", "ih", "iy", "ow", "oy",
+            "uh", "uw",
         ] {
             assert!(is_english_vowel_phoneme(vowel), "{vowel}");
         }
@@ -563,7 +594,12 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
     #[test]
     fn syllable_splitting_cases() {
         let words = |phones: &[&str]| {
-            split_english_syllables(&phones.iter().map(|phone| (*phone).to_owned()).collect::<Vec<_>>())
+            split_english_syllables(
+                &phones
+                    .iter()
+                    .map(|phone| (*phone).to_owned())
+                    .collect::<Vec<_>>(),
+            )
         };
         // Single nucleus stays whole.
         assert_eq!(words(&["hh", "ah", "l"]), vec![vec!["hh", "ah", "l"]]);
@@ -573,10 +609,7 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
             vec![vec!["hh", "ah"], vec!["l", "ow"]]
         );
         // Adjacent nuclei split between them.
-        assert_eq!(
-            words(&["ae", "ow"]),
-            vec![vec!["ae"], vec!["ow"]]
-        );
+        assert_eq!(words(&["ae", "ow"]), vec![vec!["ae"], vec!["ow"]]);
         // A cluster gives its last consonant onward.
         assert_eq!(
             words(&["s", "t", "r", "iy", "k", "ey"]),
@@ -645,7 +678,8 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
             local: english_dict(),
             english: None,
         };
-        let resolved = resolve("hello", "k ae t s", Language::English, false, &dictionaries).unwrap();
+        let resolved =
+            resolve("hello", "k ae t s", Language::English, false, &dictionaries).unwrap();
         assert_eq!(resolved.continuation, "ae");
         // No vowel at all: the tail carries the legato.
         let resolved = resolve("x", "k s", Language::English, false, &dictionaries).unwrap();
@@ -726,8 +760,13 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
     #[test]
     fn loader_reports_missing_files_like_read_file_stamp() {
         let dir = temp_dir_for_tests("resolve-missing");
-        let error = load_dictionaries(&dir, Language::English).unwrap_err().to_string();
-        assert!(error.starts_with("Cannot read synthesis resource: "), "{error}");
+        let error = load_dictionaries(&dir, Language::English)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("Cannot read synthesis resource: "),
+            "{error}"
+        );
         assert!(error.ends_with("english-arpabet-phones.txt"), "{error}");
     }
 
@@ -735,7 +774,11 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
     fn loader_prefers_cmudict_for_english() {
         let dir = temp_dir_for_tests("resolve-cmu");
         std::fs::write(dir.join("english-arpabet-phones.txt"), PHONES).unwrap();
-        std::fs::write(dir.join("english-arpabet-dict.txt"), "fallbackonly f ao l ow\n").unwrap();
+        std::fs::write(
+            dir.join("english-arpabet-dict.txt"),
+            "fallbackonly f ao l ow\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("cmudict-07b.txt"), "cmuonly k ey m y uw\n").unwrap();
         let dictionaries = load_dictionaries(&dir, Language::English).unwrap();
         assert!(dictionaries.local.has_entry("cmuonly"));
@@ -746,7 +789,11 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
     fn loader_falls_back_to_the_plain_english_dict() {
         let dir = temp_dir_for_tests("resolve-plain");
         std::fs::write(dir.join("english-arpabet-phones.txt"), PHONES).unwrap();
-        std::fs::write(dir.join("english-arpabet-dict.txt"), "fallbackonly f ao l ow\n").unwrap();
+        std::fs::write(
+            dir.join("english-arpabet-dict.txt"),
+            "fallbackonly f ao l ow\n",
+        )
+        .unwrap();
         let dictionaries = load_dictionaries(&dir, Language::English).unwrap();
         assert!(dictionaries.local.has_entry("fallbackonly"));
     }
@@ -756,7 +803,9 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
         let dir = temp_dir_for_tests("resolve-jp-partial");
         std::fs::write(dir.join("japanese-romaji-phones.txt"), ROMAJI_PHONES).unwrap();
         std::fs::write(dir.join("japanese-romaji-dict.txt"), "ka k a\n").unwrap();
-        let error = load_dictionaries(&dir, Language::Japanese).unwrap_err().to_string();
+        let error = load_dictionaries(&dir, Language::Japanese)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("japanese-hira2romaji-dict.txt"), "{error}");
     }
 

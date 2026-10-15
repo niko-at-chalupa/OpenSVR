@@ -365,12 +365,12 @@ fn print_phonemes(
     for (index, note) in notes.iter().enumerate() {
         let next_is_legato = notes.get(index + 1).is_some_and(|next| next.lyrics == "-");
         match resolver.push(&note.lyrics, &note.phonemes, &set, next_is_legato) {
-            Ok(resolved) => writeln!(
+            Ok(outcome) => writeln!(
                 out,
                 "        {:?} -> {} ({})",
                 note.lyrics,
-                resolved.phonemes.join(" "),
-                resolved.language
+                outcome.phonemes.join(" "),
+                outcome.language
             )?,
             Err(error) => writeln!(out, "        {:?} -> [ERROR] {error}", note.lyrics)?,
         }

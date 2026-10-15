@@ -53,8 +53,8 @@ fn real_model_entries_parse() {
             continue;
         }
         let bytes = db.read_entry(entry).expect("model entry must read");
-        let model = DnniReader::from_bytes(bytes.to_vec())
-            .expect("model entry {entry:?} must parse");
+        let model =
+            DnniReader::from_bytes(bytes.to_vec()).expect("model entry {entry:?} must parse");
         assert!(!model.nodes().is_empty());
         println!(
             "model size {} version {} nodes {} root {}",
@@ -65,7 +65,10 @@ fn real_model_entries_parse() {
         );
         models += 1;
     }
-    assert!(models >= 4, "expected at least 4 model entries, saw {models}");
+    assert!(
+        models >= 4,
+        "expected at least 4 model entries, saw {models}"
+    );
 }
 
 #[test]

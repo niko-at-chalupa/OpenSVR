@@ -599,8 +599,7 @@ mod tests {
                 start: phrase.notes[0].start,
                 samples: vec![
                     1.0;
-                    ((end - phrase.notes[0].start) * f64::from(rate)).round()
-                        as usize
+                    ((end - phrase.notes[0].start) * f64::from(rate)).round() as usize
                 ],
                 sample_rate: rate,
             })

@@ -182,7 +182,10 @@ fn find_changed_output_ranges(
             continue;
         }
         let range = expand_range(
-            FrameRange { first: frame, end: frame + 1 },
+            FrameRange {
+                first: frame,
+                end: frame + 1,
+            },
             radius,
             current.frames,
         );
@@ -404,6 +407,15 @@ impl DnniInference {
     ///
     /// The plain [`run`](Self::run) delegates here with no cache, so the two
     /// paths share validation and cancel checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics only on an internal invariant violation (a cache that reported
+    /// output but reads back disarmed); all fallible conditions return
+    /// [`DnniError`] instead.
+    // Cache orchestration mirrors the C++ dirty-range flow; keep the
+    // snapshot protocol in one reviewable pass.
+    #[allow(clippy::too_many_lines)]
     pub fn run_with_cache(
         &self,
         input: &Tensor,
@@ -433,10 +445,7 @@ impl DnniInference {
         // Cache-gating mirrors C++ lines 718–719:
         // canCache ⟺ cache armed ∧ finite radius ∧ (no condition OR
         // condition frames match input frames).
-        let radius = match self.context_radius {
-            Some(radius) => radius,
-            None => 0,
-        };
+        let radius = self.context_radius.unwrap_or_default();
         let can_cache = cache.is_some()
             && self.context_radius.is_some()
             && condition.is_none_or(|tensor| tensor.frames == input.frames);
@@ -450,11 +459,17 @@ impl DnniInference {
 
         let mut output_ranges: Vec<FrameRange> = Vec::new();
         if has_cached_output {
-            let cache_ref = cache.as_deref().expect("has_cached_output implies armed cache");
+            let cache_ref = cache
+                .as_deref()
+                .expect("has_cached_output implies armed cache");
             output_ranges = find_changed_output_ranges(
                 &cache_ref.input,
                 input,
-                if cache_ref.has_condition { Some(&cache_ref.condition) } else { None },
+                if cache_ref.has_condition {
+                    Some(&cache_ref.condition)
+                } else {
+                    None
+                },
                 condition,
                 radius,
             );
@@ -474,7 +489,9 @@ impl DnniInference {
         let mut context_frames = 0_usize;
 
         if has_cached_output {
-            let cache_ref = cache.as_deref().expect("has_cached_output implies armed cache");
+            let cache_ref = cache
+                .as_deref()
+                .expect("has_cached_output implies armed cache");
             replacement = cache_ref.output.clone();
             let mut updated_frames = 0_usize;
             let mut first_range = 0_usize;
@@ -500,10 +517,8 @@ impl DnniInference {
                     local
                 } else {
                     let local_input = slice_frames(input, window.first, window.end);
-                    let local_condition = match condition {
-                        Some(condition) => Some(slice_frames(condition, window.first, window.end)),
-                        None => None,
-                    };
+                    let local_condition = condition
+                        .map(|condition| slice_frames(condition, window.first, window.end));
                     let mut local = Tensor::default();
                     run_layer(
                         root,
@@ -523,8 +538,7 @@ impl DnniInference {
                 }
                 // Paste only the changed centre ranges; halos are computed
                 // but not written back.
-                for index in first_range..end_range {
-                    let range = output_ranges[index];
+                for range in &output_ranges[first_range..end_range] {
                     let source_start = (range.first - window.first) * local_output.channels;
                     let destination_start = range.first * replacement.channels;
                     let span = (range.end - range.first) * replacement.channels;
@@ -548,14 +562,15 @@ impl DnniInference {
         // Snapshot the run iff it is cacheable and within the byte cap.
         if let Some(cache) = cache {
             let condition_elements = condition.map_or(0, |tensor| tensor.values.len());
-            let snapshot_elements = input.values.len() + condition_elements + replacement.values.len();
+            let snapshot_elements =
+                input.values.len() + condition_elements + replacement.values.len();
             if can_cache
                 && replacement.frames == input.frames
                 && snapshot_elements <= MAXIMUM_CACHE_BYTES / size_of::<f32>()
             {
                 let updated = DnniCache {
                     input: input.clone(),
-                    condition: condition.map_or(Tensor::default(), |t| t.clone()),
+                    condition: condition.map_or_else(Tensor::default, Tensor::clone),
                     output: replacement.clone(),
                     model_identity: self.model_identity,
                     has_condition: condition.is_some(),
@@ -664,7 +679,7 @@ pub fn multiply_matrix(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) 
         // on AVX2, paired SSE ops otherwise) without changing the per-element
         // column order. `VECTORS_PER_BLOCK` documents the C++ `WeightBlock`
         // correspondence: lanes `[4k, 4k+4)` are the k-th SIMD register.
-        debug_assert!(BLOCK == 4 * VECTORS_PER_BLOCK);
+        debug_assert_eq!(BLOCK, 4 * VECTORS_PER_BLOCK);
         let mut acc = [0.0_f32; BLOCK];
         // Bounds checks are hoisted to one per block; the column loop runs
         // over iterators with no per-lane checks, which is what lets LLVM
@@ -693,10 +708,11 @@ fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32
     for block in 0..block_count {
         let first_channel = block * BLOCK;
         let row_count = (matrix.rows - first_channel).min(BLOCK);
+        let block_weights = &matrix.values[block * matrix.columns..][..matrix.columns];
         for row in 0..row_count {
             let mut sum = 0.0_f32;
-            for column in 0..matrix.columns {
-                sum += matrix.values[block * matrix.columns + column][row] * input[column];
+            for (weights, input) in block_weights.iter().zip(input.iter()) {
+                sum += weights[row] * input;
             }
             output[first_channel + row] = sum;
         }
@@ -708,26 +724,17 @@ fn load_matrix(
     node_index: usize,
     parameter_count: &mut usize,
 ) -> Result<DenseMatrix, DnniError> {
-    let offset = reader
-        .nodes()
-        .get(node_index)
-        .map_or(0, |node| node.offset);
-    let decoded = match reader.read_float_matrix(node_index) {
-        Ok(matrix) => matrix,
-        Err(error) => return Err(error),
-    };
+    let offset = reader.nodes().get(node_index).map_or(0, |node| node.offset);
+    let decoded = reader.read_float_matrix(node_index)?;
     let rows = decoded.rows as usize;
     let columns = decoded.columns as usize;
-    if rows == 0
-        || !valid_shape(rows, columns)
-        || decoded.values.len() != rows * columns
-    {
+    if rows == 0 || !valid_shape(rows, columns) || decoded.values.len() != rows * columns {
         return Err(node_error(offset, "invalid matrix shape."));
     }
     // C++ `loadMatrix`: transpose row-major → per-column [f32; BLOCK] blocks,
     // zero-padded on the tail. The padded element count (blockCount * columns)
     // is what the C++ loader accounts against `maximumElements`.
-    let block_count = (rows + BLOCK - 1) / BLOCK;
+    let block_count = rows.div_ceil(BLOCK);
     let padded_rows = block_count * BLOCK;
     if columns > (MAXIMUM_ELEMENTS - *parameter_count) / padded_rows {
         return Err(node_error(
@@ -741,8 +748,8 @@ fn load_matrix(
         let row_count = (rows - first_row).min(BLOCK);
         for column in 0..columns {
             let slot = &mut values[block * columns + column];
-            for row in 0..row_count {
-                slot[row] = decoded.values[(first_row + row) * columns + column];
+            for (row, lane) in slot.iter_mut().enumerate().take(row_count) {
+                *lane = decoded.values[(first_row + row) * columns + column];
             }
         }
     }
@@ -839,9 +846,10 @@ fn load_layer(
         }
         // Each stage stores the gate, its skip projection, and the input's
         // residual projection.
-        layer
-            .children
-            .resize_with(layer.stage_count * 3 + usize::from(condition_channels > 0), Layer::default);
+        layer.children.resize_with(
+            layer.stage_count * 3 + usize::from(condition_channels > 0),
+            Layer::default,
+        );
         for stage in 0..layer.stage_count {
             let stage_input = if stage == 0 {
                 layer.input_channels
@@ -851,7 +859,10 @@ fn load_layer(
             for group in 0..3 {
                 let child_index = nodes[node.children[group]].children[stage];
                 let expected = if group == 0 { "_gnc1v0" } else { "modl1" };
-                if nodes.get(child_index).is_none_or(|child| child.name != expected) {
+                if nodes
+                    .get(child_index)
+                    .is_none_or(|child| child.name != expected)
+                {
                     return Err(node_error(
                         node.offset,
                         "residual convolution contains an unsupported stage operator.",
@@ -878,18 +889,14 @@ fn load_layer(
                         }
                     }
                 } else {
-                    let dimensions_match = child
-                        .matrices
-                        .first()
-                        .is_some_and(|matrix| {
-                            let expected_input = if group == 1 {
-                                layer.gate_channels
-                            } else {
-                                stage_input
-                            };
-                            matrix.columns == expected_input
-                                && matrix.rows == layer.gate_channels
-                        });
+                    let dimensions_match = child.matrices.first().is_some_and(|matrix| {
+                        let expected_input = if group == 1 {
+                            layer.gate_channels
+                        } else {
+                            stage_input
+                        };
+                        matrix.columns == expected_input && matrix.rows == layer.gate_channels
+                    });
                     if !dimensions_match || !preserves_frames(child) {
                         return Err(node_error(
                             nodes[child_index].offset,
@@ -913,12 +920,9 @@ fn load_layer(
             let projection = layer.children.last_mut().expect("condition slot");
             load_layer(reader, child_index, projection, parameter_count)?;
             let dimensions_match = projection.matrices.first().is_some_and(|matrix| {
-                matrix.columns == layer.condition_channels
-                    && matrix.rows == layer.gate_channels
+                matrix.columns == layer.condition_channels && matrix.rows == layer.gate_channels
             });
-            if !dimensions_match
-                || projection.matrices.len() != 1
-                || !preserves_frames(projection)
+            if !dimensions_match || projection.matrices.len() != 1 || !preserves_frames(projection)
             {
                 return Err(node_error(
                     nodes[child_index].offset,
@@ -1032,8 +1036,7 @@ fn load_layer(
                 "bidirectional GRU directions have incompatible input channels or excessive output channels.",
             ));
         }
-        layer.gate_channels =
-            layer.children[0].gate_channels + layer.children[1].gate_channels;
+        layer.gate_channels = layer.children[0].gate_channels + layer.children[1].gate_channels;
         return Ok(());
     }
 
@@ -1049,11 +1052,12 @@ fn load_layer(
         for projection in 0..6 {
             let matrix_index = node.children[2 * projection];
             let bias_index = node.children[2 * projection + 1];
-            let valid_pair = nodes.get(matrix_index).is_some_and(|matrix_node| {
-                matrix_node.children.is_empty()
-            }) && nodes.get(bias_index).is_some_and(|bias_node| {
-                bias_node.children.is_empty() && bias_node.name == "prim1"
-            });
+            let valid_pair = nodes
+                .get(matrix_index)
+                .is_some_and(|matrix_node| matrix_node.children.is_empty())
+                && nodes.get(bias_index).is_some_and(|bias_node| {
+                    bias_node.children.is_empty() && bias_node.name == "prim1"
+                });
             if !valid_pair {
                 return Err(node_error(
                     node.offset,
@@ -1077,12 +1081,8 @@ fn load_layer(
                 ));
             }
             layer.matrices.push(matrix);
-            let bias = match reader.read_float_vector(bias_index) {
-                Ok(bias) => bias,
-                Err(error) => return Err(error),
-            };
-            if bias.len() != layer.gate_channels
-                || bias.len() > MAXIMUM_ELEMENTS - *parameter_count
+            let bias = reader.read_float_vector(bias_index)?;
+            if bias.len() != layer.gate_channels || bias.len() > MAXIMUM_ELEMENTS - *parameter_count
             {
                 return Err(node_error(
                     nodes[bias_index].offset,
@@ -1128,9 +1128,7 @@ fn load_layer(
             layer.stride = stride as usize;
             layer.padding = padding as usize;
             layer.dilation = dilation as usize;
-            if node.children.len() < kernel_count
-                || node.children.len() > kernel_count + 1
-            {
+            if node.children.len() < kernel_count || node.children.len() > kernel_count + 1 {
                 return Err(node_error(
                     node.offset,
                     "Conv1D child count does not match its kernel count and optional bias.",
@@ -1156,9 +1154,9 @@ fn load_layer(
                         "unexpected or duplicate bias vector.",
                     ));
                 }
-                match reader.read_float_vector(child_index) {
-                    Ok(bias) => layer.bias = bias,
-                    Err(error) => return Err(error),
+                {
+                    let bias = reader.read_float_vector(child_index)?;
+                    layer.bias = bias;
                 }
                 has_bias = true;
                 if layer.bias.len() > MAXIMUM_ELEMENTS - *parameter_count {
@@ -1237,16 +1235,10 @@ fn load_layer(
         }
         layer.alpha = f32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         if !layer.alpha.is_finite() {
-            return Err(node_error(
-                node.offset,
-                "activation alpha must be finite.",
-            ));
+            return Err(node_error(node.offset, "activation alpha must be finite."));
         }
     } else if !payload.is_empty() {
-        return Err(node_error(
-            node.offset,
-            "activation payload must be empty.",
-        ));
+        return Err(node_error(node.offset, "activation payload must be empty."));
     }
     Ok(())
 }
@@ -1328,9 +1320,7 @@ fn run_gru(
     reverse: bool,
     cancel: &CancelToken,
 ) -> Result<(), DnniError> {
-    if input.channels != layer.input_channels
-        || !valid_shape(input.frames, layer.gate_channels)
-    {
+    if input.channels != layer.input_channels || !valid_shape(input.frames, layer.gate_channels) {
         return Err(node_error(
             layer.source_offset,
             "GRU input channels do not match the model or output exceeds the memory limit.",
@@ -1373,8 +1363,8 @@ fn run_gru(
                 + layer.bias[4 * hidden_channels + channel]
                 + projections[hidden_channels + channel]
                 + projections[4 * hidden_channels + channel];
-            let candidate_recurrent =
-                layer.bias[5 * hidden_channels + channel] + projections[5 * hidden_channels + channel];
+            let candidate_recurrent = layer.bias[5 * hidden_channels + channel]
+                + projections[5 * hidden_channels + channel];
             let candidate_input = sigmoid(reset_input) * candidate_recurrent
                 + projections[2 * hidden_channels + channel]
                 + layer.bias[2 * hidden_channels + channel];
@@ -1386,8 +1376,7 @@ fn run_gru(
                 ));
             }
             let update = sigmoid(update_input);
-            hidden[channel] =
-                update * hidden[channel] + (1.0 - update) * candidate_input.tanh();
+            hidden[channel] = update * hidden[channel] + (1.0 - update) * candidate_input.tanh();
         }
         output.values[frame * hidden_channels..(frame + 1) * hidden_channels]
             .copy_from_slice(&hidden);
@@ -1395,6 +1384,9 @@ fn run_gru(
     Ok(())
 }
 
+// Layer dispatch mirrors the C++ operator switch; one branch per operator,
+// kept whole so summation order stays auditable in a single pass.
+#[allow(clippy::too_many_lines)]
 fn run_layer(
     layer: &Layer,
     input: &Tensor,
@@ -1489,11 +1481,29 @@ fn run_layer(
         let mut current = input.clone();
         for stage in 0..layer.stage_count {
             let mut residual = Tensor::default();
-            run_layer(&layer.children[stage * 3 + 2], &current, &mut residual, None, cancel)?;
+            run_layer(
+                &layer.children[stage * 3 + 2],
+                &current,
+                &mut residual,
+                None,
+                cancel,
+            )?;
             let mut gated = Tensor::default();
-            run_layer(&layer.children[stage * 3], &current, &mut gated, condition, cancel)?;
+            run_layer(
+                &layer.children[stage * 3],
+                &current,
+                &mut gated,
+                condition,
+                cancel,
+            )?;
             let mut skip = Tensor::default();
-            run_layer(&layer.children[stage * 3 + 1], &gated, &mut skip, None, cancel)?;
+            run_layer(
+                &layer.children[stage * 3 + 1],
+                &gated,
+                &mut skip,
+                None,
+                cancel,
+            )?;
             if residual.frames != output.frames
                 || gated.frames != output.frames
                 || skip.frames != output.frames
@@ -1557,8 +1567,7 @@ fn run_layer(
                 None,
                 cancel,
             )?;
-            if projected.frames != gate_input.frames || projected.channels != gate_input.channels
-            {
+            if projected.frames != gate_input.frames || projected.channels != gate_input.channels {
                 return Err(node_error(
                     layer.source_offset,
                     "input and condition convolutions must produce matching frames and channels.",
@@ -1601,8 +1610,7 @@ fn run_layer(
         if layer.operation == Operation::Convolution {
             // Parameters are int32 and tensor dimensions are bounded, so these
             // fit u64.
-            let receptive_field =
-                (layer.matrices.len() as u64 - 1) * layer.dilation as u64 + 1;
+            let receptive_field = (layer.matrices.len() as u64 - 1) * layer.dilation as u64 + 1;
             let padded_frames = input.frames as u64 + 2 * layer.padding as u64;
             output.frames = if padded_frames < receptive_field {
                 0
@@ -1628,7 +1636,11 @@ fn run_layer(
             // per tap is accumulated and added back in order, mirroring the C++
             // 2-frame unrolling (which keeps independent accumulators per frame).
             for (kernel, matrix) in layer.matrices.iter().enumerate() {
-                let tap = frame as i64 * layer.stride as i64 + kernel as i64 * layer.dilation as i64
+                // Tensor dimensions are bounded by the memory limit, so the
+                // signed tap arithmetic cannot wrap; the sign carries padding.
+                #[allow(clippy::cast_possible_wrap)]
+                let tap = frame as i64 * layer.stride as i64
+                    + kernel as i64 * layer.dilation as i64
                     - layer.padding as i64;
                 if tap < 0 || tap as usize >= input.frames {
                     // Out-of-range taps contribute zero (padding), never
@@ -1645,8 +1657,7 @@ fn run_layer(
             }
             if !layer.bias.is_empty() {
                 for channel_out in 0..output.channels {
-                    output.values[frame * output.channels + channel_out] +=
-                        layer.bias[channel_out];
+                    output.values[frame * output.channels + channel_out] += layer.bias[channel_out];
                 }
             }
         }
@@ -1669,13 +1680,11 @@ fn run_layer(
                 Operation::LeakyRelu => {
                     *value *= if *value > 0.0 { 1.0 } else { layer.alpha };
                 }
-                Operation::Elu => {
+                Operation::Elu if layer.alpha < 0.0 || *value < 0.0 => {
                     // Preserve the reference formula for every finite alpha,
                     // including negative values. A non-negative alpha leaves
                     // positive inputs unchanged without evaluating exp(x).
-                    if layer.alpha < 0.0 || *value < 0.0 {
-                        *value = value.max(0.0) + (layer.alpha * value.exp_m1()).min(0.0);
-                    }
+                    *value = value.max(0.0) + (layer.alpha * value.exp_m1()).min(0.0);
                 }
                 _ => {}
             }
@@ -1806,6 +1815,9 @@ mod tests {
         node_bytes("modl0", &[], &children)
     }
 
+    // Test fixture mirroring the 4-int32 modl1 payload plus taps, channels
+    // and an optional bias.
+    #[allow(clippy::too_many_arguments)]
     fn conv_model(
         kernel: i32,
         stride: i32,
@@ -1879,7 +1891,7 @@ mod tests {
         frames: usize,
         channels: usize,
         values: &[f32],
-        condition: Option<Tensor>,
+        condition: Option<&Tensor>,
     ) -> Tensor {
         let input = Tensor {
             frames,
@@ -1888,13 +1900,17 @@ mod tests {
         };
         let mut output = Tensor::default();
         engine
-            .run(&input, &mut output, condition.as_ref(), &test_token())
+            .run(&input, &mut output, condition, &test_token())
             .expect("run must succeed");
         output
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
-        assert_eq!(actual.len(), expected.len(), "length mismatch: {actual:?} vs {expected:?}");
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "length mismatch: {actual:?} vs {expected:?}"
+        );
         for (index, (got, want)) in actual.iter().zip(expected).enumerate() {
             let allowed = tolerance * want.abs().max(1.0);
             assert!(
@@ -1919,11 +1935,9 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
-        assert_eq!(
-            error.to_string(),
-            "No DNNI inference model has been loaded."
-        );
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "No DNNI inference model has been loaded.");
         assert!(output.values.is_empty());
     }
 
@@ -1932,10 +1946,7 @@ mod tests {
         let reader = load_reader(&leaf("moda5", &[]));
         let mut engine = DnniInference::new();
         let error = engine.load(&reader, 7).unwrap_err().to_string();
-        assert_eq!(
-            error.to_string(),
-            "DNNI inference root or child node is out of range."
-        );
+        assert_eq!(error, "DNNI inference root or child node is out of range.");
         assert!(!engine.is_loaded());
     }
 
@@ -1955,9 +1966,10 @@ mod tests {
             };
             let error = engine
                 .run(&input, &mut output, None, &test_token())
-                .unwrap_err().to_string();
+                .unwrap_err()
+                .to_string();
             assert_eq!(
-                error.to_string(),
+                error,
                 "DNNI input must contain finite frame-major values with valid dimensions within 64 Mi elements."
             );
             // Output is left untouched on failure.
@@ -1983,9 +1995,10 @@ mod tests {
             let mut output = Tensor::default();
             let error = engine
                 .run(&input, &mut output, None, &test_token())
-                .unwrap_err().to_string();
+                .unwrap_err()
+                .to_string();
             assert_eq!(
-                error.to_string(),
+                error,
                 "DNNI input must contain finite frame-major values with valid dimensions within 64 Mi elements."
             );
         }
@@ -2007,9 +2020,10 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, Some(&condition), &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert_eq!(
-            error.to_string(),
+            error,
             "DNNI condition must contain finite frame-major values with valid dimensions within 64 Mi elements."
         );
     }
@@ -2025,7 +2039,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &cancelled_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert_eq!(error, "DNNI inference cancelled.");
         assert!(output.values.is_empty());
     }
@@ -2090,7 +2105,11 @@ mod tests {
             load_error(&root),
             "DNNI inference at 0x8: dense requires an empty payload, one matrix and an optional bias."
         );
-        let root = node_bytes("modl0", &[0], &[leaf("prim0", &dense_payload(1, 1, &[1.0]))]);
+        let root = node_bytes(
+            "modl0",
+            &[0],
+            &[leaf("prim0", &dense_payload(1, 1, &[1.0]))],
+        );
         assert_eq!(
             load_error(&root),
             "DNNI inference at 0x8: dense requires an empty payload, one matrix and an optional bias."
@@ -2125,7 +2144,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with("input channels do not match the matrix columns."),
             "unexpected: {error}"
@@ -2144,7 +2164,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with("operator produced a non-finite output."),
             "unexpected: {error}"
@@ -2167,7 +2188,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with("output tensor exceeds the memory limit."),
             "unexpected: {error}"
@@ -2204,16 +2226,7 @@ mod tests {
 
     #[test]
     fn conv_receptive_field_larger_than_input_yields_no_frames() {
-        let root = conv_model(
-            3,
-            1,
-            0,
-            1,
-            &[vec![1.0], vec![1.0], vec![1.0]],
-            1,
-            1,
-            None,
-        );
+        let root = conv_model(3, 1, 0, 1, &[vec![1.0], vec![1.0], vec![1.0]], 1, 1, None);
         let engine = load_engine(&root);
         let output = run_ok(&engine, 2, 1, &[5.0, 6.0]);
         assert_eq!(output.frames, 0);
@@ -2236,12 +2249,7 @@ mod tests {
 
     #[test]
     fn conv_bad_parameters_fail() {
-        for parameters in [
-            [0_i32, 1, 0, 1],
-            [1, 0, 0, 1],
-            [1, 1, -1, 1],
-            [1, 1, 0, 0],
-        ] {
+        for parameters in [[0_i32, 1, 0, 1], [1, 0, 0, 1], [1, 1, -1, 1], [1, 1, 0, 0]] {
             let mut payload = Vec::new();
             for parameter in parameters {
                 payload.extend_from_slice(&parameter.to_le_bytes());
@@ -2339,10 +2347,7 @@ mod tests {
         let reader = load_reader(&leaf("moda5", &[]));
         let mut engine = DnniInference::new();
         let error = engine.load(&reader, 99).unwrap_err().to_string();
-        assert_eq!(
-            error.to_string(),
-            "DNNI inference root or child node is out of range."
-        );
+        assert_eq!(error, "DNNI inference root or child node is out of range.");
     }
 
     #[test]
@@ -2412,14 +2417,15 @@ mod tests {
 
     #[test]
     fn activations_apply_elementwise() {
-        let cases: &[(&str, Option<f32>, &[f32], &[f32])] = &[
+        type ActivationCase<'a> = (&'a str, Option<f32>, &'a [f32], &'a [f32]);
+        let cases: &[ActivationCase<'_>] = &[
             ("moda0", None, &[-2.0, 0.0, 3.0], &[0.0, 0.0, 3.0]),
             ("moda1", None, &[0.0, 10.0], &[0.0, 1.0]),
             ("moda2", None, &[0.0], &[0.5]),
             ("moda5", None, &[-1.5, 2.5], &[-1.5, 2.5]),
             ("moda3", Some(0.1), &[-2.0, 3.0], &[-0.2, 3.0]),
-            ("moda4", Some(1.0), &[-1.0, 2.0], &[-0.63212055, 2.0]),
-            ("moda7", None, &[0.0, 2.0], &[0.0, 1.7615942]),
+            ("moda4", Some(1.0), &[-1.0, 2.0], &[-0.632_120_55, 2.0]),
+            ("moda7", None, &[0.0, 2.0], &[0.0, 1.761_594_2]),
         ];
         for (name, alpha, input, expected) in cases {
             let payload = alpha.map_or(Vec::new(), alpha_payload);
@@ -2435,7 +2441,11 @@ mod tests {
         let engine = load_engine(&leaf("moda2", &[]));
         let output = run_ok(&engine, 2, 1, &[-100.0, 100.0]);
         assert!(output.values[0] < 1e-30, "got {}", output.values[0]);
-        assert!((output.values[1] - 1.0).abs() < 1e-6, "got {}", output.values[1]);
+        assert!(
+            (output.values[1] - 1.0).abs() < 1e-6,
+            "got {}",
+            output.values[1]
+        );
     }
 
     #[test]
@@ -2479,7 +2489,7 @@ mod tests {
         let mut engine = DnniInference::new();
         let error = engine.load(&reader, 0).unwrap_err().to_string();
         assert_eq!(
-            error.to_string(),
+            error,
             "DNNI inference at 0x8: unsupported operator 0x123456789abcdef0."
         );
     }
@@ -2531,7 +2541,7 @@ mod tests {
         let engine = load_engine(&root);
         assert_eq!(engine.context_radius(), Some(0));
         let output = run_ok(&engine, 1, 2, &[2.0, 3.0]);
-        assert_close(&output.values, &[0.91830772], 1e-5);
+        assert_close(&output.values, &[0.918_307_7], 1e-5);
     }
 
     #[test]
@@ -2545,7 +2555,7 @@ mod tests {
             channels: 1,
             values: vec![1.0],
         };
-        let output = run_cond_ok(&engine, 1, 1, &[1.0], Some(condition));
+        let output = run_cond_ok(&engine, 1, 1, &[1.0], Some(&condition));
         assert_close(&output.values, &[1.0], 1e-5);
     }
 
@@ -2576,7 +2586,11 @@ mod tests {
             load_error(&root),
             "DNNI inference at 0x8: gated Conv1D v0 requires an input convolution and an optional condition convolution."
         );
-        let root = node_bytes("_gnc1v0", &dims3(1, 1, 0), &[leaf("moda5", &[]), conv.clone()]);
+        let root = node_bytes(
+            "_gnc1v0",
+            &dims3(1, 1, 0),
+            &[leaf("moda5", &[]), conv.clone()],
+        );
         let error = load_error(&root);
         assert!(
             error.ends_with("gated Conv1D v0 requires an input convolution and an optional condition convolution.")
@@ -2592,11 +2606,7 @@ mod tests {
 
     #[test]
     fn gated_conv_children_must_be_conv() {
-        let root = node_bytes(
-            "_gnc1v0",
-            &dims3(1, 1, 0),
-            &[leaf("moda0", &[])],
-        );
+        let root = node_bytes("_gnc1v0", &dims3(1, 1, 0), &[leaf("moda0", &[])]);
         assert_eq!(
             load_error(&root),
             "DNNI inference at 0x8: gated Conv1D v0 children must be Conv1D operators."
@@ -2610,7 +2620,9 @@ mod tests {
         let root = node_bytes("_gnc1v0", &dims3(1, 1, 0), &[conv]);
         let error = load_error(&root);
         assert!(
-            error.ends_with("gated convolution matrices do not match the declared channel dimensions."),
+            error.ends_with(
+                "gated convolution matrices do not match the declared channel dimensions."
+            ),
             "unexpected: {error}"
         );
     }
@@ -2647,7 +2659,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with("gated Conv1D input channels do not match the declared input."),
             "unexpected: {error}"
@@ -2668,7 +2681,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with(
                 "gated Conv1D requires a condition tensor with the declared channel count."
@@ -2682,7 +2696,8 @@ mod tests {
         };
         let error = engine
             .run(&input, &mut output, Some(&wrong), &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with(
                 "gated Conv1D requires a condition tensor with the declared channel count."
@@ -2711,7 +2726,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, Some(&condition), &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with(
                 "input and condition convolutions must produce matching frames and channels."
@@ -2766,9 +2782,7 @@ mod tests {
         let root = node_bytes("_ncwnv0", &dims3(1, 1, 0), &groups);
         let error = load_error(&root);
         assert!(
-            error.ends_with(
-                "residual convolution requires empty-payload cmpg1 parameter groups."
-            ),
+            error.ends_with("residual convolution requires empty-payload cmpg1 parameter groups."),
             "unexpected: {error}"
         );
     }
@@ -2941,11 +2955,10 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
-            error.ends_with(
-                "residual convolution input channel count does not match the network."
-            ),
+            error.ends_with("residual convolution input channel count does not match the network."),
             "unexpected: {error}"
         );
     }
@@ -2953,8 +2966,8 @@ mod tests {
     #[test]
     fn residual_run_needs_matching_condition() {
         let gate_conv = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
-        let gate_cond = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
-        let gate = node_bytes("_gnc1v0", &dims3(1, 1, 1), &[gate_conv, gate_cond]);
+        let cond_conv = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
+        let gate = node_bytes("_gnc1v0", &dims3(1, 1, 1), &[gate_conv, cond_conv]);
         let skip = conv_model(1, 1, 0, 1, &[vec![1.0]], 1, 1, None);
         let residual = conv_model(1, 1, 0, 1, &[vec![1.0]], 1, 1, None);
         let projection = conv_model(1, 1, 0, 1, &[vec![1.0]], 1, 1, None);
@@ -2974,7 +2987,8 @@ mod tests {
         // Missing condition.
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with(
                 "residual convolution requires a condition tensor with matching frames and declared channels."
@@ -2989,7 +3003,8 @@ mod tests {
         };
         let error = engine
             .run(&input, &mut output, Some(&wrong), &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with(
                 "residual convolution requires a condition tensor with matching frames and declared channels."
@@ -3001,8 +3016,8 @@ mod tests {
     #[test]
     fn residual_run_with_condition_accumulates_projection() {
         let gate_conv = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
-        let gate_cond = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
-        let gate = node_bytes("_gnc1v0", &dims3(1, 1, 1), &[gate_conv, gate_cond]);
+        let cond_conv = conv_model(1, 1, 0, 1, &[vec![0.0, 0.0]], 2, 1, None);
+        let gate = node_bytes("_gnc1v0", &dims3(1, 1, 1), &[gate_conv, cond_conv]);
         let skip = conv_model(1, 1, 0, 1, &[vec![1.0]], 1, 1, None);
         let residual = conv_model(1, 1, 0, 1, &[vec![0.0]], 1, 1, None);
         // Condition projection gain 5: output starts at [5], gate is zero so
@@ -3020,7 +3035,7 @@ mod tests {
             channels: 1,
             values: vec![1.0],
         };
-        let output = run_cond_ok(&engine, 1, 1, &[7.0], Some(condition));
+        let output = run_cond_ok(&engine, 1, 1, &[7.0], Some(&condition));
         assert_eq!(output.values, vec![5.0]);
     }
 
@@ -3032,7 +3047,7 @@ mod tests {
         let engine = load_engine(&gru_model(&[1.0, 1.0, 1.0, 0.5, 0.5, 0.5]));
         assert_eq!(engine.context_radius(), None);
         let output = run_ok(&engine, 2, 1, &[1.0, 0.0]);
-        assert_close(&output.values, &[0.20482419, 0.13316301], 1e-5);
+        assert_close(&output.values, &[0.204_824_2, 0.133_163], 1e-5);
     }
 
     #[test]
@@ -3097,7 +3112,8 @@ mod tests {
         let root = node_bytes("modl3", &[], &children);
         let error = load_error(&root);
         assert!(
-            error.ends_with("GRU bias dimensions are invalid or exceed the parameter memory limit."),
+            error
+                .ends_with("GRU bias dimensions are invalid or exceed the parameter memory limit."),
             "unexpected: {error}"
         );
     }
@@ -3113,7 +3129,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with(
                 "GRU input channels do not match the model or output exceeds the memory limit."
@@ -3134,7 +3151,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with("GRU projection produced a non-finite value."),
             "unexpected: {error}"
@@ -3159,7 +3177,8 @@ mod tests {
         let mut output = Tensor::default();
         let error = engine
             .run(&input, &mut output, None, &test_token())
-            .unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
             error.ends_with("GRU gate produced a non-finite value."),
             "unexpected: {error}"
@@ -3205,11 +3224,7 @@ mod tests {
             load_error(&root),
             "DNNI inference at 0x8: bidirectional GRU requires two GRU children and an empty payload."
         );
-        let root = node_bytes(
-            "modl6",
-            &[],
-            &[leaf("moda5", &[]), gru_model(&[1.0; 6])],
-        );
+        let root = node_bytes("modl6", &[], &[leaf("moda5", &[]), gru_model(&[1.0; 6])]);
         assert_eq!(
             load_error(&root),
             "DNNI inference at 0x8: bidirectional GRU children must be modl3 operators."
@@ -3256,16 +3271,7 @@ mod tests {
     #[test]
     fn asymmetric_conv_has_no_radius() {
         // padding 1 with kernel 5 needs padding 2 for symmetry.
-        let root = conv_model(
-            5,
-            1,
-            1,
-            1,
-            &vec![vec![1.0]; 5],
-            1,
-            1,
-            None,
-        );
+        let root = conv_model(5, 1, 1, 1, &vec![vec![1.0]; 5], 1, 1, None);
         assert_eq!(load_engine(&root).context_radius(), None);
     }
 
@@ -3275,12 +3281,7 @@ mod tests {
     /// `load_matrix` path, so packing tests cover the transpose, not a
     /// test-local reimplementation.
     fn packed_matrix_via_blob(rows: usize, columns: usize, values: &[f32]) -> DenseMatrix {
-        let engine = load_engine(&dense_model(
-            rows as u32,
-            columns as u32,
-            values,
-            None,
-        ));
+        let engine = load_engine(&dense_model(rows as u32, columns as u32, values, None));
         engine
             .root
             .as_ref()
@@ -3291,8 +3292,8 @@ mod tests {
 
     fn lcg(state: &mut u64) -> f32 {
         *state = state
-            .wrapping_mul(6364_1362_2384_6793_005)
-            .wrapping_add(1_4426_9504_0889_6634_07);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         ((*state >> 33) as f32 / u32::MAX as f32 - 0.5) * 4.0
     }
 
@@ -3308,7 +3309,11 @@ mod tests {
             // Full first block: lanes hold rows 0..16 of this column.
             let full = &matrix.values[column];
             for row in 0..16 {
-                assert_eq!(full[row], values[row * 3 + column], "row {row} col {column}");
+                assert_eq!(
+                    full[row],
+                    values[row * 3 + column],
+                    "row {row} col {column}"
+                );
             }
             // Tail block: lane 0 holds row 16, the rest are zero pad.
             let tail = &matrix.values[3 + column];
@@ -3373,7 +3378,14 @@ mod tests {
     ) -> Tensor {
         let mut output = Tensor::default();
         engine
-            .run_with_cache(input, &mut output, condition, cache, &test_token(), statistics)
+            .run_with_cache(
+                input,
+                &mut output,
+                condition,
+                cache,
+                &test_token(),
+                statistics,
+            )
             .expect("cached run must succeed");
         output
     }
@@ -3392,7 +3404,13 @@ mod tests {
         let input = tensor(4, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         let mut cache = DnniCache::default();
         let mut first_stats = DnniRunStatistics::default();
-        let first = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut first_stats));
+        let first = run_cache_ok(
+            &engine,
+            &input,
+            None,
+            Some(&mut cache),
+            Some(&mut first_stats),
+        );
         assert_eq!(
             first_stats,
             DnniRunStatistics {
@@ -3406,7 +3424,13 @@ mod tests {
 
         // Identical rerun: every frame reused, output bytes equal.
         let mut second_stats = DnniRunStatistics::default();
-        let second = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut second_stats));
+        let second = run_cache_ok(
+            &engine,
+            &input,
+            None,
+            Some(&mut cache),
+            Some(&mut second_stats),
+        );
         assert_eq!(second.values, first.values);
         assert_eq!(
             second_stats,
@@ -3511,7 +3535,12 @@ mod tests {
                 context_frames: 2,
             }
         );
-        let fresh = run_ok(&engine, 10, 1, &[1.0, 9.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 9.0, 1.0]);
+        let fresh = run_ok(
+            &engine,
+            10,
+            1,
+            &[1.0, 9.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 9.0, 1.0],
+        );
         assert_eq!(output.values, fresh.values);
     }
 
@@ -3536,13 +3565,25 @@ mod tests {
         let input = tensor(2, 1, vec![1.0, 0.0]);
         let mut cache = DnniCache::default();
         let mut first_stats = DnniRunStatistics::default();
-        let first = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut first_stats));
+        let first = run_cache_ok(
+            &engine,
+            &input,
+            None,
+            Some(&mut cache),
+            Some(&mut first_stats),
+        );
         assert_eq!(first_stats.computed_frames, 2);
         // Recurrent state cannot be windowed: the cache is cleared and the
         // second run recomputes everything.
         assert_eq!(cache.model_identity, 0);
         let mut second_stats = DnniRunStatistics::default();
-        let second = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut second_stats));
+        let second = run_cache_ok(
+            &engine,
+            &input,
+            None,
+            Some(&mut cache),
+            Some(&mut second_stats),
+        );
         assert_eq!(second.values, first.values);
         assert_eq!(second_stats.computed_frames, 2);
         assert_eq!(second_stats.reused_frames, 0);
@@ -3561,7 +3602,13 @@ mod tests {
         let reader = load_reader(&dense_model(1, 1, &[5.0], None));
         engine.load(&reader, 0).expect("reload must succeed");
         let mut statistics = DnniRunStatistics::default();
-        let second = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut statistics));
+        let second = run_cache_ok(
+            &engine,
+            &input,
+            None,
+            Some(&mut cache),
+            Some(&mut statistics),
+        );
         assert_eq!(second.values, vec![15.0, 20.0]);
         assert_eq!(statistics.computed_frames, 2);
         assert_eq!(statistics.reused_frames, 0);
@@ -3591,7 +3638,13 @@ mod tests {
         let input = tensor(frames, 1, vec![1.0; frames]);
         let mut cache = DnniCache::default();
         let mut statistics = DnniRunStatistics::default();
-        let output = run_cache_ok(&engine, &input, None, Some(&mut cache), Some(&mut statistics));
+        let output = run_cache_ok(
+            &engine,
+            &input,
+            None,
+            Some(&mut cache),
+            Some(&mut statistics),
+        );
         assert_eq!(output.values.len(), frames);
         assert_eq!(statistics.computed_frames, frames);
         assert_eq!(cache.model_identity, 0);
@@ -3605,7 +3658,7 @@ mod tests {
         let mut cache = DnniCache::default();
         run_cache_ok(&engine, &input, None, Some(&mut cache), None);
         // Capacity-based accounting always covers at least the live lengths.
-        assert!(cache.get_bytes() >= (4 + 0 + 4) * size_of::<f32>());
+        assert!(cache.get_bytes() >= (4 + 4) * size_of::<f32>());
         assert_ne!(cache.model_identity, 0);
         cache.clear();
         assert_eq!(cache.model_identity, 0);
@@ -3721,13 +3774,7 @@ mod tests {
         let input = tensor(3, 1, vec![1.0, 2.0, 3.0]);
         let condition = tensor(3, 1, vec![1.0, 1.0, 1.0]);
         let mut cache = DnniCache::default();
-        let first = run_cache_ok(
-            &engine,
-            &input,
-            Some(&condition),
-            Some(&mut cache),
-            None,
-        );
+        let first = run_cache_ok(&engine, &input, Some(&condition), Some(&mut cache), None);
         assert!(cache.has_condition);
 
         // Identical rerun reuses everything, condition included.
@@ -3754,7 +3801,7 @@ mod tests {
             Some(&mut cache),
             None,
         );
-        let fresh = run_cond_ok(&engine, 3, 1, &[1.0, 2.0, 3.0], Some(edited_condition));
+        let fresh = run_cond_ok(&engine, 3, 1, &[1.0, 2.0, 3.0], Some(&edited_condition));
         assert_eq!(third.values, fresh.values);
     }
 
@@ -3778,8 +3825,7 @@ mod tests {
     // C++ code, so agreement is far tighter in practice.
 
     fn golden_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/golden/dnni")
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/dnni")
     }
 
     fn read_golden_tensor(path: &std::path::Path) -> Tensor {
@@ -3867,4 +3913,3 @@ mod tests {
         }
     }
 }
-
