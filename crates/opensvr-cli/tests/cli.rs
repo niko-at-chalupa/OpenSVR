@@ -7,8 +7,10 @@ use std::{
 };
 
 const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/two-tracks.svp");
-const NEURAL_BASIC: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/audio/neural-basic.svp");
+const NEURAL_BASIC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/golden/audio/neural-basic.svp"
+);
 
 fn opensvr(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_opensvr"))
@@ -114,12 +116,17 @@ fn render_sings_when_a_voice_is_configured() {
         left.len()
     );
     let mean_abs = |window: &[f32]| -> f64 {
-        window.iter().map(|sample| f64::from(sample.abs())).sum::<f64>()
+        window
+            .iter()
+            .map(|sample| f64::from(sample.abs()))
+            .sum::<f64>()
             / window.len().max(1) as f64
     };
     let voiced = mean_abs(&left[800..2400]);
     let silence = mean_abs(&left[8400..9200]);
-    let peak = left.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    let peak = left
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
     assert!(peak > 0.05, "peak {peak}: the phrase must sing audibly");
     assert!(
         voiced > 10.0 * silence,
@@ -168,6 +175,173 @@ fn midi_export_writes_a_standard_midi_file() {
         "conductor track plus two project tracks"
     );
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn convert_svp_to_mid_writes_a_standard_midi_file() {
+    let path = scratch("convert.mid");
+    let output = opensvr(&["convert", EXAMPLE, path.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0));
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(&bytes[..4], b"MThd");
+    assert_eq!(
+        &bytes[10..12],
+        [0, 3],
+        "conductor track plus two project tracks"
+    );
+    // The dedicated exporter and convert agree byte for byte.
+    let direct = scratch("convert-direct.mid");
+    let direct_output = opensvr(&["midi", EXAMPLE, "-o", direct.to_str().unwrap()]);
+    assert_eq!(direct_output.status.code(), Some(0));
+    assert_eq!(fs::read(&direct).unwrap(), bytes);
+    fs::remove_file(path).unwrap();
+    fs::remove_file(direct).unwrap();
+}
+
+#[test]
+fn convert_mid_to_svp_keeps_the_notes() {
+    // Same file stems throughout, so the `.mid` project names coincide.
+    let here = scratch("keep-a");
+    let there = scratch("keep-b");
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&there).unwrap();
+    let (mid_a, svp_a) = (here.join("song.mid"), here.join("song.svp"));
+    let (mid_b, svp_b) = (there.join("song.mid"), there.join("song.svp"));
+
+    assert_eq!(
+        opensvr(&["convert", EXAMPLE, mid_a.to_str().unwrap()])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        opensvr(&["convert", mid_a.to_str().unwrap(), svp_a.to_str().unwrap()])
+            .status
+            .code(),
+        Some(0)
+    );
+    // The sung notes survive the MIDI leg: Lead keeps its 4 lyric-bearing
+    // notes. (Harmony flattens from 0 to 2 notes because MIDI has no library
+    // groups: the exporter writes its placed library notes into the track,
+    // and the importer cannot tell them apart. The timeline is unchanged.)
+    let original = opensvr(&["info", EXAMPLE]);
+    let after = opensvr(&["info", svp_a.to_str().unwrap()]);
+    assert_eq!(original.status.code(), Some(0));
+    assert_eq!(after.status.code(), Some(0));
+    let after = String::from_utf8(after.stdout).unwrap();
+    assert!(
+        after.contains("[0] Lead  notes=4  language=japanese"),
+        "{after}"
+    );
+    assert_eq!(after.matches("Tracks: 2").count(), 1);
+    // And `.mid` -> `.svp` is a fixed point from here on.
+    assert_eq!(
+        opensvr(&["convert", svp_a.to_str().unwrap(), mid_b.to_str().unwrap()])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        opensvr(&["convert", mid_b.to_str().unwrap(), svp_b.to_str().unwrap()])
+            .status
+            .code(),
+        Some(0)
+    );
+    let again = opensvr(&["info", svp_b.to_str().unwrap()]);
+    assert_eq!(again.status.code(), Some(0));
+    assert_eq!(String::from_utf8(again.stdout).unwrap(), after);
+    std::fs::remove_dir_all(here).unwrap();
+    std::fs::remove_dir_all(there).unwrap();
+}
+
+#[test]
+fn convert_svp_to_svp_converges_to_a_fixed_point() {
+    // The first save appends default keys the input lacks (e.g.
+    // `renderConfig`), which the second save then keeps in place: like the
+    // C++ retained-object writer, `save` reaches its fixed point on the
+    // second pass, not the first.
+    let once = scratch("fixed-once.svp");
+    let twice = scratch("fixed-twice.svp");
+    let thrice = scratch("fixed-thrice.svp");
+    assert_eq!(
+        opensvr(&["convert", EXAMPLE, once.to_str().unwrap()])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        opensvr(&["convert", once.to_str().unwrap(), twice.to_str().unwrap()])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        opensvr(&["convert", twice.to_str().unwrap(), thrice.to_str().unwrap()])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(fs::read(&twice).unwrap(), fs::read(&thrice).unwrap());
+    let first = opensvr(&["info", once.to_str().unwrap()]);
+    let second = opensvr(&["info", twice.to_str().unwrap()]);
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(second.status.code(), Some(0));
+    // The `Project:` line follows the file stem through conversions; the
+    // tracks below it must be identical.
+    let without_name = |output: std::process::Output| {
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(without_name(second), without_name(first));
+    fs::remove_file(once).unwrap();
+    fs::remove_file(twice).unwrap();
+    fs::remove_file(thrice).unwrap();
+}
+
+#[test]
+fn convert_uses_the_documented_exit_codes() {
+    let mid = scratch("exit-codes.mid");
+    assert_eq!(
+        opensvr(&["convert", EXAMPLE, mid.to_str().unwrap()])
+            .status
+            .code(),
+        Some(0)
+    );
+    // Unknown extensions are refused, not misread.
+    assert_eq!(
+        opensvr(&["convert", EXAMPLE, scratch("out.txt").to_str().unwrap()])
+            .status
+            .code(),
+        Some(3)
+    );
+    assert_eq!(
+        opensvr(&[
+            "convert",
+            scratch("in.txt").to_str().unwrap(),
+            mid.to_str().unwrap()
+        ])
+        .status
+        .code(),
+        Some(3)
+    );
+    // Missing inputs are load errors.
+    assert_eq!(
+        opensvr(&["convert", "/no/such/project.svp", mid.to_str().unwrap()])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        opensvr(&["convert", "/no/such/project.mid", mid.to_str().unwrap()])
+            .status
+            .code(),
+        Some(2)
+    );
+    fs::remove_file(mid).unwrap();
 }
 
 #[test]
