@@ -25,6 +25,8 @@ pub enum Command {
     Render(RenderArgs),
     /// Export notes, lyrics, tempo and meter as a Standard MIDI File
     Midi(MidiArgs),
+    /// Convert between project formats (.svp and .mid, matched case-insensitively)
+    Convert(ConvertArgs),
 }
 
 /// Settings that replace what the project file says, on every track.
@@ -83,6 +85,14 @@ pub struct MidiArgs {
     pub output: PathBuf,
 }
 
+#[derive(Debug, Args)]
+pub struct ConvertArgs {
+    /// Input project (.svp or .mid)
+    pub input: PathBuf,
+    /// Output project (.svp or .mid)
+    pub output: PathBuf,
+}
+
 const _: () = assert!(
     MAX_SAMPLE_RATE >= 192_000,
     "the CLI cap must not exceed the renderer's"
@@ -130,8 +140,19 @@ mod tests {
                 "opensvr", "render", "song.svp", "-o", "out.wav", "--rate", "100",
             ],
             &["opensvr", "info", "song.svp", "--language", "klingon"],
+            &["opensvr", "convert", "song.svp"],
         ] {
             assert!(Cli::try_parse_from(arguments).is_err(), "{arguments:?}");
         }
+    }
+
+    #[test]
+    fn parses_convert_options() {
+        let cli = Cli::try_parse_from(["opensvr", "convert", "song.svp", "song.mid"]).unwrap();
+        let Command::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        assert_eq!(args.input, PathBuf::from("song.svp"));
+        assert_eq!(args.output, PathBuf::from("song.mid"));
     }
 }

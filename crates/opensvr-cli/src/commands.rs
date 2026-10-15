@@ -14,7 +14,7 @@ use opensvr_midi::MidiError;
 use opensvr_svp::SvpError;
 use thiserror::Error;
 
-use crate::cli::{Command, InfoArgs, MidiArgs, Overrides, RenderArgs};
+use crate::cli::{Command, ConvertArgs, InfoArgs, MidiArgs, Overrides, RenderArgs};
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -26,6 +26,16 @@ pub enum CliError {
     Wav(#[from] WavError),
     #[error("MIDI export failed: {0}")]
     Midi(#[from] MidiError),
+    #[error("MIDI import failed: {0}")]
+    MidiLoad(MidiError),
+    #[error("cannot write {}: {0}", .path.display())]
+    ConvertWrite {
+        path: PathBuf,
+        #[source]
+        source: SvpError,
+    },
+    #[error("unsupported extension for {} (expected .svp or .mid)", .path.display())]
+    UnsupportedExtension { path: PathBuf },
     #[error("cannot write {}: {source}", .path.display())]
     Write {
         path: PathBuf,
@@ -40,7 +50,7 @@ impl CliError {
     /// Process exit status: 2 for load errors, 130 for cancellation, 3 for everything else.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Load(_) => 2,
+            Self::Load(_) | Self::MidiLoad(_) => 2,
             Self::Render(RenderError::Cancelled) | Self::Wav(WavError::Cancelled) => 130,
             _ => 3,
         }
@@ -52,6 +62,7 @@ pub fn run(command: Command, cancel: &CancelToken) -> Result<(), CliError> {
         Command::Info(args) => info(&args),
         Command::Render(args) => render(&args, cancel),
         Command::Midi(args) => midi(&args),
+        Command::Convert(args) => convert(&args),
     }
 }
 
@@ -99,9 +110,10 @@ fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
     // missing database counts as voiceless: the placeholder keeps those
     // renders (and CI without proprietary data) working, warning included,
     // while `info` flags the path as [MISSING] for diagnosis.
-    let voiced = project.tracks.iter().any(|track| {
-        track.voice.database.as_deref().is_some_and(Path::is_file)
-    });
+    let voiced = project
+        .tracks
+        .iter()
+        .any(|track| track.voice.database.as_deref().is_some_and(Path::is_file));
     // Phrase progress goes to an `indicatif` bar on stderr unless `--quiet`.
     // The total is only known inside the renderer, so the bar starts without
     // a length and learns it from the first report; quiet renders pass the
@@ -153,6 +165,53 @@ fn midi(args: &MidiArgs) -> Result<(), CliError> {
         path: args.output.clone(),
         source,
     })
+}
+
+/// Converts between `.svp` and `.mid` in any direction: same-extension pairs
+/// are load-then-save round trips, not byte copies.
+fn convert(args: &ConvertArgs) -> Result<(), CliError> {
+    let input = format_of(&args.input).ok_or_else(|| CliError::UnsupportedExtension {
+        path: args.input.clone(),
+    })?;
+    let output = format_of(&args.output).ok_or_else(|| CliError::UnsupportedExtension {
+        path: args.output.clone(),
+    })?;
+    let project = match input {
+        Format::Svp => opensvr_svp::load(&args.input)?,
+        Format::Midi => opensvr_midi::load(&args.input).map_err(CliError::MidiLoad)?,
+    };
+    match output {
+        Format::Svp => {
+            opensvr_svp::save(&args.output, &project).map_err(|source| CliError::ConvertWrite {
+                path: args.output.clone(),
+                source,
+            })?;
+        }
+        Format::Midi => {
+            let bytes = opensvr_midi::export(&project)?;
+            fs::write(&args.output, bytes).map_err(|source| CliError::Write {
+                path: args.output.clone(),
+                source,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// A project file format, picked by file extension (case-insensitively, so
+/// `song.MID` works on case-preserving filesystems).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Svp,
+    Midi,
+}
+
+fn format_of(path: &Path) -> Option<Format> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("svp") => Some(Format::Svp),
+        Some(extension) if extension.eq_ignore_ascii_case("mid") => Some(Format::Midi),
+        _ => None,
+    }
 }
 
 /// Loads a project and applies the command-line overrides to every track.
@@ -263,9 +322,7 @@ fn print_phonemes(
     let mut resolver = opensvr_g2p::NoteResolver::new(language);
     writeln!(out, "      phonemes:")?;
     for (index, note) in notes.iter().enumerate() {
-        let next_is_legato = notes
-            .get(index + 1)
-            .is_some_and(|next| next.lyrics == "-");
+        let next_is_legato = notes.get(index + 1).is_some_and(|next| next.lyrics == "-");
         match resolver.push(&note.lyrics, &note.phonemes, &set, next_is_legato) {
             Ok(resolved) => writeln!(
                 out,
@@ -340,12 +397,14 @@ mod tests {
 
     #[test]
     fn info_with_phonemes_resolves_each_note() {
-        let dir = std::env::temp_dir().join(format!(
-            "opensvr-info-phonemes-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("opensvr-info-phonemes-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("japanese-romaji-phones.txt"), "a vowel\nk consonant\nsil silence\n").unwrap();
+        std::fs::write(
+            dir.join("japanese-romaji-phones.txt"),
+            "a vowel\nk consonant\nsil silence\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("japanese-romaji-dict.txt"), "ka k a\n").unwrap();
         std::fs::write(dir.join("japanese-hira2romaji-dict.txt"), "か ka\n").unwrap();
         std::fs::write(dir.join("japanese-kata2romaji-dict.txt"), "カ ka\n").unwrap();
@@ -415,7 +474,10 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"か\" -> k a (japanese)"), "{text}");
         assert!(text.contains("\"-\" -> a (japanese)"), "{text}");
-        assert!(text.contains("\"zzz\" -> [ERROR] No pronunciation for dictionary key 'zzz'."), "{text}");
+        assert!(
+            text.contains("\"zzz\" -> [ERROR] No pronunciation for dictionary key 'zzz'."),
+            "{text}"
+        );
     }
 
     #[test]
@@ -452,7 +514,10 @@ mod tests {
         let mut out = Vec::new();
         print_info(&project, &mut out, true).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("phonemes: [UNREADABLE: Cannot read synthesis resource:"), "{text}");
+        assert!(
+            text.contains("phonemes: [UNREADABLE: Cannot read synthesis resource:"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -464,6 +529,40 @@ mod tests {
             CliError::Load(SvpError::UnsupportedVersion(1)).exit_code(),
             2
         );
+        assert_eq!(
+            CliError::MidiLoad(MidiError::NoNotes).exit_code(),
+            2,
+            "MIDI load errors are load errors"
+        );
+        assert_eq!(
+            CliError::UnsupportedExtension {
+                path: PathBuf::from("song.txt"),
+            }
+            .exit_code(),
+            3,
+            "unknown extensions are refused, not misread"
+        );
+        assert_eq!(
+            CliError::ConvertWrite {
+                path: PathBuf::from("song.svp"),
+                source: SvpError::Invalid("nope".into()),
+            }
+            .exit_code(),
+            3,
+            "conversion write errors are write errors"
+        );
+    }
+
+    #[test]
+    fn extensions_match_case_insensitively() {
+        assert_eq!(
+            format_of(Path::new("song.SVP")),
+            Some(Format::Svp),
+            "format_of"
+        );
+        assert_eq!(format_of(Path::new("song.MID")), Some(Format::Midi));
+        assert_eq!(format_of(Path::new("song.txt")), None);
+        assert_eq!(format_of(Path::new("song")), None);
     }
 
     #[test]
