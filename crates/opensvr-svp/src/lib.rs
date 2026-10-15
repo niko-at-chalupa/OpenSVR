@@ -175,15 +175,15 @@ struct RawTime {
 
 #[derive(Deserialize)]
 struct RawTempo {
-    position: i64,
+    position: Value,
     bpm: f64,
 }
 
 #[derive(Deserialize)]
 struct RawMeter {
-    index: i64,
-    numerator: i64,
-    denominator: i64,
+    index: Value,
+    numerator: Value,
+    denominator: Value,
 }
 
 #[derive(Deserialize)]
@@ -247,9 +247,9 @@ struct RawCurve {
 
 #[derive(Deserialize)]
 struct RawNote {
-    onset: i64,
-    duration: i64,
-    pitch: i64,
+    onset: Value,
+    duration: Value,
+    pitch: Value,
     lyrics: String,
     #[serde(default)]
     phonemes: String,
@@ -271,12 +271,12 @@ struct RawNote {
 struct RawReference {
     #[serde(rename = "groupID")]
     group_id: String,
-    blick_offset: i64,
-    pitch_offset: i64,
+    blick_offset: Value,
+    pitch_offset: Value,
     #[serde(default)]
-    blick_absolute_begin: i64,
-    #[serde(default = "unbounded")]
-    blick_absolute_end: i64,
+    blick_absolute_begin: Option<Value>,
+    #[serde(default)]
+    blick_absolute_end: Option<Value>,
     #[serde(default)]
     is_instrumental: bool,
     /// Reference `audio` backing-track metadata (`filename`, `duration`).
@@ -292,9 +292,22 @@ struct RawReference {
     voice: Option<Value>,
 }
 
-/// Sentinel the format uses for "no right crop boundary".
-fn unbounded() -> i64 {
-    -1
+/// Mirrors OpenSV's `readInteger` in `src/core/ProjectFile.cpp`: integer or
+/// double JSON that is finite, integral (`trunc`) and within
+/// [`MAX_FILE_BLICK`]; anything else is `None` (the caller reports the
+/// field's existing `Invalid` error, never a JSON error).
+fn read_integer(value: &Value) -> Option<Blick> {
+    let number = value.as_f64()?;
+    if !number.is_finite() || number.trunc() != number || number.abs() > MAX_FILE_BLICK as f64 {
+        return None;
+    }
+    if let Some(exact) = value.as_i64() {
+        return Some(exact);
+    }
+    if let Some(unsigned) = value.as_u64() {
+        return Blick::try_from(unsigned).ok();
+    }
+    Some(number as Blick)
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +332,12 @@ impl RawTime {
             .into_iter()
             .map(|value| {
                 let tempo: RawTempo = serde_json::from_value(value.clone())?;
-                let position = blick(tempo.position, "a tempo position")?;
+                let Some(position) =
+                    read_integer(&tempo.position).map(|raw| blick(raw, "a tempo position"))
+                else {
+                    return invalid("a tempo marker is invalid");
+                };
+                let position = position?;
                 if position < 0 || !tempo.bpm.is_finite() || tempo.bpm <= 0.0 {
                     return invalid("a tempo marker is invalid");
                 }
@@ -339,13 +357,20 @@ impl RawTime {
             .into_iter()
             .map(|value| {
                 let meter: RawMeter = serde_json::from_value(value.clone())?;
+                let (Some(index), Some(numerator), Some(denominator)) = (
+                    read_integer(&meter.index),
+                    read_integer(&meter.numerator),
+                    read_integer(&meter.denominator),
+                ) else {
+                    return invalid("a meter marker is invalid");
+                };
                 let signature = TimeSignature {
-                    bar: u32::try_from(meter.index).unwrap_or(u32::MAX),
-                    numerator: u32::try_from(meter.numerator).unwrap_or(0),
-                    denominator: u32::try_from(meter.denominator).unwrap_or(0),
+                    bar: u32::try_from(index).unwrap_or(u32::MAX),
+                    numerator: u32::try_from(numerator).unwrap_or(0),
+                    denominator: u32::try_from(denominator).unwrap_or(0),
                     extra: Extra::default(),
                 };
-                if meter.index < 0 || meter.index > i64::from(i32::MAX) || !signature.is_valid() {
+                if index < 0 || index > i64::from(i32::MAX) || !signature.is_valid() {
                     return invalid("a meter marker is invalid");
                 }
                 let Some(entry) = value.as_object() else {
@@ -363,9 +388,16 @@ impl RawTime {
 impl RawNote {
     fn into_note(value: &Value) -> Result<Note> {
         let raw: RawNote = serde_json::from_value(value.clone())?;
-        let onset = blick(raw.onset, "a note onset")?;
-        let duration = blick(raw.duration, "a note duration")?;
-        let pitch = u8::try_from(raw.pitch).ok().filter(|&pitch| pitch <= 127);
+        let (Some(onset), Some(duration), Some(pitch_raw)) = (
+            read_integer(&raw.onset),
+            read_integer(&raw.duration),
+            read_integer(&raw.pitch),
+        ) else {
+            return invalid("a note has invalid timing, pitch, or detune");
+        };
+        let onset = blick(onset, "a note onset")?;
+        let duration = blick(duration, "a note duration")?;
+        let pitch = u8::try_from(pitch_raw).ok().filter(|&pitch| pitch <= 127);
         let Some(pitch) = pitch.filter(|_| duration > 0 && raw.detune.is_finite()) else {
             return invalid("a note has invalid timing, pitch, or detune");
         };
@@ -790,16 +822,35 @@ fn read_curve_inner(value: Option<&Value>, name: &str, normalise: bool) -> Resul
 impl RawReference {
     fn into_reference(value: &Value, base_dir: &Path) -> Result<GroupReference> {
         let raw: RawReference = serde_json::from_value(value.clone())?;
-        let pitch_offset = i32::try_from(raw.pitch_offset)
+        let (Some(offset_raw), Some(pitch_raw)) = (
+            read_integer(&raw.blick_offset),
+            read_integer(&raw.pitch_offset),
+        ) else {
+            return invalid("a group reference has an invalid pitch offset");
+        };
+        let pitch_offset = i32::try_from(pitch_raw)
             .ok()
             .filter(|offset| (-127..=127).contains(offset));
         let Some(pitch_offset) = pitch_offset else {
             return invalid("a group reference has an invalid pitch offset");
         };
-        let begin = blick(raw.blick_absolute_begin, "a crop boundary")?;
-        let end = match blick(raw.blick_absolute_end, "a crop boundary")? {
-            -1 => None,
-            end => Some(end),
+        let begin = match raw.blick_absolute_begin.as_ref() {
+            None => 0,
+            Some(raw) => {
+                let Some(bound) = read_integer(raw) else {
+                    return invalid("a group reference has invalid crop boundaries");
+                };
+                blick(bound, "a crop boundary")?
+            }
+        };
+        let end = match raw.blick_absolute_end.as_ref() {
+            // The format's sentinel for "no right crop boundary".
+            None => None,
+            Some(raw) => match read_integer(raw) {
+                Some(-1) => None,
+                Some(bound) => Some(blick(bound, "a crop boundary")?),
+                None => return invalid("a group reference has invalid crop boundaries"),
+            },
         };
         if begin < 0 || end.is_some_and(|end| end <= begin) {
             return invalid("a group reference has invalid crop boundaries");
@@ -835,7 +886,7 @@ impl RawReference {
         )?;
         Ok(GroupReference {
             group_id: raw.group_id,
-            time_offset: blick(raw.blick_offset, "a group offset")?,
+            time_offset: blick(offset_raw, "a group offset")?,
             pitch_offset,
             begin,
             end,
@@ -1372,6 +1423,21 @@ mod tests {
         parse(value.to_string().as_bytes(), "song", Path::new("/proj"))
     }
 
+    /// Sets a JSON-pointer target, creating the leaf key when the sample omits
+    /// it (crop bounds). Only the two crop leaves are ever absent, so the
+    /// fallback inserts a final object key under an existing parent.
+    fn set_pointer(value: &mut Value, pointer: &str, replacement: Value) {
+        if let Some(target) = value.pointer_mut(pointer) {
+            *target = replacement;
+            return;
+        }
+        let parent_end = pointer.rfind('/').unwrap();
+        let (parent, leaf) = pointer.split_at(parent_end);
+        let leaf = leaf.trim_start_matches('/');
+        let leaf: &str = leaf;
+        value.pointer_mut(parent).unwrap()[leaf] = replacement;
+    }
+
     #[test]
     fn loads_a_project() {
         let project = parse_value(&sample()).unwrap();
@@ -1434,6 +1500,97 @@ mod tests {
                 "{pointer} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn integer_valued_floats_load_like_integers() {
+        let plain = parse_value(&sample()).unwrap();
+        let mut value = sample();
+        // One `.0` spelling per `readInteger` call site (note timing/pitch,
+        // reference offsets, tempo position, meter fields). Crop bounds are
+        // covered separately below so this stays value-identical to `plain`.
+        value["tracks"][0]["mainGroup"]["notes"][0]["onset"] = json!(705_600_000.0);
+        value["tracks"][0]["mainGroup"]["notes"][0]["duration"] = json!(705_600_000.0);
+        value["tracks"][0]["mainGroup"]["notes"][0]["pitch"] = json!(62.0);
+        value["tracks"][0]["mainGroup"]["notes"][1]["onset"] = json!(0.0);
+        value["tracks"][0]["mainGroup"]["notes"][1]["duration"] = json!(705_600_000.0);
+        value["tracks"][0]["mainGroup"]["notes"][1]["pitch"] = json!(60.0);
+        value["tracks"][0]["groups"][0]["blickOffset"] = json!(0.0);
+        value["tracks"][0]["groups"][0]["pitchOffset"] = json!(0.0);
+        value["time"]["tempo"][0]["position"] = json!(0.0);
+        value["time"]["meter"][0]["index"] = json!(0.0);
+        value["time"]["meter"][0]["numerator"] = json!(3.0);
+        value["time"]["meter"][0]["denominator"] = json!(4.0);
+        let dotted = parse_value(&value).unwrap();
+        assert_eq!(dotted.tracks, plain.tracks);
+        assert_eq!(dotted.library, plain.library);
+        assert_eq!(dotted.tempo_map, plain.tempo_map);
+        // Integral crop doubles keep their values (the sample omits them, so
+        // they are set explicitly here).
+        let mut value = sample();
+        value["tracks"][0]["groups"][0]["blickAbsoluteBegin"] = json!(705_600_000.0);
+        value["tracks"][0]["groups"][0]["blickAbsoluteEnd"] = json!(2_116_800_000.0);
+        let project = parse_value(&value).unwrap();
+        assert_eq!(
+            (
+                project.tracks[0].groups[0].begin,
+                project.tracks[0].groups[0].end
+            ),
+            (705_600_000, Some(2_116_800_000))
+        );
+        assert_eq!(project.tracks[0].main_group.notes[1].pitch, 62);
+        // The `-1.0` sentinel still means unbounded, as in the C++ cast.
+        let mut value = sample();
+        value["tracks"][0]["groups"][0]["blickAbsoluteBegin"] = json!(0.0);
+        value["tracks"][0]["groups"][0]["blickAbsoluteEnd"] = json!(-1.0);
+        let project = parse_value(&value).unwrap();
+        assert_eq!(project.tracks[0].groups[0].end, None);
+    }
+
+    #[test]
+    fn rejects_non_integral_and_out_of_range_integers() {
+        // Non-integral doubles fail with the field's `Invalid` error, never a
+        // JSON error, exactly like C++ `readInteger` returning false.
+        let pointers = [
+            "/tracks/0/mainGroup/notes/0/onset",
+            "/tracks/0/mainGroup/notes/0/duration",
+            "/tracks/0/mainGroup/notes/0/pitch",
+            "/tracks/0/groups/0/blickOffset",
+            "/tracks/0/groups/0/pitchOffset",
+            "/tracks/0/groups/0/blickAbsoluteBegin",
+            "/tracks/0/groups/0/blickAbsoluteEnd",
+            "/time/tempo/0/position",
+            "/time/meter/0/index",
+            "/time/meter/0/numerator",
+            "/time/meter/0/denominator",
+        ];
+        for pointer in pointers {
+            let mut value = sample();
+            // `0.5` is the non-integral probe; the crop-end sentinel path
+            // uses `-0.5` so it cannot be mistaken for `-1`. Crop keys are
+            // absent from the sample, so they are created via the parent
+            // object when the JSON pointer has no target yet.
+            let probe = if pointer.ends_with("blickAbsoluteEnd") {
+                json!(-0.5)
+            } else {
+                json!(0.5)
+            };
+            set_pointer(&mut value, pointer, probe);
+            assert!(
+                matches!(parse_value(&value), Err(SvpError::Invalid(_))),
+                "{pointer} should reject 0.5 with Invalid"
+            );
+            let mut value = sample();
+            set_pointer(&mut value, pointer, json!(4_611_686_018_427_387_904i64));
+            assert!(
+                matches!(parse_value(&value), Err(SvpError::Invalid(_))),
+                "{pointer} should reject out-of-range magnitudes with Invalid"
+            );
+        }
+        // Out-of-range doubles are rejected too, not just out-of-range ints.
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["notes"][0]["onset"] = json!(4_611_686_018_427_387_904.0);
+        assert!(matches!(parse_value(&value), Err(SvpError::Invalid(_))));
     }
 
     #[test]
