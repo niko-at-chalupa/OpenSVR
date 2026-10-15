@@ -372,10 +372,28 @@ impl RawNote {
         let Some(note) = value.as_object() else {
             return invalid("a note has invalid timing, pitch, or detune");
         };
+        // Plain scalar style fields, exactly like `readGroup`
+        // (`ProjectFile.cpp:298-320`): present values must have the right
+        // JSON type, absent keys (or JSON null, which JUCE parses to void)
+        // keep the C++ member defaults.
+        let accent = match note.get("accent") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(text)) => text.clone(),
+            _ => return invalid("a note's accent must be a string."),
+        };
+        let instant_mode = match note.get("instantMode") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(mode)) => *mode,
+            _ => return invalid("a note's instantMode must be a boolean."),
+        };
+        let musical_type = match note.get("musicalType") {
+            None | Some(Value::Null) => "singing".to_owned(),
+            Some(Value::String(style)) => style.clone(),
+            _ => return invalid("a note's musicalType must be a string."),
+        };
         // C++ `ProjectFile.cpp:329` strips the handled keys, including the
-        // legacy `accent`/`instantMode`/`musicalType` members Rust has no
-        // fields for yet (a later PR adds the fields and their validation);
-        // only truly unknown keys survive into `extra`, exactly as there.
+        // three scalar style members above; only truly unknown keys survive
+        // into `extra`, exactly as there.
         let extra = preserve(
             note,
             &[
@@ -399,6 +417,9 @@ impl RawNote {
             lyrics: raw.lyrics,
             phonemes: raw.phonemes,
             detune: raw.detune,
+            instant_mode,
+            musical_type,
+            accent,
             attributes,
             system_attributes,
             extra,
