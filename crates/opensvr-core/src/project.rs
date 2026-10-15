@@ -28,6 +28,14 @@ pub struct Note {
     pub phonemes: String,
     /// Microtonal offset in cents.
     pub detune: f64,
+    /// Whether instant pitch mode (smooth neural transitions) is enabled.
+    /// Mirrors OpenSV's `Note::instantMode` (defaults to true).
+    pub instant_mode: bool,
+    /// Musical style: `"singing"` or `"rap"`, mirroring OpenSV's
+    /// `Note::musicalType` (any string is accepted on read).
+    pub musical_type: String,
+    /// Stress / emphasis markings, mirroring OpenSV's `Note::accent`.
+    pub accent: String,
     /// User-specified manual pitch/vibrato overrides.
     pub attributes: PitchAttributes,
     /// Automatically calculated pitch/vibrato defaults.
@@ -588,6 +596,9 @@ mod tests {
             lyrics: "la".into(),
             phonemes: String::new(),
             detune: 0.0,
+            instant_mode: true,
+            musical_type: "singing".into(),
+            accent: String::new(),
             attributes: PitchAttributes::default(),
             system_attributes: PitchAttributes::default(),
             extra: Extra::default(),
