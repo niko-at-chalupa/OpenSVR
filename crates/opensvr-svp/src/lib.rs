@@ -1,13 +1,16 @@
-//! Reader for Synthesizer V Studio project files (`.svp`, format version 153).
+//! Reader and writer for Synthesizer V Studio project files (`.svp`, format version 153).
 //!
-//! The file is JSON. It is first deserialized into private "raw" structs that
-//! mirror the file layout, then validated and converted into the domain types of
-//! [`opensvr_core`]. Group automation curves (`parameters.pitchDelta` and
-//! `parameters.vibratoEnv`) and per-mode vocal-mode curves are read with the
-//! same validation as OpenSV's `readCurve`; unknown vendor fields at every
-//! level are captured into [`Extra`](opensvr_core::Extra) exactly like
-//! OpenSV's `preserve`, so a future saver can round-trip them; see
-//! `ROADMAP.md` for lossless saving.
+//! The file is JSON. Reads go through private "raw" structs that mirror the
+//! file layout, then validate into the domain types of [`opensvr_core`].
+//! Group automation curves (`parameters.pitchDelta` and `parameters.vibratoEnv`)
+//! and per-mode vocal-mode curves are read with the same validation as
+//! OpenSV's `readCurve`; unknown vendor fields at every level are captured
+//! into [`Extra`](opensvr_core::Extra) exactly like OpenSV's `preserve`.
+//! Writes mirror OpenSV's `write*` functions: each level starts from
+//! `retainedObject(extra)` and overwrites the handled keys from the domain
+//! values, so `parse(serialize(project))` is a fixed point (modulo the
+//! documented `systemPitchDelta` gap: Rust has no field for it yet, so the
+//! saver always emits the default empty curve).
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -16,8 +19,8 @@ use std::{
 };
 
 use opensvr_core::{
-    AutomationPoint, Blick, Curve, Extra, GroupReference, Interpolation, MAX_FILE_BLICK, Mixer,
-    Note, NoteGroup, PitchAttribute, PitchAttributes, Project, TempoChange, TempoMap,
+    AutomationPoint, Blick, Curve, Extra, GroupReference, Interpolation, Language, MAX_FILE_BLICK,
+    Mixer, Note, NoteGroup, PitchAttribute, PitchAttributes, Project, TempoChange, TempoMap,
     TimeSignature, Track, VocalModeSetting, VoiceSettings,
 };
 use serde::Deserialize;
@@ -372,10 +375,28 @@ impl RawNote {
         let Some(note) = value.as_object() else {
             return invalid("a note has invalid timing, pitch, or detune");
         };
+        // Plain scalar style fields, exactly like `readGroup`
+        // (`ProjectFile.cpp:298-320`): present values must have the right
+        // JSON type, absent keys (or JSON null, which JUCE parses to void)
+        // keep the C++ member defaults.
+        let accent = match note.get("accent") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(text)) => text.clone(),
+            _ => return invalid("a note's accent must be a string."),
+        };
+        let instant_mode = match note.get("instantMode") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(mode)) => *mode,
+            _ => return invalid("a note's instantMode must be a boolean."),
+        };
+        let musical_type = match note.get("musicalType") {
+            None | Some(Value::Null) => "singing".to_owned(),
+            Some(Value::String(style)) => style.clone(),
+            _ => return invalid("a note's musicalType must be a string."),
+        };
         // C++ `ProjectFile.cpp:329` strips the handled keys, including the
-        // legacy `accent`/`instantMode`/`musicalType` members Rust has no
-        // fields for yet (a later PR adds the fields and their validation);
-        // only truly unknown keys survive into `extra`, exactly as there.
+        // three scalar style members above; only truly unknown keys survive
+        // into `extra`, exactly as there.
         let extra = preserve(
             note,
             &[
@@ -399,6 +420,9 @@ impl RawNote {
             lyrics: raw.lyrics,
             phonemes: raw.phonemes,
             detune: raw.detune,
+            instant_mode,
+            musical_type,
+            accent,
             attributes,
             system_attributes,
             extra,
@@ -883,6 +907,427 @@ impl RawTrack {
             extra,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Serialization (`write*` in `src/core/ProjectFile.cpp`)
+// ---------------------------------------------------------------------------
+
+/// Mirrors OpenSV's `retainedObject`: restores the preserved JSON blob, or an
+/// empty object when the blob is empty or malformed. `Map::insert` keeps
+/// existing-key positions, matching JUCE `setProperty` semantics (overwritten
+/// keys stay put, new keys append) — so the writer reproduces the C++ key
+/// order, including its append-on-first-save behavior for default keys.
+fn retained_object(extra: &Extra) -> Map<String, Value> {
+    if extra.is_empty() {
+        return Map::new();
+    }
+    serde_json::from_str(extra.json()).unwrap_or_default()
+}
+
+/// Mirrors OpenSV's `objectProperty`: clones a nested object property, or an
+/// empty object when it is absent or not an object.
+fn object_property(parent: &Map<String, Value>, name: &str) -> Map<String, Value> {
+    parent
+        .get(name)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Mirrors OpenSV's `setDefault`: inserts only when the key is missing.
+fn set_default(object: &mut Map<String, Value>, name: &str, value: Value) {
+    if !object.contains_key(name) {
+        object.insert(name.to_owned(), value);
+    }
+}
+
+/// Mirrors OpenSV's `defaultTakes`: `{activeTakeId: 0, takes: [{id: 0,
+/// expr: 0.0, liked: false}]}`.
+fn default_takes() -> Value {
+    serde_json::json!({
+        "activeTakeId": 0,
+        "takes": [{ "id": 0, "expr": 0.0, "liked": false }],
+    })
+}
+
+fn number(value: f64) -> Value {
+    serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
+}
+
+/// Mirrors OpenSV's `writePitchAttributes`: merges the preserved blob, then
+/// sets present fields and removes absent ones.
+fn write_pitch_attributes(attributes: &PitchAttributes) -> Map<String, Value> {
+    let mut value = retained_object(&attributes.extra);
+    for field in PitchAttribute::ALL {
+        match attributes.get(field) {
+            Some(amount) => {
+                value.insert(field.name().to_owned(), number(amount));
+            }
+            None => {
+                value.shift_remove(field.name());
+            }
+        }
+    }
+    value
+}
+
+/// Mirrors OpenSV's `writeCurve`: merges the preserved blob, then sets
+/// `mode` and the flat `[position, value, ...]` points (positions as
+/// integers).
+fn write_curve(curve: &Curve) -> Map<String, Value> {
+    let mut value = retained_object(&curve.extra);
+    value.insert("mode".to_owned(), Value::String(curve.mode.as_str().into()));
+    let mut points = Vec::with_capacity(curve.points.len() * 2);
+    for point in &curve.points {
+        points.push(Value::from(point.position));
+        points.push(number(point.value));
+    }
+    value.insert("points".to_owned(), Value::Array(points));
+    value
+}
+
+/// Converts a stored absolute path back to project-relative form, mirroring
+/// `juce::File::getRelativePathFrom`: paths under the project directory lose
+/// their prefix, anything else keeps its absolute form.
+fn relativize(base_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(base_dir).map_or_else(
+        |_| path.to_string_lossy().into_owned(),
+        |relative| relative.to_string_lossy().into_owned(),
+    )
+}
+
+fn write_note(note: &Note) -> Value {
+    let mut item = retained_object(&note.extra);
+    item.insert("onset".to_owned(), Value::from(note.onset));
+    item.insert("duration".to_owned(), Value::from(note.duration));
+    item.insert("pitch".to_owned(), Value::from(note.pitch));
+    item.insert("lyrics".to_owned(), Value::String(note.lyrics.clone()));
+    item.insert("phonemes".to_owned(), Value::String(note.phonemes.clone()));
+    item.insert(
+        "musicalType".to_owned(),
+        Value::String(note.musical_type.clone()),
+    );
+    item.insert("accent".to_owned(), Value::String(note.accent.clone()));
+    item.insert("detune".to_owned(), number(note.detune));
+    item.insert("instantMode".to_owned(), Value::Bool(note.instant_mode));
+    let mut attributes = write_pitch_attributes(&note.attributes);
+    set_default(&mut attributes, "evenSyllableDuration", Value::Bool(true));
+    item.insert("attributes".to_owned(), Value::Object(attributes));
+    let system_attributes = write_pitch_attributes(&note.system_attributes);
+    if system_attributes.is_empty() {
+        item.shift_remove("systemAttributes");
+    } else {
+        item.insert(
+            "systemAttributes".to_owned(),
+            Value::Object(system_attributes),
+        );
+    }
+    set_default(&mut item, "pitchTakes", default_takes());
+    set_default(&mut item, "timbreTakes", default_takes());
+    Value::Object(item)
+}
+
+fn write_group(group: &NoteGroup) -> Value {
+    let mut value = retained_object(&group.extra);
+    value.insert("uuid".to_owned(), Value::String(group.id.clone()));
+    value.insert("name".to_owned(), Value::String(group.name.clone()));
+    value.insert(
+        "notes".to_owned(),
+        Value::Array(group.notes.iter().map(write_note).collect()),
+    );
+    let mut parameters = object_property(&value, "parameters");
+    for name in [
+        "loudness",
+        "tension",
+        "breathiness",
+        "voicing",
+        "gender",
+        "toneShift",
+    ] {
+        let mut curve = object_property(&parameters, name);
+        set_default(&mut curve, "mode", Value::String("cubic".into()));
+        set_default(&mut curve, "points", Value::Array(Vec::new()));
+        parameters.insert(name.to_owned(), Value::Object(curve));
+    }
+    parameters.insert(
+        "pitchDelta".to_owned(),
+        Value::Object(write_curve(&group.pitch_delta)),
+    );
+    parameters.insert(
+        "vibratoEnv".to_owned(),
+        Value::Object(write_curve(&group.vibrato_env)),
+    );
+    value.insert("parameters".to_owned(), Value::Object(parameters));
+    // `vocalModes` is rebuilt fresh from the members (C++ `writeGroup`),
+    // so plain amounts normalize to `{enabled, amount}` objects here.
+    let mut vocal_modes = Map::new();
+    for (name, setting) in &group.vocal_modes {
+        let mut mode = retained_object(&setting.extra);
+        mode.insert("enabled".to_owned(), Value::Bool(setting.enabled));
+        mode.insert("amount".to_owned(), number(setting.amount));
+        if setting.has_curve {
+            let curve = write_curve(&setting.curve);
+            if let Some(mode_value) = curve.get("mode") {
+                mode.insert("mode".to_owned(), mode_value.clone());
+            }
+            if let Some(points) = curve.get("points") {
+                mode.insert("points".to_owned(), points.clone());
+            }
+        }
+        vocal_modes.insert(name.clone(), Value::Object(mode));
+    }
+    value.insert("vocalModes".to_owned(), Value::Object(vocal_modes));
+    Value::Object(value)
+}
+
+fn write_reference(reference: &GroupReference, base_dir: &Path) -> Value {
+    let mut value = retained_object(&reference.extra);
+    value.insert(
+        "groupID".to_owned(),
+        Value::String(reference.group_id.clone()),
+    );
+    value.insert("blickOffset".to_owned(), Value::from(reference.time_offset));
+    value.insert(
+        "pitchOffset".to_owned(),
+        Value::from(reference.pitch_offset),
+    );
+    value.insert(
+        "blickAbsoluteBegin".to_owned(),
+        Value::from(reference.begin),
+    );
+    value.insert(
+        "blickAbsoluteEnd".to_owned(),
+        Value::from(reference.end.unwrap_or(-1)),
+    );
+    value.insert(
+        "isInstrumental".to_owned(),
+        Value::Bool(reference.instrumental),
+    );
+    let mut database = object_property(&value, "database");
+    for name in [
+        "name",
+        "language",
+        "phoneset",
+        "languageOverride",
+        "phonesetOverride",
+        "backendType",
+    ] {
+        set_default(&mut database, name, Value::String(String::new()));
+    }
+    set_default(&mut database, "version", Value::String("-2".into()));
+    value.insert("database".to_owned(), Value::Object(database));
+    set_default(&mut value, "dictionary", Value::String(String::new()));
+    let mut voice = write_pitch_attributes(&reference.voice_pitch);
+    voice.insert(
+        "vocalModeInherited".to_owned(),
+        Value::Bool(reference.vocal_mode_inherited),
+    );
+    voice.insert(
+        "vocalModePreset".to_owned(),
+        Value::String(reference.vocal_mode_preset.clone()),
+    );
+    let mut mode_params = Map::new();
+    for (name, amount) in &reference.vocal_mode_params {
+        mode_params.insert(name.clone(), number(*amount));
+    }
+    voice.insert("vocalModeParams".to_owned(), Value::Object(mode_params));
+    value.insert("voice".to_owned(), Value::Object(voice));
+    set_default(&mut value, "pitchTakes", default_takes());
+    set_default(&mut value, "timbreTakes", default_takes());
+    // Rust has no `systemPitchDelta` field yet (it lands with the pitch
+    // builder), so the saver always emits the default empty curve; a loaded
+    // non-default curve cannot round-trip until then.
+    value.insert(
+        "systemPitchDelta".to_owned(),
+        Value::Object(write_curve(&Curve::default())),
+    );
+    if let Some(audio_file) = reference.audio_file.as_ref() {
+        let mut audio = object_property(&value, "audio");
+        audio.insert(
+            "filename".to_owned(),
+            Value::String(relativize(base_dir, audio_file)),
+        );
+        audio.insert(
+            "duration".to_owned(),
+            number(reference.audio_duration_seconds),
+        );
+        value.insert("audio".to_owned(), Value::Object(audio));
+    }
+    Value::Object(value)
+}
+
+fn write_track(track: &Track, index: usize, base_dir: &Path) -> Value {
+    let mut value = retained_object(&track.extra);
+    value.insert("name".to_owned(), Value::String(track.name.clone()));
+    set_default(&mut value, "dispColor", Value::String("ff7db235".into()));
+    value.insert(
+        "dispOrder".to_owned(),
+        Value::from(i64::try_from(index).unwrap_or(i64::MAX)),
+    );
+    set_default(&mut value, "renderEnabled", Value::Bool(false));
+    value.insert("mainGroup".to_owned(), write_group(&track.main_group));
+    value.insert(
+        "mainRef".to_owned(),
+        write_reference(&track.main_ref, base_dir),
+    );
+    if track.voice.database.is_some()
+        || track.voice.dictionary.is_some()
+        || track.voice.language != Language::Japanese
+    {
+        let mut voice = Map::new();
+        voice.insert(
+            "databasePath".to_owned(),
+            Value::String(
+                track
+                    .voice
+                    .database
+                    .as_deref()
+                    .map_or_else(String::new, |path| relativize(base_dir, path)),
+            ),
+        );
+        voice.insert(
+            "language".to_owned(),
+            Value::String(track.voice.language.as_str().into()),
+        );
+        voice.insert(
+            "dictionaryDirectory".to_owned(),
+            Value::String(
+                track
+                    .voice
+                    .dictionary
+                    .as_deref()
+                    .map_or_else(String::new, |path| relativize(base_dir, path)),
+            ),
+        );
+        value.insert("svVoice".to_owned(), Value::Object(voice));
+    }
+    let mut mixer = object_property(&value, "mixer");
+    // Preserve the source dB value when no linear gain edit has occurred
+    // (exact `f64` comparison, as in the C++).
+    let gain_decibel = if track.mixer.gain > 0.0 {
+        20.0 * track.mixer.gain.log10()
+    } else {
+        -100.0
+    };
+    let keep_decibel = mixer
+        .get("gainDecibel")
+        .and_then(Value::as_f64)
+        .is_some_and(|original| 10.0_f64.powf(original / 20.0) == track.mixer.gain);
+    if !mixer.contains_key("gainDecibel") || !keep_decibel {
+        mixer.insert("gainDecibel".to_owned(), number(gain_decibel));
+    }
+    mixer.insert("pan".to_owned(), number(track.mixer.pan));
+    mixer.insert("mute".to_owned(), Value::Bool(track.mixer.mute));
+    mixer.insert("solo".to_owned(), Value::Bool(track.mixer.solo));
+    set_default(&mut mixer, "display", Value::Bool(true));
+    value.insert("mixer".to_owned(), Value::Object(mixer));
+    value.insert(
+        "groups".to_owned(),
+        Value::Array(
+            track
+                .groups
+                .iter()
+                .map(|reference| write_reference(reference, base_dir))
+                .collect(),
+        ),
+    );
+    Value::Object(value)
+}
+
+/// Serializes a project to multi-line JSON, mirroring `saveProjectFile`
+/// (`src/core/ProjectFile.cpp:899`) without the trailing NUL byte or the
+/// atomic file replacement (see [`save`]). `base_dir` is the directory voice,
+/// dictionary, and backing-track paths relativize against (the file's parent
+/// on [`save`]).
+pub fn serialize(project: &Project, base_dir: &Path) -> Result<String> {
+    let mut root = retained_object(&project.extra);
+    root.insert("version".to_owned(), Value::from(FORMAT_VERSION));
+    let mut time = object_property(&root, "time");
+    time.insert(
+        "tempo".to_owned(),
+        Value::Array(
+            project
+                .tempo_map
+                .tempos()
+                .iter()
+                .map(|tempo| {
+                    let mut value = retained_object(&tempo.extra);
+                    value.insert("position".to_owned(), Value::from(tempo.position));
+                    value.insert("bpm".to_owned(), number(tempo.bpm));
+                    Value::Object(value)
+                })
+                .collect(),
+        ),
+    );
+    time.insert(
+        "meter".to_owned(),
+        Value::Array(
+            project
+                .tempo_map
+                .time_signatures()
+                .iter()
+                .map(|signature| {
+                    let mut value = retained_object(&signature.extra);
+                    value.insert("index".to_owned(), Value::from(signature.bar));
+                    value.insert("numerator".to_owned(), Value::from(signature.numerator));
+                    value.insert("denominator".to_owned(), Value::from(signature.denominator));
+                    Value::Object(value)
+                })
+                .collect(),
+        ),
+    );
+    root.insert("time".to_owned(), Value::Object(time));
+    root.insert(
+        "library".to_owned(),
+        Value::Array(project.library.iter().map(write_group).collect()),
+    );
+    root.insert(
+        "tracks".to_owned(),
+        Value::Array(
+            project
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(index, track)| write_track(track, index, base_dir))
+                .collect(),
+        ),
+    );
+    let mut render = object_property(&root, "renderConfig");
+    set_default(&mut render, "destination", Value::String(String::new()));
+    set_default(&mut render, "filename", Value::String(project.name.clone()));
+    set_default(&mut render, "numChannels", Value::from(1));
+    set_default(
+        &mut render,
+        "aspirationFormat",
+        Value::String("noAspiration".into()),
+    );
+    set_default(&mut render, "bitDepth", Value::from(16));
+    set_default(&mut render, "sampleRate", Value::from(44100));
+    set_default(&mut render, "exportMixDown", Value::Bool(true));
+    set_default(&mut render, "exportPitch", Value::Bool(false));
+    root.insert("renderConfig".to_owned(), Value::Object(render));
+    serde_json::to_string_pretty(&Value::Object(root)).map_err(SvpError::Json)
+}
+
+/// Saves a project to disk: multi-line JSON plus the trailing NUL byte
+/// Synthesizer V appends, written atomically via a sibling temporary file
+/// and rename, as in `saveProjectFile`.
+pub fn save(path: &Path, project: &Project) -> Result<()> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut bytes = serialize(project, base_dir)?.into_bytes();
+    bytes.push(0);
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    fs::write(&temporary, &bytes).map_err(|source| SvpError::Io {
+        path: temporary.clone(),
+        source,
+    })?;
+    fs::rename(&temporary, path).map_err(|source| SvpError::Io {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -1574,5 +2019,277 @@ mod tests {
             ),
             other => panic!("expected the audio metadata error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reads_note_style_fields_with_defaults() {
+        let project = parse_value(&sample()).unwrap();
+        for note in &project.tracks[0].main_group.notes {
+            assert_eq!(note.accent, "");
+            assert!(note.instant_mode);
+            assert_eq!(note.musical_type, "singing");
+        }
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["notes"][0]["accent"] = json!("strong");
+        value["tracks"][0]["mainGroup"]["notes"][0]["instantMode"] = json!(false);
+        value["tracks"][0]["mainGroup"]["notes"][0]["musicalType"] = json!("rap");
+        let project = parse_value(&value).unwrap();
+        let note = project.tracks[0]
+            .main_group
+            .notes
+            .iter()
+            .find(|note| note.onset == Q)
+            .unwrap();
+        assert_eq!(note.accent, "strong");
+        assert!(!note.instant_mode);
+        assert_eq!(note.musical_type, "rap");
+        // JSON null parses to void in JUCE, i.e. absent.
+        let mut value = sample();
+        value["tracks"][0]["mainGroup"]["notes"][0]["accent"] = json!(null);
+        value["tracks"][0]["mainGroup"]["notes"][0]["instantMode"] = json!(null);
+        value["tracks"][0]["mainGroup"]["notes"][0]["musicalType"] = json!(null);
+        let project = parse_value(&value).unwrap();
+        let note = &project.tracks[0].main_group.notes[0];
+        assert_eq!(note.accent, "");
+        assert!(note.instant_mode);
+        assert_eq!(note.musical_type, "singing");
+    }
+
+    #[test]
+    fn rejects_malformed_note_style_fields() {
+        let cases = [
+            ("accent", json!(3)),
+            ("instantMode", json!("yes")),
+            ("musicalType", json!(7)),
+        ];
+        for (key, replacement) in cases {
+            let mut value = sample();
+            value["tracks"][0]["mainGroup"]["notes"][0][key] = replacement;
+            assert!(parse_value(&value).is_err(), "{key} should be rejected");
+        }
+    }
+
+    fn round_trip_fixture() -> Value {
+        json!({
+            "version": 153,
+            "vendorRoot": { "a": 1 },
+            "time": {
+                "tempo": [{ "position": 0, "bpm": 100.0, "vendorTempo": "t" }],
+                "meter": [{ "index": 0, "numerator": 3, "denominator": 4, "vendorMeter": 2 }],
+            },
+            "library": [],
+            "tracks": [{
+                "name": "Lead",
+                "vendorTrack": [1, 2],
+                "mainGroup": {
+                    "uuid": "main",
+                    "name": "main",
+                    "vendorGroup": true,
+                    "notes": [{
+                        "onset": 0,
+                        "duration": Q,
+                        "pitch": 60,
+                        "lyrics": "do",
+                        "accent": "strong",
+                        "instantMode": false,
+                        "musicalType": "rap",
+                        "attributes": { "tF0Offset": 1.5, "vendorAttr": "a" },
+                        "systemAttributes": { "vendorSys": 2 },
+                        "vendorNote": "n",
+                    }],
+                    "parameters": {
+                        "pitchDelta": { "mode": "linear", "points": [0, 0.0], "vendorCurve": "c" },
+                        "vendorParam": 7,
+                    },
+                    "vocalModes": {
+                        "Power": 0.5,
+                        "Soft": { "enabled": false, "amount": 0.25, "vendorMode": "m" },
+                    },
+                },
+                "mainRef": {
+                    "groupID": "main",
+                    "blickOffset": 0,
+                    "pitchOffset": 0,
+                    "vendorRef": "r",
+                    "voice": { "vocalModePreset": "p", "vendorVoice": 1 },
+                    "database": { "name": "db", "vendorDb": 1 },
+                    "audio": { "filename": "takes/vocal.wav", "duration": 90.0 },
+                },
+                "groups": [],
+                "mixer": { "gainDecibel": 0.0, "pan": 0.0 },
+                "svVoice": { "databasePath": "", "language": "japanese", "dictionaryDirectory": "" },
+            }],
+        })
+    }
+
+    fn reserialize(project: &Project) -> String {
+        serialize(project, Path::new("/proj")).unwrap()
+    }
+
+    fn reparse(text: &str) -> Project {
+        parse(text.as_bytes(), "song", Path::new("/proj")).unwrap()
+    }
+
+    #[test]
+    fn saving_a_clean_project_adds_exactly_the_cpp_defaults() {
+        let project = parse_value(&sample()).unwrap();
+        let saved = reserialize(&project);
+        let root: Value = serde_json::from_str(&saved).unwrap();
+
+        assert_eq!(root["version"], json!(153));
+        let render = &root["renderConfig"];
+        assert_eq!(
+            render,
+            &json!({
+                "destination": "",
+                "filename": "song",
+                "numChannels": 1,
+                "aspirationFormat": "noAspiration",
+                "bitDepth": 16,
+                "sampleRate": 44100,
+                "exportMixDown": true,
+                "exportPitch": false,
+            })
+        );
+
+        let track = &root["tracks"][0];
+        assert_eq!(track["dispColor"], json!("ff7db235"));
+        assert_eq!(track["dispOrder"], json!(0));
+        assert_eq!(track["renderEnabled"], json!(false));
+        assert_eq!(track["mixer"]["display"], json!(true));
+        assert_eq!(
+            track["svVoice"],
+            json!({
+                "databasePath": "voices/a.nofs",
+                "language": "english",
+                "dictionaryDirectory": "",
+            })
+        );
+
+        // Notes are sorted by onset: the "do" note (detune 12.5) comes first.
+        let note = &track["mainGroup"]["notes"][0];
+        assert_eq!(note["lyrics"], json!("do"));
+        assert_eq!(note["musicalType"], json!("singing"));
+        assert_eq!(note["accent"], json!(""));
+        assert_eq!(note["instantMode"], json!(true));
+        assert_eq!(note["attributes"]["evenSyllableDuration"], json!(true));
+        assert_eq!(note["pitchTakes"]["takes"][0]["liked"], json!(false));
+        assert_eq!(note["timbreTakes"]["activeTakeId"], json!(0));
+        assert!(note.get("systemAttributes").is_none());
+
+        let parameters = &track["mainGroup"]["parameters"];
+        for name in [
+            "loudness",
+            "tension",
+            "breathiness",
+            "voicing",
+            "gender",
+            "toneShift",
+        ] {
+            assert_eq!(
+                parameters[name],
+                json!({ "mode": "cubic", "points": [] }),
+                "{name} should gain the C++ default curve"
+            );
+        }
+
+        let reference = &track["groups"][0];
+        assert_eq!(reference["database"]["version"], json!("-2"));
+        assert_eq!(reference["database"]["name"], json!(""));
+        assert_eq!(reference["dictionary"], json!(""));
+        assert_eq!(reference["voice"]["vocalModeInherited"], json!(true));
+        assert_eq!(reference["voice"]["vocalModeParams"], json!({}));
+        assert_eq!(
+            reference["systemPitchDelta"],
+            json!({ "mode": "cubic", "points": [] })
+        );
+        assert!(reference.get("audio").is_none());
+
+        // Handled values survive the trip.
+        let back = reparse(&saved);
+        let back_note = &back.tracks[0].main_group.notes[0];
+        assert_eq!(back_note.lyrics, "do");
+        assert_eq!(back_note.detune, 12.5);
+        assert_eq!(back.tempo_map.tempo_at(0), 100.0);
+        assert_eq!(back.tracks[0].voice.language, Language::English);
+        assert!((back.tracks[0].mixer.gain - 0.501_187).abs() < 1e-5);
+    }
+
+    #[test]
+    fn save_is_a_fixed_point() {
+        let first = parse_value(&round_trip_fixture()).unwrap();
+        assert_eq!(first.tracks[0].main_group.notes[0].accent, "strong");
+        assert!(!first.tracks[0].main_group.notes[0].instant_mode);
+        assert_eq!(first.tracks[0].main_group.notes[0].musical_type, "rap");
+        assert_eq!(
+            first.tracks[0].main_ref.audio_file.as_deref(),
+            Some(Path::new("/proj/takes/vocal.wav"))
+        );
+
+        let saved_once = reserialize(&first);
+        let second = reparse(&saved_once);
+        // Style fields, vendor blobs, and the backing-track path survive.
+        assert_eq!(second.tracks[0].main_group.notes[0].accent, "strong");
+        assert!(!second.tracks[0].main_group.notes[0].instant_mode);
+        assert_eq!(second.tracks[0].main_group.notes[0].musical_type, "rap");
+        assert_eq!(
+            second.tracks[0].main_ref.audio_file.as_deref(),
+            Some(Path::new("/proj/takes/vocal.wav"))
+        );
+        assert_eq!(
+            second.tracks[0].main_ref.voice_pitch.extra.json(),
+            r#"{"vendorVoice":1}"#
+        );
+
+        // One cycle is semantically stable; the second cycle is byte-stable
+        // too. (Handled keys appended after retained vendor keys change key
+        // order on the first save, exactly as the C++ `set` calls do, so
+        // byte-identity only holds from the second save on.)
+        let saved_twice = reserialize(&second);
+        let as_value = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        assert_eq!(as_value(&saved_once), as_value(&saved_twice));
+        let third = reparse(&saved_twice);
+        assert_eq!(second.tracks, third.tracks);
+        assert_eq!(second.library, third.library);
+        assert_eq!(second.tempo_map, third.tempo_map);
+        assert_eq!(reserialize(&third), saved_twice);
+
+        // Vendor blobs survive both trips verbatim.
+        let root = as_value(&saved_twice);
+        assert_eq!(root["vendorRoot"], json!({ "a": 1 }));
+        assert_eq!(root["tracks"][0]["vendorTrack"], json!([1, 2]));
+        let group = &root["tracks"][0]["mainGroup"];
+        assert_eq!(group["vendorGroup"], json!(true));
+        assert_eq!(group["parameters"]["pitchDelta"]["vendorCurve"], json!("c"));
+        assert_eq!(group["notes"][0]["vendorNote"], json!("n"));
+        assert_eq!(group["notes"][0]["attributes"]["vendorAttr"], json!("a"));
+        assert_eq!(
+            root["tracks"][0]["mainRef"]["database"]["vendorDb"],
+            json!(1)
+        );
+        assert_eq!(
+            root["tracks"][0]["mainRef"]["audio"],
+            json!({ "filename": "takes/vocal.wav", "duration": 90.0 })
+        );
+    }
+
+    #[test]
+    fn save_writes_a_nul_terminated_file_atomically() {
+        let project = parse_value(&sample()).unwrap();
+        let dir = std::env::temp_dir().join(format!("opensvr-svp-save-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.svp");
+        save(&path, &project).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.last(), Some(&0));
+        let mut orphan = path.as_os_str().to_owned();
+        orphan.push(".tmp");
+        assert!(!Path::new(&orphan).exists());
+
+        let back = load(&path).unwrap();
+        assert_eq!(back.name, "song");
+        assert_eq!(back.tracks[0].main_group.notes.len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
