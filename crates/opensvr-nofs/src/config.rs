@@ -205,6 +205,8 @@ fn is_text(bytes: &[u8]) -> bool {
         && std::str::from_utf8(bytes).is_ok()
 }
 
+/// Sequential table decoder; kept whole so error offsets stay in one reviewable pass.
+#[allow(clippy::too_many_lines)]
 fn parse_configuration(bytes: &[u8], entries: &mut Vec<VoiceConfigurationEntry>) -> Result<()> {
     if bytes.len() < 8 || bytes.len() > MAXIMUM_CONFIGURATION_BYTES {
         return Err(invalid(
