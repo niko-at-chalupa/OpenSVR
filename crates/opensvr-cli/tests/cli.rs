@@ -345,6 +345,76 @@ fn convert_uses_the_documented_exit_codes() {
 }
 
 #[test]
+fn flat_render_matches_the_subcommand() {
+    let flat = scratch("flat.wav");
+    let plain = scratch("flat-plain.wav");
+    let flat_output = opensvr(&[
+        EXAMPLE,
+        "-o",
+        flat.to_str().unwrap(),
+        "--rate",
+        "22050",
+        "-q",
+    ]);
+    assert_eq!(
+        flat_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&flat_output.stderr)
+    );
+    let plain_output = opensvr(&[
+        "render",
+        EXAMPLE,
+        "-o",
+        plain.to_str().unwrap(),
+        "--rate",
+        "22050",
+        "-q",
+    ]);
+    assert_eq!(
+        plain_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&plain_output.stderr)
+    );
+    assert_eq!(fs::read(&flat).unwrap(), fs::read(&plain).unwrap());
+    fs::remove_file(flat).unwrap();
+    fs::remove_file(plain).unwrap();
+}
+
+#[test]
+fn flat_info_matches_the_subcommand() {
+    let flat = opensvr(&[EXAMPLE, "--info"]);
+    let plain = opensvr(&["info", EXAMPLE]);
+    assert_eq!(flat.status.code(), Some(0));
+    assert_eq!(plain.status.code(), Some(0));
+    assert_eq!(flat.stdout, plain.stdout);
+}
+
+#[test]
+fn flat_failures_exit_with_usage_errors() {
+    // C++ texts, same exit status as the subcommand usage errors.
+    let missing_output = opensvr(&[EXAMPLE]);
+    assert_eq!(missing_output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&missing_output.stderr).contains("no output file given (use -o)")
+    );
+    let unknown = opensvr(&[EXAMPLE, "-o", "out.wav", "--frobnicate"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown option --frobnicate"));
+    let extra = opensvr(&[EXAMPLE, "extra.svp", "-o", "out.wav"]);
+    assert_eq!(extra.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&extra.stderr).contains("unexpected extra argument extra.svp"));
+    // The bare binary has no input project.
+    assert_eq!(opensvr(&[]).status.code(), Some(1));
+    // Top-level help still documents the subcommands.
+    let help = opensvr(&["--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("render") && text.contains("info"));
+}
+
+#[test]
 fn failures_use_the_documented_exit_codes() {
     assert_eq!(opensvr(&[]).status.code(), Some(1), "usage error");
     assert_eq!(
