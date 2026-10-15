@@ -311,6 +311,12 @@ pub struct GroupReference {
     pub end: Option<Blick>,
     /// An instrumental (audio backing) reference carries no singing notes.
     pub instrumental: bool,
+    /// Backing-track file for an instrumental reference, resolved against the
+    /// project directory (`audioFile` in `src/core/Project.h`; `None` when
+    /// the `audio` block is absent or its filename is empty).
+    pub audio_file: Option<PathBuf>,
+    /// Backing-track length in seconds (`audioDurationSeconds`, `0.0` by default).
+    pub audio_duration_seconds: f64,
     /// If true, inherit vocal-mode settings from the parent track.
     pub vocal_mode_inherited: bool,
     /// Name of the applied vocal-mode preset.
@@ -330,6 +336,8 @@ impl Default for GroupReference {
             begin: 0,
             end: None,
             instrumental: false,
+            audio_file: None,
+            audio_duration_seconds: 0.0,
             vocal_mode_inherited: true,
             vocal_mode_preset: String::new(),
             vocal_mode_params: BTreeMap::new(),
