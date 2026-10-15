@@ -13,10 +13,21 @@ const NEURAL_BASIC: &str = concat!(
 );
 
 fn opensvr(arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_opensvr"))
+    // Hermetic by default: ambient OPENSVR_VOICE/OPENSVR_DICT must not leak
+    // into assertions about project-file paths (use `opensvr_env` to set them).
+    opensvr_env(arguments, &[])
+}
+
+fn opensvr_env(arguments: &[&str], vars: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_opensvr"));
+    command
         .args(arguments)
-        .output()
-        .expect("the binary runs")
+        .env_remove("OPENSVR_VOICE")
+        .env_remove("OPENSVR_DICT");
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    command.output().expect("the binary runs")
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -389,6 +400,67 @@ fn flat_info_matches_the_subcommand() {
     assert_eq!(flat.status.code(), Some(0));
     assert_eq!(plain.status.code(), Some(0));
     assert_eq!(flat.stdout, plain.stdout);
+}
+
+#[test]
+fn env_vars_default_the_overrides_on_every_track() {
+    let vars = &[
+        ("OPENSVR_VOICE", "/env/voice.nofs"),
+        ("OPENSVR_DICT", "/env/dicts"),
+    ];
+    let output = opensvr_env(&["info", EXAMPLE], vars);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    // Both tracks pick the env paths up; neither exists, so both are flagged.
+    assert_eq!(
+        text.matches("/env/voice.nofs  [MISSING]").count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(text.matches("/env/dicts  [MISSING]").count(), 2, "{text}");
+    // The project file's own voice path is gone, overridden on every track.
+    assert!(!text.contains("voices/example/voice.nofs"), "{text}");
+}
+
+#[test]
+fn explicit_flags_beat_env_vars() {
+    let output = opensvr_env(
+        &["info", EXAMPLE, "--voice", "/flag/voice.nofs"],
+        &[("OPENSVR_VOICE", "/env/voice.nofs")],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text.matches("/flag/voice.nofs  [MISSING]").count(),
+        2,
+        "{text}"
+    );
+    assert!(!text.contains("/env/voice.nofs"), "{text}");
+}
+
+#[test]
+fn empty_env_values_count_as_unset() {
+    let output = opensvr_env(
+        &["info", EXAMPLE],
+        &[("OPENSVR_VOICE", ""), ("OPENSVR_DICT", "")],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let plain = opensvr(&["info", EXAMPLE]);
+    assert_eq!(output.stdout, plain.stdout);
+}
+
+#[test]
+fn flat_form_honors_env_vars() {
+    let vars = &[("OPENSVR_VOICE", "/env/voice.nofs")];
+    let flat = opensvr_env(&[EXAMPLE, "--info"], vars);
+    let plain = opensvr_env(&["info", EXAMPLE], vars);
+    assert_eq!(flat.status.code(), Some(0));
+    assert_eq!(flat.stdout, plain.stdout);
+    assert!(
+        String::from_utf8(flat.stdout)
+            .unwrap()
+            .contains("/env/voice.nofs")
+    );
 }
 
 #[test]

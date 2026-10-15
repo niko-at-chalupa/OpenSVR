@@ -8,6 +8,7 @@ use opensvr_core::Language;
 
 const AFTER_HELP: &str = "\
 Voice databases and dictionaries are not bundled; point to files you own.
+OPENSVR_VOICE and OPENSVR_DICT default --voice and --dict when those flags are absent; explicit flags win.
 Exit codes: 0 ok, 1 usage error, 2 load error, 3 render/write error, 130 cancelled.";
 
 #[derive(Debug, Parser)]
@@ -30,12 +31,16 @@ pub enum Command {
 }
 
 /// Settings that replace what the project file says, on every track.
+///
+/// Each path falls back to its environment variable (`OPENSVR_VOICE`,
+/// `OPENSVR_DICT`) when the flag is absent; explicit flags win, and empty
+/// env values count as unset.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct Overrides {
-    /// Use this voice database on every track
+    /// Use this voice database on every track (default: OPENSVR_VOICE)
     #[arg(long, value_name = "VOICE.NOFS")]
     pub voice: Option<PathBuf>,
-    /// Use this pronunciation dictionary directory on every track
+    /// Use this pronunciation dictionary directory on every track (default: OPENSVR_DICT)
     #[arg(long, value_name = "CLF-DATA")]
     pub dict: Option<PathBuf>,
     /// Override the singing language on every track (japanese, mandarin, english, cantonese, spanish)
