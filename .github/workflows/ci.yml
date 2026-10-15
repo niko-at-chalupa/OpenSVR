@@ -1,0 +1,45 @@
+# CI for OpenSVR.
+#
+# Why a plain matrix instead of `cargo dist`: releases stay manual (no tags
+# are cut by automation and nothing publishes), so there is no release
+# pipeline to drive; `cargo dist` would add installers plus a config to
+# maintain for no current gain. Revisit it when publishing GitHub Releases
+# becomes routine. This workflow only tests, lints, and uploads binaries.
+#
+# Clippy stance: `-D clippy::correctness` denies likely-bug lints and is
+# green workspace-wide. Full `-D warnings` is NOT used: the style/pedantic
+# backlog (e.g. `opensvr-dnni`, `opensvr-g2p`) still warns and cleaning it
+# is its own generation, not release work. Pedantic lints stay warn-only
+# until that cleanup lands; do not widen this gate by accident.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Lint (correctness only; see the header comment)
+        run: cargo clippy --workspace --all-targets -- -D clippy::correctness
+      - name: Build release binaries
+        run: cargo build --release --locked -p opensvr-cli
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensvr-${{ matrix.os }}
+          path: |
+            target/release/opensvr
+            target/release/opensvr.exe
+            crates/opensvr-cli/opensvr.1
