@@ -1,6 +1,6 @@
 use std::f64::consts::TAU;
 
-use opensvr_core::{CancelToken, VoiceSettings};
+use opensvr_core::{CancelToken, GroupReference, Note, NoteGroup, TempoMap, VoiceSettings};
 use thiserror::Error;
 
 use crate::{Phrase, REST_CONTEXT_SECONDS};
@@ -18,6 +18,18 @@ pub struct TimedNote<'a> {
     pub lyrics: &'a str,
     /// Explicit phoneme override; empty when the lyrics should be looked up.
     pub phonemes: &'a str,
+    /// The score note, for pitch attributes, instant mode and musical type.
+    pub note: &'a Note,
+    /// The placing group, for `pitchDelta`/`vibratoEnv` curves and vocal modes.
+    pub group: &'a NoteGroup,
+    /// The placing reference, for curve time offsets and voice/vocal defaults.
+    pub reference: &'a GroupReference,
+    /// The track's main reference, resolving vocal-mode inheritance exactly as
+    /// OpenSV's `buildVocalModeWeights` does (`settings == &track.mainRef`).
+    pub main_reference: &'a GroupReference,
+    /// The project tempo map, converting frame seconds back to blick
+    /// positions for curve sampling.
+    pub tempo_map: &'a TempoMap,
     /// Start of the placing group reference's crop window, in seconds.
     ///
     /// Backends keep the full model-input context (onset consonants live in
@@ -130,6 +142,26 @@ impl VoiceBackend for ToneBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opensvr_core::{Note, PitchAttributes};
+
+    static NOTE: std::sync::LazyLock<Note> = std::sync::LazyLock::new(|| Note {
+        onset: 0,
+        duration: 1,
+        pitch: 60,
+        lyrics: "la".into(),
+        phonemes: String::new(),
+        detune: 0.0,
+        instant_mode: true,
+        musical_type: "singing".into(),
+        accent: String::new(),
+        attributes: PitchAttributes::default(),
+        system_attributes: PitchAttributes::default(),
+        extra: opensvr_core::Extra::default(),
+    });
+    static GROUP: std::sync::LazyLock<NoteGroup> = std::sync::LazyLock::new(NoteGroup::default);
+    static REFERENCE: std::sync::LazyLock<GroupReference> =
+        std::sync::LazyLock::new(GroupReference::default);
+    static TEMPO: std::sync::LazyLock<TempoMap> = std::sync::LazyLock::new(TempoMap::default);
 
     fn note(start: f64, end: f64, pitch: u8) -> TimedNote<'static> {
         TimedNote {
@@ -140,6 +172,11 @@ mod tests {
             seconds_per_quarter: 0.5,
             lyrics: "la",
             phonemes: "",
+            note: &NOTE,
+            group: &GROUP,
+            reference: &REFERENCE,
+            main_reference: &REFERENCE,
+            tempo_map: &TEMPO,
             window_start: 0.0,
             window_end: None,
         }

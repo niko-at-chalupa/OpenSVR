@@ -223,7 +223,7 @@ impl<B: VoiceBackend + Sync> Renderer<B> {
         // workers re-split identically when they sing.
         let total = work
             .iter()
-            .map(|(_, placed)| split_phrases(&timed_notes(project, placed)).len())
+            .map(|(track, placed)| split_phrases(&timed_notes(project, track, placed)).len())
             .sum();
         let completed = std::sync::atomic::AtomicUsize::new(0);
         let order = std::sync::Mutex::new(());
@@ -336,7 +336,7 @@ fn sing_track<B: VoiceBackend>(
     cancel: &CancelToken,
     reporter: &Reporter<'_>,
 ) -> Result<Vec<SungPhrase>, RenderError> {
-    let notes = timed_notes(project, placed);
+    let notes = timed_notes(project, track, placed);
     let backend_error = |source| RenderError::Backend {
         track: track.name.clone(),
         source,
@@ -374,7 +374,11 @@ fn is_audible(mixer: &Mixer, has_solo: bool) -> bool {
     !mixer.mute && (!has_solo || mixer.solo) && mixer.gain != 0.0
 }
 
-fn timed_notes<'a>(project: &Project, placed: &[PlacedNote<'a>]) -> Vec<TimedNote<'a>> {
+fn timed_notes<'a>(
+    project: &'a Project,
+    track: &'a Track,
+    placed: &[PlacedNote<'a>],
+) -> Vec<TimedNote<'a>> {
     let seconds = |position| project.tempo_map.blick_to_seconds(position);
     placed
         .iter()
@@ -386,6 +390,11 @@ fn timed_notes<'a>(project: &Project, placed: &[PlacedNote<'a>]) -> Vec<TimedNot
             seconds_per_quarter: 60.0 / project.tempo_map.tempo_at(placed.start),
             lyrics: &placed.note.lyrics,
             phonemes: &placed.note.phonemes,
+            note: placed.note,
+            group: placed.group,
+            reference: placed.reference,
+            main_reference: &track.main_ref,
+            tempo_map: &project.tempo_map,
             window_start: seconds(placed.window_start),
             window_end: placed.window_end.map(seconds),
         })

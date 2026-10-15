@@ -6,8 +6,10 @@
 //! the next-legato lookahead), inter-note gaps become `sil` syllables, timing
 //! predicts durations, [`quantize_phoneme_durations`][opensvr_voice::quantize_phoneme_durations]
 //! snaps them to the acoustic grid, [`merge_continuation_phones`][crate::merge_continuation_phones]
-//! folds legato repeats, pitch predicts the automatic curve, [`build_log_f0`][crate::build_log_f0]
-//! assembles log-F0, and `render` (seed 5489, default vocal-mode weights) sings
+//! folds legato repeats, pitch predicts the automatic curve (shaped by the
+//! phrase's `vibratoEnv` envelope), [`build_log_f0`][crate::build_log_f0]
+//! assembles log-F0 (attributes, `pitchDelta` cents, envelope-scaled vibrato),
+//! and `render` (seed 5489, per-phrase vocal-mode weights) sings
 //! native-rate audio that is resampled to the project rate.
 //!
 //! Voice databases load once per file from `VoiceSettings::database` into an
@@ -30,7 +32,9 @@ use opensvr_voice::{
 };
 
 use crate::cache::{DictionaryCache, DictionaryKey, FileStamp, PhraseCache, VoiceCache};
-use crate::pitch::{build_log_f0, merge_continuation_phones};
+use crate::pitch::{
+    build_log_f0, build_vibrato_envelope, build_vocal_mode_weights, merge_continuation_phones,
+};
 use crate::resample::resample_mono;
 use crate::{BackendError, Phrase, PhraseAudio, REST_CONTEXT_SECONDS, VoiceBackend};
 
@@ -352,8 +356,16 @@ impl VoiceBackend for NeuralBackend {
         })?;
         let synthesis = predict_phrase(&synthesizer, &inputs, phrase.notes, start_seconds, cancel)?;
 
-        // Empty vibrato envelope means unity; empty vocal-mode weights mean defaults.
-        let vocal_mode_weights: Vec<f32> = Vec::new();
+        // Empty vocal-mode weights mean the database default style; a phrase
+        // with modes produces per-frame weights that join the phrase cache
+        // key, so a mode change misses the modeless entry.
+        let vocal_mode_weights = build_vocal_mode_weights(
+            phrase.notes,
+            start_seconds,
+            synthesizer.frame_interval_seconds(),
+            synthesis.log_f0.len(),
+            synthesizer.vocal_mode_names(),
+        )?;
         if let Some((native_rate, native)) = lock_cache(&self.phrases).lookup(
             &voice_stamp,
             &inputs.syllables,
@@ -427,7 +439,18 @@ fn predict_phrase(
         ));
     }
 
-    // Empty vibrato envelope means unity.
+    // The pitch model hears the same `vibratoEnv` envelope the F0 assembly
+    // uses, sampled onto its own grid (all ones when the phrase has no
+    // curves, which the model treats exactly like the previous empty input).
+    let first = notes.first().expect("phrases are never empty");
+    let pitch_start = first.start - PITCH_CONTEXT_SECONDS;
+    let pitch_interval = synthesizer.pitch_frame_interval_seconds();
+    let pitch_duration =
+        notes.last().expect("phrases are never empty").end - first.start + 2.0 * PITCH_CONTEXT_SECONDS;
+    let pitch_envelope_count =
+        (pitch_duration / f64::from(pitch_interval)).ceil() as usize + 2;
+    let pitch_envelope =
+        build_vibrato_envelope(notes, pitch_start, pitch_interval, pitch_envelope_count);
     let mut automatic_pitch = Vec::new();
     synthesizer
         .predict_pitch(
@@ -436,17 +459,16 @@ fn predict_phrase(
             cancel,
             None,
             None,
-            &[],
+            &pitch_envelope,
         )
         .map_err(|error| backend_error(error.to_string()))?;
-    let first = notes.first().expect("phrases are never empty");
     let log_f0 = build_log_f0(
         notes,
         start_seconds,
         frame_interval,
         frame_count,
         &automatic_pitch,
-        first.start - PITCH_CONTEXT_SECONDS,
+        pitch_start,
         synthesizer.pitch_frame_interval_seconds(),
     )?;
     Ok(PhraseSynthesis { timed, log_f0 })
@@ -481,9 +503,29 @@ fn render_native(
 
 #[cfg(test)]
 mod tests {
+    use opensvr_core::{Extra, GroupReference, Note, NoteGroup, PitchAttributes, TempoMap};
     use opensvr_g2p::PhonemeDictionary;
 
     use super::*;
+
+    static SCORE: std::sync::LazyLock<Note> = std::sync::LazyLock::new(|| Note {
+        onset: 0,
+        duration: 1,
+        pitch: 60,
+        lyrics: "la".into(),
+        phonemes: String::new(),
+        detune: 0.0,
+        instant_mode: true,
+        musical_type: "singing".into(),
+        accent: String::new(),
+        attributes: PitchAttributes::default(),
+        system_attributes: PitchAttributes::default(),
+        extra: Extra::default(),
+    });
+    static GROUP: std::sync::LazyLock<NoteGroup> = std::sync::LazyLock::new(NoteGroup::default);
+    static REFERENCE: std::sync::LazyLock<GroupReference> =
+        std::sync::LazyLock::new(GroupReference::default);
+    static TEMPO: std::sync::LazyLock<TempoMap> = std::sync::LazyLock::new(TempoMap::default);
 
     fn parse_generic(phones: &str, dict: &str) -> PhonemeDictionary {
         PhonemeDictionary::parse(
@@ -516,6 +558,11 @@ mod tests {
             seconds_per_quarter: 0.5,
             lyrics,
             phonemes: "",
+            note: &SCORE,
+            group: &GROUP,
+            reference: &REFERENCE,
+            main_reference: &REFERENCE,
+            tempo_map: &TEMPO,
             window_start: 0.0,
             window_end: None,
         }
