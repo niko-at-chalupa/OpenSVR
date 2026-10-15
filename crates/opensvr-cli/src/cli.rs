@@ -17,7 +17,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// List tracks, voices and whether their files exist
     Info(InfoArgs),
@@ -30,7 +30,7 @@ pub enum Command {
 }
 
 /// Settings that replace what the project file says, on every track.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct Overrides {
     /// Use this voice database on every track
     #[arg(long, value_name = "VOICE.NOFS")]
@@ -43,7 +43,7 @@ pub struct Overrides {
     pub language: Option<Language>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct InfoArgs {
     /// The .svp project to read
     pub project: PathBuf,
@@ -54,7 +54,7 @@ pub struct InfoArgs {
     pub phonemes: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct RenderArgs {
     /// The .svp project to render
     pub project: PathBuf,
@@ -76,7 +76,7 @@ pub struct RenderArgs {
     pub quiet: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct MidiArgs {
     /// The .svp project to read
     pub project: PathBuf,
@@ -85,7 +85,7 @@ pub struct MidiArgs {
     pub output: PathBuf,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ConvertArgs {
     /// Input project (.svp or .mid)
     pub input: PathBuf,
