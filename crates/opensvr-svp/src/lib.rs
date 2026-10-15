@@ -49,7 +49,7 @@ fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(SvpError::Invalid(message.into()))
 }
 
-/// Loads a project from disk. Relative voice and dictionary paths resolve against the file's directory.
+/// Loads a project from disk. Relative voice, dictionary, and backing-track paths resolve against the file's directory.
 pub fn load(path: &Path) -> Result<Project> {
     let bytes = fs::read(path).map_err(|source| SvpError::Io {
         path: path.to_owned(),
@@ -258,6 +258,12 @@ struct RawReference {
     blick_absolute_end: i64,
     #[serde(default)]
     is_instrumental: bool,
+    /// Reference `audio` backing-track metadata (`filename`, `duration`).
+    /// Kept as [`Value`] so a malformed block is the single `Invalid` error
+    /// OpenSV's `readReference` reports, rather than a JSON error;
+    /// absent/null means defaults.
+    #[serde(default)]
+    audio: Option<Value>,
     /// Reference `voice` overrides (`vocalModeInherited`, `vocalModePreset`,
     /// `vocalModeParams`). Kept as [`Value`] so a non-object is an `Invalid`
     /// error like the C++ block; absent/null means defaults.
@@ -503,6 +509,36 @@ fn read_voice_overrides(raw: Option<&Value>) -> Result<(bool, String, BTreeMap<S
     Ok((inherited, preset, params))
 }
 
+/// Reads the `audio` backing-track metadata of a group reference exactly like
+/// the `audio` block of OpenSV's `readReference` (`src/core/ProjectFile.cpp`):
+/// absent (or JSON null, which JUCE parses to void) keeps the defaults
+/// (`None`, `0.0`); otherwise the value must be an object with a string
+/// `filename` and a finite `duration >= 0.0`, else one shared `Invalid`
+/// error. A non-empty filename resolves against the project directory, while
+/// an empty one stays unset, as in the C++.
+fn read_audio(raw: Option<&Value>, base_dir: &Path) -> Result<(Option<PathBuf>, f64)> {
+    let Some(raw) = raw else {
+        return Ok((None, 0.0));
+    };
+    if raw.is_null() {
+        return Ok((None, 0.0));
+    }
+    let invalid_audio = || invalid("an instrumental reference has invalid audio metadata.");
+    let Value::Object(audio) = raw else {
+        return invalid_audio();
+    };
+    let Some(Value::String(filename)) = audio.get("filename") else {
+        return invalid_audio();
+    };
+    let Some(duration) = audio.get("duration").and_then(Value::as_f64) else {
+        return invalid_audio();
+    };
+    if !duration.is_finite() || duration < 0.0 {
+        return invalid_audio();
+    }
+    Ok((resolve(base_dir, filename), duration))
+}
+
 /// Reads pitch/vibrato attributes exactly like OpenSV's `readPitchAttributes`
 /// in `src/core/ProjectFile.cpp`: absent (or JSON null, which JUCE parses to
 /// void) keeps the defaults; a non-object is an error; each present field
@@ -622,7 +658,7 @@ fn read_curve_inner(raw: Option<RawCurve>, name: &str, normalise: bool) -> Resul
 }
 
 impl RawReference {
-    fn into_reference(self) -> Result<GroupReference> {
+    fn into_reference(self, base_dir: &Path) -> Result<GroupReference> {
         let pitch_offset = i32::try_from(self.pitch_offset)
             .ok()
             .filter(|offset| (-127..=127).contains(offset));
@@ -642,6 +678,9 @@ impl RawReference {
         // Reference pitch attributes come from the SAME `voice` object, which
         // doubles as the `voicePitch` container in the C++ `readReference`.
         let voice_pitch = read_pitch_attributes(self.voice.as_ref(), "reference voice")?;
+        // Backing-track metadata is read regardless of the instrumental flag,
+        // as in the C++: the `audio` block sits outside any such check.
+        let (audio_file, audio_duration_seconds) = read_audio(self.audio.as_ref(), base_dir)?;
         Ok(GroupReference {
             group_id: self.group_id,
             time_offset: blick(self.blick_offset, "a group offset")?,
@@ -649,6 +688,8 @@ impl RawReference {
             begin,
             end,
             instrumental: self.is_instrumental,
+            audio_file,
+            audio_duration_seconds,
             vocal_mode_inherited,
             vocal_mode_preset,
             vocal_mode_params,
@@ -672,7 +713,7 @@ impl RawTrack {
         };
 
         let main_group = self.main_group.into_group()?;
-        let main_ref = self.main_ref.into_reference()?;
+        let main_ref = self.main_ref.into_reference(base_dir)?;
         if main_ref.group_id != main_group.id {
             return invalid("a track's mainRef does not refer to its mainGroup");
         }
@@ -690,7 +731,7 @@ impl RawTrack {
             groups: self
                 .groups
                 .into_iter()
-                .map(RawReference::into_reference)
+                .map(|reference| reference.into_reference(base_dir))
                 .collect::<Result<_>>()?,
             mixer: Mixer {
                 gain,
@@ -1181,6 +1222,75 @@ mod tests {
                 parse_value(&value).is_err(),
                 "malformed voice overrides should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn loads_reference_audio_metadata() {
+        // A full `audio` object loads on both instrumental and singing
+        // references (the C++ block sits outside any instrumental check);
+        // integer durations count, like C++ `isNumber`.
+        for instrumental in [false, true] {
+            let mut value = sample();
+            value["tracks"][0]["groups"][0]["isInstrumental"] = json!(instrumental);
+            value["tracks"][0]["groups"][0]["audio"] =
+                json!({ "filename": "takes/vocal.wav", "duration": 90 });
+            let project = parse_value(&value).unwrap();
+            let reference = &project.tracks[0].groups[0];
+            assert_eq!(reference.instrumental, instrumental);
+            assert_eq!(
+                reference.audio_file.as_deref(),
+                Some(Path::new("/proj/takes/vocal.wav"))
+            );
+            assert_eq!(reference.audio_duration_seconds, 90.0);
+        }
+        // Absent and null `audio` keep the defaults; an empty filename stays
+        // unset while still requiring a valid duration.
+        let project = parse_value(&sample()).unwrap();
+        assert_eq!(project.tracks[0].groups[0].audio_file, None);
+        assert_eq!(project.tracks[0].groups[0].audio_duration_seconds, 0.0);
+        let mut value = sample();
+        value["tracks"][0]["groups"][0]["audio"] = json!(null);
+        let project = parse_value(&value).unwrap();
+        assert_eq!(project.tracks[0].groups[0].audio_file, None);
+        let mut value = sample();
+        value["tracks"][0]["groups"][0]["audio"] = json!({ "filename": "", "duration": 12.5 });
+        let project = parse_value(&value).unwrap();
+        assert_eq!(project.tracks[0].groups[0].audio_file, None);
+        assert_eq!(project.tracks[0].groups[0].audio_duration_seconds, 12.5);
+    }
+
+    #[test]
+    fn rejects_malformed_reference_audio() {
+        // Every malformed shape is the single error OpenSV's `readReference`
+        // reports. `duration` is required: C++ `readNumber` fails on a void
+        // (missing or null) value.
+        let bad_audio = [
+            json!(5.0),
+            json!("take.wav"),
+            json!({ "duration": 90.0 }),
+            json!({ "filename": 3 }),
+            json!({ "filename": "take.wav" }),
+            json!({ "filename": "take.wav", "duration": "long" }),
+            json!({ "filename": "take.wav", "duration": null }),
+            json!({ "filename": "take.wav", "duration": -1.0 }),
+        ];
+        for bad in bad_audio {
+            let mut value = sample();
+            value["tracks"][0]["groups"][0]["audio"] = bad;
+            assert!(
+                parse_value(&value).is_err(),
+                "malformed reference audio should be rejected"
+            );
+        }
+        let mut value = sample();
+        value["tracks"][0]["groups"][0]["audio"] = json!({ "filename": 3, "duration": 1.0 });
+        match parse_value(&value) {
+            Err(SvpError::Invalid(message)) => assert_eq!(
+                message,
+                "an instrumental reference has invalid audio metadata."
+            ),
+            other => panic!("expected the audio metadata error, got {other:?}"),
         }
     }
 }
