@@ -27,37 +27,46 @@ from relaxed numerics.
 | Mixer, pan law, solo/mute | `ProjectRenderer::mixPhrase` | `opensvr-audio::render` | done |
 | WAV output | `audio/WaveFile.cpp` | `opensvr-audio::wav` | done |
 | CLI | `cli/Main.cpp` | `opensvr-cli` | done, with subcommands instead of flat flags |
-| Voice synthesis | `synthesis/*` (10.4k lines) | `VoiceBackend` trait + `ToneBackend`, `opensvr-nofs` (NOFS + voice config), `opensvr-dnni` (DNNI reader + blocked-SIMD inference with incremental cache) | **partial: database, model-file reads and neural inference done, voice stages not started** |
-| Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done (dictionary + resolution + `info --phonemes`; timing model types only) |
-| Phrase building, pitch/vibrato, caching | `ProjectRenderer.cpp` (1.6k lines) | one phrase per track | **simplified** |
+| Voice synthesis | `synthesis/*` (10.4k lines) | `opensvr-voice` (timing, pitch, acoustic, vocoder, `VoiceSynthesizer`), `opensvr-nofs`, `opensvr-dnni` | done (neural `NeuralBackend` sings voiced tracks; `ToneBackend` stays as the voiceless fallback) |
+| Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done (dictionary + resolution + `info --phonemes`; timing types live here, the duration model in `opensvr-voice`) |
+| Phrase building, pitch/vibrato, caching | `ProjectRenderer.cpp` (1.6k lines) | `opensvr-audio` (phrase splitting, `buildPitch`/vibrato/vocal-mode weights, voice/dictionary/phrase caches) | done |
 | Editor GUI | `ui/*`, `app/*`, `audio/PreviewEngine.*` (5.6k lines) | none | out of scope |
 
-`opensvr render` currently sings sine tones. The pipeline around the voice is real and tested,
-so every step below replaces a stub with the real thing without changing the CLI.
+`opensvr render` sings through the neural voice when a voice database resolves,
+and falls back to sine tones otherwise. Every phase below is ported; only
+small gaps remain (see "Remaining gaps").
 
-## What to do next
+## What was done
 
-Phase 2 (NOFS + voice config) is done and `opensvr info` shows singer metadata.
-The `opensvr-dnni` reader is also done and parses all 4 real model entries
-(a `prim0` matrix matches an independent decode exactly).
-The dictionary + `resolvePhonemes` half of Phase 3 is done too: `opensvr-g2p`
-ports `PhoneSet` (DNNI `_psv2`), `PhonemeDictionary` (all five language
-pipelines) and `resolvePhonemes` with the `+`/`-` sequencing around it, and
-`opensvr info --phonemes` prints resolved phonemes per note.
-The next PRs, in order:
+Every phase below is ported, in the listed order, one PR-sized branch per
+stage. Phase 2 (NOFS + voice config) lets `opensvr info` show singer metadata.
+The `opensvr-dnni` reader parses all real model entries, scalar inference
+matches per-op golden tensors, and blocked-`[f32; 16]` weights plus the
+incremental dirty-range `Cache` keep those goldens green. The dictionary +
+`resolvePhonemes` half of Phase 3 became `opensvr-g2p`, and
+`opensvr info --phonemes` prints resolved phonemes per note. Phase 5 landed
+stage by stage (timing → pitch → acoustic → vocoder) behind `VoiceSynthesizer`,
+each gated on golden files from the previous stage's output, and Phase 6
+replaced the sine placeholder with `NeuralBackend` (phrase splitting, pitch
+and vibrato building, resampling with latency compensation, group-edge
+cropping, caches, track parallelism, progress). Phase 7 finished the CLI
+surface (compat shim, exit-code contract, completions/man, env defaults,
+release automation) with hygiene (workspace clippy denial, `cargo fmt`).
 
-1. ~~**`opensvr-dnni` reader**~~ done (see above).
-2. ~~**Dictionary + `resolvePhonemes`**~~ done (see above).
-3. ~~**`opensvr-dnni` inference (scalar)**~~ done (see above).
-4. ~~**`opensvr-dnni` SIMD packing + `Cache`**~~ done (see above): blocked
-   `[f32; 16]` weights (LLVM auto-vectorized, objdump-verified packed
-   `mulps`/`addps`) and incremental dirty-range inference with
-   `DnniRunStatistics`; goldens green unmodified plus exact cached reruns.
-5. Then Phase 5 in the listed stage order (timing -> pitch -> acoustic -> vocoder),
-   each gated on golden files from the previous stage's output.
+## Remaining gaps
 
-Do not start Phase 5 before the reader and inference agree with the C++ build:
-every model stage's input is a DNNI tensor.
+- **`systemPitchDelta` has no Rust field.** The SVP reader strips it and the
+  saver emits the default empty curve, so `load -> save -> load` is a fixed
+  point except for non-default `systemPitchDelta` contours.
+- **`memmap2` for lazy voice entry slices.** Entries are read eagerly; a 40 MiB
+  voice is re-read per unique path only because of the file-stamp cache, not
+  mapped.
+- **No fuzzer for the DNNI parser.** It reads untrusted files; the plan was to
+  fuzz it with `cargo-fuzz`.
+- **No note IDs.** Only needed for editing and incremental caches; add
+  `NoteId(u64)` when an editor-side consumer needs it.
+
+The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
 
 ## Principles for the remaining work
 
@@ -74,6 +83,15 @@ every model stage's input is a DNNI tensor.
 5. **No new public surface without a test.** The existing crates average roughly one test per 25 lines of code; keep that up.
 
 ## Phase 1: finish the project format (about 600 lines)
+
+Done: `opensvr-core` + `opensvr-svp` + `opensvr-midi` read and write every
+field OpenSV understands — curves (`Linear`/`Cosine`/`Cubic` evaluation plus
+`pitchDelta`, `vibratoEnv`), vocal modes, the 14 pitch attributes, audio
+metadata, unknown-field capture via `Extra`, `load -> save -> load` fixed
+points, integer-valued floats, MIDI import, and `opensvr convert` — with the
+single documented `systemPitchDelta` gap noted above.
+
+Original plan, kept for reference:
 
 Goal: read and write every field OpenSV understands, with lossless round trips.
 
@@ -182,6 +200,14 @@ New crate `opensvr-dnni`. This is the largest single risk, so build it test-firs
 
 ## Phase 5: the models (about 4,500 lines)
 
+Done: new crate `opensvr-voice`, one module per C++ stage, ported in order
+(timing -> pitch -> acoustic -> vocoder) with `VoiceSynthesizer` as the
+orchestrator implementing `predict`, `predict_pitch` and `render`. Gated
+voice tests prove each stage against real model data; the suite stays green
+without proprietary files.
+
+Original plan, kept for reference:
+
 New crate `opensvr-voice`, one module per C++ stage. Port in this order, since each stage's output is the next one's golden input:
 
 1. **Timing**: `PhonemeTiming` -> phoneme durations.
@@ -205,6 +231,16 @@ Notes on exactness:
 
 ## Phase 6: renderer parity (about 1,500 lines)
 
+Done in `opensvr-audio`: `NeuralBackend` replaced the sine placeholder behind
+the `VoiceBackend` seam (voiced projects sing, voiceless ones keep tones with
+a warning), with `Phrase` splitting at rests, `buildPitch` /
+`buildVibratoEnvelope` / `buildVocalModeWeights`, `rubato` resampling with
+measured latency compensation, group-window cropping, file-stamp voice /
+dictionary / phrase caches, scoped-thread track parallelism with fixed-order
+summing, and a `ProgressSink` trait wired to `indicatif` behind `-q`.
+
+Original plan, kept for reference:
+
 Replace `ToneBackend` with `NeuralBackend` and widen the seam as needed. Work in `opensvr-audio`:
 
 - **Phrase splitting.** `ProjectRenderer` cuts a track into phrases at rests and renders each separately, which is what makes
@@ -222,6 +258,15 @@ Replace `ToneBackend` with `NeuralBackend` and widen the seam as needed. Work in
 - **Progress.** Add a `ProgressSink` trait (phrases done / total) and hook up `indicatif` in the CLI behind `-q`.
 
 ## Phase 7: CLI polish
+
+Done: the flat-form shim routes `opensvr project.svp -o out.wav --info` to
+the matching subcommand, the exit-code table is tested and rides in `--help`
+and `opensvr.1`, `complete`/`man` ship completions and the man page (a sync
+test guards the checked-in page byte for byte), `OPENSVR_VOICE` /
+`OPENSVR_DICT` default `--voice` / `--dict`, and CI builds, lints and uploads
+per-OS artifacts on tags.
+
+Original list, kept for reference:
 
 - **Compatibility shim.** Accept the original flat form `opensvr project.svp -o out.wav --info` by routing it to `render`/`info`
   when the first argument is not a subcommand.
@@ -242,6 +287,9 @@ alongside `ProgressSink`. An editor built on these crates would be a different p
 
 ## Suggested order and sizing
 
+All rows below shipped, in this order (the line counts were the original
+estimates):
+
 | Phase | Result you can see | Approx. new Rust lines |
 | --- | --- | --- |
 | 1 | Lossless `.svp` round trip, MIDI import, `convert` | 600 |
@@ -252,4 +300,8 @@ alongside `ProgressSink`. An editor built on these crates would be a different p
 | 6 | Full-project render matching `opensv-cli` | 1,500 |
 | 7 | CLI polish | 300 |
 
-That is roughly 11,000 lines on top of the current 2,600, against 14,400 lines of C++ for the same scope without the editor.
+That table was the original sizing estimate; every row is now done. The C++
+scope it estimated against was about 14,400 lines without the editor; the
+Rust port landed at a comparable size with roughly one test per 25 lines of
+code, and the workspace suite (555 tests, green without proprietary data)
+is the ground truth for what works.
