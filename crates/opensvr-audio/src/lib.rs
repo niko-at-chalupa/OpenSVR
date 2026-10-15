@@ -19,7 +19,10 @@ pub use backend::{BackendError, PhraseAudio, TimedNote, ToneBackend, VoiceBacken
 pub use neural::NeuralBackend;
 pub use opensvr_core::CancelToken;
 pub use phrase::{PHRASE_BREAK_SECONDS, Phrase, split_phrases};
-pub use pitch::{build_log_f0, merge_continuation_phones};
+pub use pitch::{
+    build_log_f0, build_vibrato_envelope, build_vocal_mode_weights, local_curve_position,
+    merge_continuation_phones, phrase_has_vocal_modes,
+};
 pub use render::{
     MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, NoProgress, ProgressSink, REST_CONTEXT_SECONDS, RenderError,
     Renderer, StereoBuffer,

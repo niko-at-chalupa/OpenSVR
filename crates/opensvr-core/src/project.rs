@@ -485,7 +485,9 @@ impl Track {
 /// `window_start`/`window_end` are the placing reference's crop boundaries:
 /// the renderer keeps the full model-input context but crops the mixed
 /// output to this window, exactly as OpenSV's `cropStartSeconds`/`stopSeconds`
-/// in `src/audio/ProjectRenderer.cpp`.
+/// in `src/audio/ProjectRenderer.cpp`. `group`/`reference` borrow the placing
+/// group and reference so pitch builders can sample their curves, attributes
+/// and vocal-mode settings without another lookup.
 #[derive(Debug, Clone, Copy)]
 pub struct PlacedNote<'a> {
     pub start: Blick,
@@ -493,6 +495,8 @@ pub struct PlacedNote<'a> {
     /// Pitch after the reference's transposition, `0..=127`.
     pub pitch: u8,
     pub note: &'a Note,
+    pub group: &'a NoteGroup,
+    pub reference: &'a GroupReference,
     pub window_start: Blick,
     pub window_end: Option<Blick>,
 }
@@ -545,7 +549,7 @@ impl Project {
 
 fn place<'a>(
     group: &'a NoteGroup,
-    reference: &GroupReference,
+    reference: &'a GroupReference,
     placed: &mut Vec<PlacedNote<'a>>,
 ) -> Result<(), ProjectError> {
     if reference.instrumental {
@@ -576,6 +580,8 @@ fn place<'a>(
             end,
             pitch,
             note,
+            group,
+            reference,
             window_start: reference.begin,
             window_end: reference.end,
         });
