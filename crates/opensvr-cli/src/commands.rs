@@ -215,14 +215,23 @@ fn format_of(path: &Path) -> Option<Format> {
 }
 
 /// Loads a project and applies the command-line overrides to every track.
+///
+/// Unset `--voice`/`--dict` flags fall back to `OPENSVR_VOICE`/`OPENSVR_DICT`
+/// (non-empty only), so both the subcommand and flat forms share one
+/// flag-beats-env-beats-file precedence.
 fn load(path: &Path, overrides: &Overrides) -> Result<Project, CliError> {
     let mut project = opensvr_svp::load(path)?;
+    let voice = overrides
+        .voice
+        .clone()
+        .or_else(|| env_path("OPENSVR_VOICE"));
+    let dictionary = overrides.dict.clone().or_else(|| env_path("OPENSVR_DICT"));
     let absolute = |path: &Path| path::absolute(path);
     for track in &mut project.tracks {
-        if let Some(voice) = &overrides.voice {
+        if let Some(voice) = &voice {
             track.voice.database = Some(absolute(voice)?);
         }
-        if let Some(dictionary) = &overrides.dict {
+        if let Some(dictionary) = &dictionary {
             track.voice.dictionary = Some(absolute(dictionary)?);
         }
         if let Some(language) = overrides.language {
@@ -230,6 +239,18 @@ fn load(path: &Path, overrides: &Overrides) -> Result<Project, CliError> {
         }
     }
     Ok(project)
+}
+
+/// Reads an optional path override from the environment: unset or empty
+/// counts as absent, so `VAR=""` never becomes a relative path.
+fn env_path(name: &str) -> Option<PathBuf> {
+    non_empty(std::env::var_os(name))
+}
+
+/// Drops empty values, keeping them from turning into bogus relative paths.
+fn non_empty(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let value = value?;
+    (!value.is_empty()).then(|| PathBuf::from(value))
 }
 
 fn print_info(project: &Project, out: &mut impl io::Write, show_phonemes: bool) -> io::Result<()> {
@@ -369,6 +390,21 @@ mod tests {
     use opensvr_core::{Language, NoteGroup, Track};
 
     use super::*;
+
+    #[test]
+    fn empty_env_values_count_as_unset() {
+        assert_eq!(non_empty(None), None);
+        assert_eq!(non_empty(Some(std::ffi::OsString::from(""))), None);
+        assert_eq!(
+            non_empty(Some(std::ffi::OsString::from("/voices/gumi.nofs"))),
+            Some(PathBuf::from("/voices/gumi.nofs"))
+        );
+        assert_eq!(
+            env_path("OPENSVR_DEFINITELY_UNSET_VARIABLE"),
+            None,
+            "an unset variable resolves to no override"
+        );
+    }
 
     #[test]
     fn info_flags_missing_files() {

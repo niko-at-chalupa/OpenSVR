@@ -27,6 +27,7 @@ Options:
   -q, --quiet             Suppress progress messages
   -h, --help              Show this help
 
+OPENSVR_VOICE and OPENSVR_DICT default --voice and --dict when those flags are absent; explicit flags win.
 Voice databases and dictionaries are not bundled; point to files you own.
 Exit codes: 0 ok, 1 usage error, 2 load error, 3 render/write error, 130 cancelled.";
 
