@@ -212,9 +212,7 @@ fn synthesizer_load_reports_intervals_and_vocal_modes() {
         return;
     };
     let mut synthesizer = VoiceSynthesizer::new();
-    synthesizer
-        .load(voice.as_path())
-        .expect("voice must load");
+    synthesizer.load(voice.as_path()).expect("voice must load");
     // Loader validation: the acoustic entry's `_ftmf` scan must report 5 ms.
     assert_eq!(synthesizer.frame_interval_seconds(), 0.005);
     assert_eq!(synthesizer.pitch_frame_interval_seconds(), 0.005);
@@ -229,7 +227,11 @@ fn synthesizer_load_reports_intervals_and_vocal_modes() {
     );
 
     // A failed load preserves the previously loaded voice.
-    assert!(synthesizer.load(Path::new("/nonexistent-voice-12345.nofs")).is_err());
+    assert!(
+        synthesizer
+            .load(Path::new("/nonexistent-voice-12345.nofs"))
+            .is_err()
+    );
     assert_eq!(synthesizer.frame_interval_seconds(), 0.005);
     let mut durations = Vec::new();
     synthesizer
@@ -253,9 +255,7 @@ fn synthesizer_full_chain_matches_cpp_goldens() {
         return;
     };
     let mut synthesizer = VoiceSynthesizer::new();
-    synthesizer
-        .load(voice.as_path())
-        .expect("voice must load");
+    synthesizer.load(voice.as_path()).expect("voice must load");
 
     let cases = golden_cases();
     assert!(!cases.is_empty(), "expected vocoder goldens");
@@ -403,7 +403,11 @@ fn check_case(synthesizer: &VoiceSynthesizer, case: &Path) {
         &mut timed,
     )
     .unwrap_or_else(|error| panic!("{} must quantize: {error}", case.display()));
-    let log_f0: Vec<f32> = golden.pitch.iter().map(|pitch| midi_to_log_f0(*pitch)).collect();
+    let log_f0: Vec<f32> = golden
+        .pitch
+        .iter()
+        .map(|pitch| midi_to_log_f0(*pitch))
+        .collect();
     let mut render_statistics = SynthesisStatistics::default();
     let mut output = NeuralVocoderOutput::default();
     synthesizer
@@ -432,12 +436,14 @@ fn check_case(synthesizer: &VoiceSynthesizer, case: &Path) {
         case.display()
     );
     assert_eq!(
-        render_statistics.acoustic_frames, frame_count,
+        render_statistics.acoustic_frames,
+        frame_count,
         "{} acoustic statistics",
         case.display()
     );
     assert_eq!(
-        render_statistics.vocoder_frames, frame_count,
+        render_statistics.vocoder_frames,
+        frame_count,
         "{} vocoder statistics",
         case.display()
     );
@@ -446,7 +452,12 @@ fn check_case(synthesizer: &VoiceSynthesizer, case: &Path) {
         "{} render computes network frames",
         case.display()
     );
-    assert_eq!(output.hop_samples, golden.hop_samples, "{} hop", case.display());
+    assert_eq!(
+        output.hop_samples,
+        golden.hop_samples,
+        "{} hop",
+        case.display()
+    );
     assert!(
         (output.sample_rate - golden.sample_rate).abs() < 1e-9,
         "{} sample rate",
@@ -472,7 +483,8 @@ fn check_case(synthesizer: &VoiceSynthesizer, case: &Path) {
     let compared_frames = golden.waveform_frames - TRUNCATION_GUARD_FRAMES;
     let mut worst = 0.0f64;
     for frame in 0..compared_frames {
-        for (index, (&got, &want)) in output.samples[frame * golden.hop_samples..(frame + 1) * golden.hop_samples]
+        for (index, (&got, &want)) in output.samples
+            [frame * golden.hop_samples..(frame + 1) * golden.hop_samples]
             .iter()
             .zip(&golden.waveform[frame * golden.hop_samples..(frame + 1) * golden.hop_samples])
             .enumerate()
@@ -511,10 +523,7 @@ fn check_case(synthesizer: &VoiceSynthesizer, case: &Path) {
             &[],
         )
         .expect("stateful render must run");
-    assert!(
-        render_state.get_bytes() > 0,
-        "phrase caches are retained"
-    );
+    assert!(render_state.get_bytes() > 0, "phrase caches are retained");
     let mut cached_output = NeuralVocoderOutput::default();
     synthesizer
         .render(

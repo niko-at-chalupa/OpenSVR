@@ -125,8 +125,7 @@ impl FeatureNormalizer {
                 // Floor of 1e-5 in the denominator prevents division by zero
                 // for constant features.
                 let scaled = self.target_lower
-                    + target_range * (value - self.lower[channel])
-                        / source_range.max(1.0e-5f32);
+                    + target_range * (value - self.lower[channel]) / source_range.max(1.0e-5f32);
                 if clamp {
                     scaled.clamp(self.target_lower, self.target_upper)
                 } else {
@@ -266,7 +265,9 @@ mod tests {
     fn constant_channel_uses_the_epsilon_floor() {
         let reader = cmpu_reader(&[3.0], &[3.0], &[0.0, 1.0]);
         let mut normalizer = FeatureNormalizer::default();
-        normalizer.load(&reader, 0).expect("constant range must load");
+        normalizer
+            .load(&reader, 0)
+            .expect("constant range must load");
         let mut output = DnniTensor::default();
         normalizer
             .normalize(

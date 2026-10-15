@@ -91,9 +91,10 @@ fn read_string_list(bytes: &[u8], position: &mut usize) -> Option<Vec<String>> {
 /// The node must be a leaf `_psv2` node; on any validation failure nothing
 /// is returned and the error text matches the C++ `readPhoneSet` message.
 pub fn read_phone_set(reader: &DnniReader, node_index: usize) -> Result<PhoneSet> {
-    let node = reader.nodes().get(node_index).ok_or_else(|| {
-        invalid("Phoneme tables require a leaf _psv2 node.")
-    })?;
+    let node = reader
+        .nodes()
+        .get(node_index)
+        .ok_or_else(|| invalid("Phoneme tables require a leaf _psv2 node."))?;
     if node.name != "_psv2" || !node.children.is_empty() {
         return Err(invalid("Phoneme tables require a leaf _psv2 node."));
     }
@@ -212,8 +213,7 @@ mod tests {
 
     #[test]
     fn wrong_type_is_rejected() {
-        let reader =
-            DnniReader::from_bytes(v1_file("prim0", &payload(), 0)).expect("blob parses");
+        let reader = DnniReader::from_bytes(v1_file("prim0", &payload(), 0)).expect("blob parses");
         assert_eq!(
             read_phone_set(&reader, 0).unwrap_err().to_string(),
             "Phoneme tables require a leaf _psv2 node."

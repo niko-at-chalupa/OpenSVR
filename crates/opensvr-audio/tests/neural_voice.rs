@@ -38,7 +38,10 @@ fn golden_dir() -> PathBuf {
 }
 
 fn mean_abs(samples: &[f32]) -> f64 {
-    samples.iter().map(|sample| f64::from(sample.abs())).sum::<f64>()
+    samples
+        .iter()
+        .map(|sample| f64::from(sample.abs()))
+        .sum::<f64>()
         / samples.len().max(1) as f64
 }
 
@@ -93,7 +96,12 @@ fn load_excerpt(name: &str) -> Excerpt {
         .take(count)
         .map(|line| line.parse().expect("sample float"))
         .collect();
-    assert_eq!(samples.len(), count, "{}: excerpt truncated", path.display());
+    assert_eq!(
+        samples.len(),
+        count,
+        "{}: excerpt truncated",
+        path.display()
+    );
     Excerpt {
         rate,
         frames,
@@ -128,7 +136,8 @@ fn neural_backend_sings_the_basic_phrase_deterministically() {
     let Some(voice) = voice_path() else {
         return;
     };
-    let svp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/audio/neural-basic.svp");
+    let svp =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/audio/neural-basic.svp");
     let mut project = opensvr_svp::load(&svp).expect("basic SVP must parse");
     assert_eq!(project.tracks.len(), 1);
     for track in &mut project.tracks {

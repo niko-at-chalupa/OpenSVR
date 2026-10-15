@@ -144,19 +144,31 @@ impl Reader<'_> {
     }
 
     fn read_u16(&mut self) -> Option<u16> {
-        let bytes: [u8; 2] = self.bytes.get(self.position..self.position + 2)?.try_into().ok()?;
+        let bytes: [u8; 2] = self
+            .bytes
+            .get(self.position..self.position + 2)?
+            .try_into()
+            .ok()?;
         self.position += 2;
         Some(u16::from_le_bytes(bytes))
     }
 
     fn read_u32(&mut self) -> Option<u32> {
-        let bytes: [u8; 4] = self.bytes.get(self.position..self.position + 4)?.try_into().ok()?;
+        let bytes: [u8; 4] = self
+            .bytes
+            .get(self.position..self.position + 4)?
+            .try_into()
+            .ok()?;
         self.position += 4;
         Some(u32::from_le_bytes(bytes))
     }
 
     fn read_double(&mut self) -> Option<f64> {
-        let bytes: [u8; 8] = self.bytes.get(self.position..self.position + 8)?.try_into().ok()?;
+        let bytes: [u8; 8] = self
+            .bytes
+            .get(self.position..self.position + 8)?
+            .try_into()
+            .ok()?;
         self.position += 8;
         let value = f64::from_le_bytes(bytes);
         value.is_finite().then_some(value)
@@ -164,7 +176,10 @@ impl Reader<'_> {
 
     fn read_string(&mut self) -> Option<Vec<u8>> {
         let size = usize::from(self.read_u16()?);
-        let value = self.bytes.get(self.position..self.position + size)?.to_vec();
+        let value = self
+            .bytes
+            .get(self.position..self.position + size)?
+            .to_vec();
         self.position += size;
         Some(value)
     }
@@ -224,12 +239,15 @@ fn parse_configuration(bytes: &[u8], entries: &mut Vec<VoiceConfigurationEntry>)
             .ok_or_else(|| reader.error("truncated entry header."))?;
         let value_count = reader
             .read_u32()
-            .ok_or_else(|| reader.error("truncated entry header."))? as usize;
+            .ok_or_else(|| reader.error("truncated entry header."))?
+            as usize;
         if !ordinals.insert(ordinal) {
             return Err(reader.error("duplicate entry ordinal."));
         }
         let decoded = decode_name(&key);
-        let name = String::from_utf8(decoded).ok().filter(|text| is_text(text.as_bytes()));
+        let name = String::from_utf8(decoded)
+            .ok()
+            .filter(|text| is_text(text.as_bytes()));
         let Some(name) = name else {
             // `decode_name` collects bytes as chars; re-check the raw UTF-8 validity
             // the same way the C++ `isText` does (printable ASCII range + valid UTF-8).
@@ -253,9 +271,11 @@ fn parse_configuration(bytes: &[u8], entries: &mut Vec<VoiceConfigurationEntry>)
                 entry.entry_type = VoiceConfigurationType::Strings;
                 entry.strings.reserve(value_count);
                 for _ in 0..value_count {
-                    entry
-                        .strings
-                        .push(reader.read_string().ok_or_else(|| reader.error("truncated string value."))?);
+                    entry.strings.push(
+                        reader
+                            .read_string()
+                            .ok_or_else(|| reader.error("truncated string value."))?,
+                    );
                 }
             }
             1 => {
@@ -334,7 +354,9 @@ fn read_model_reference(
     let architecture = String::from_utf8(architecture_bytes)
         .ok()
         .filter(|text| is_text(text.as_bytes()))
-        .ok_or_else(|| invalid("Voice configuration model architecture is not valid UTF-8 text."))?;
+        .ok_or_else(|| {
+            invalid("Voice configuration model architecture is not valid UTF-8 text.")
+        })?;
     if !database.entries().iter().any(|entry| entry.key == key) {
         return Err(invalid(format!(
             "Voice configuration references a missing model: {key_field}"
@@ -459,29 +481,26 @@ mod tests {
                 "model_timbre_pred",
                 ConfigValue::Strings(&[b"aco-key"]),
             ),
-            (
-                0,
-                4,
-                "model_timbre_arch",
-                ConfigValue::Strings(&[b"dds"]),
-            ),
+            (0, 4, "model_timbre_arch", ConfigValue::Strings(&[b"dds"])),
             (0, 5, "model_vocoder", ConfigValue::Strings(&[b"voc-key"])),
-            (
-                0,
-                6,
-                "model_vocoder_arch",
-                ConfigValue::Strings(&[b"nhv"]),
-            ),
+            (0, 6, "model_vocoder_arch", ConfigValue::Strings(&[b"nhv"])),
         ])
     }
 
     #[test]
     fn decodes_names_and_model_references() {
-        assert_eq!(decode_name(&encode_name("model_duration")), b"model_duration");
+        assert_eq!(
+            decode_name(&encode_name("model_duration")),
+            b"model_duration"
+        );
         let blob = model_config();
         let db = database_with_config(
             &blob,
-            &[(b"dur-key", b"model-a"), (b"aco-key", b"model-b"), (b"voc-key", b"model-c")],
+            &[
+                (b"dur-key", b"model-a"),
+                (b"aco-key", b"model-b"),
+                (b"voc-key", b"model-c"),
+            ],
         );
         let config = VoiceConfiguration::load(&db).unwrap();
         assert_eq!(config.entries().len(), 6);
@@ -523,7 +542,10 @@ mod tests {
             blob.push(0);
             blob
         }] {
-            let db = database_with_config(&blob, &[(b"dur-key", b"a"), (b"aco-key", b"b"), (b"voc-key", b"c")]);
+            let db = database_with_config(
+                &blob,
+                &[(b"dur-key", b"a"), (b"aco-key", b"b"), (b"voc-key", b"c")],
+            );
             assert!(VoiceConfiguration::load(&db).is_err());
         }
         let error = {
@@ -549,19 +571,9 @@ mod tests {
                 "model_timbre_pred",
                 ConfigValue::Strings(&[b"aco-key"]),
             ),
-            (
-                0,
-                4,
-                "model_timbre_arch",
-                ConfigValue::Strings(&[b"dds"]),
-            ),
+            (0, 4, "model_timbre_arch", ConfigValue::Strings(&[b"dds"])),
             (0, 5, "model_vocoder", ConfigValue::Strings(&[b"voc-key"])),
-            (
-                0,
-                6,
-                "model_vocoder_arch",
-                ConfigValue::Strings(&[b"nhv"]),
-            ),
+            (0, 6, "model_vocoder_arch", ConfigValue::Strings(&[b"nhv"])),
             (1, 7, "threshold", ConfigValue::Numbers(&[0.5, -1.25])),
             (2, 8, "flags", ConfigValue::Integers(&[1, 2, 3])),
         ]);
@@ -570,7 +582,11 @@ mod tests {
             &[(b"dur-key", b"a"), (b"aco-key", b"b"), (b"voc-key", b"c")],
         );
         let config = VoiceConfiguration::load(&db).unwrap();
-        let numbers = config.entries().iter().find(|e| e.name == "threshold").unwrap();
+        let numbers = config
+            .entries()
+            .iter()
+            .find(|e| e.name == "threshold")
+            .unwrap();
         assert_eq!(numbers.numbers, [0.5, -1.25]);
         let integers = config.entries().iter().find(|e| e.name == "flags").unwrap();
         assert_eq!(integers.integers, [1, 2, 3]);

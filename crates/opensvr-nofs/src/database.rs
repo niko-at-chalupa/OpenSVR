@@ -14,8 +14,7 @@
 
 use std::{
     collections::HashSet,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -217,7 +216,9 @@ fn parse(data: &[u8]) -> Result<(Vec<VoiceEntry>, VoiceMetadata)> {
     let _ = index_probe;
     let index_size = u64::from(read_u32(data, 16));
     let index_type = read_u16(data, 20);
-    if index_size < 10 || index_size > file_size - FILE_HEADER_SIZE || index_type != INDEX_BLOCK_TYPE
+    if index_size < 10
+        || index_size > file_size - FILE_HEADER_SIZE
+        || index_type != INDEX_BLOCK_TYPE
     {
         return Err(invalid("invalid or unsupported index block"));
     }
@@ -245,9 +246,7 @@ fn parse(data: &[u8]) -> Result<(Vec<VoiceEntry>, VoiceMetadata)> {
         let record_type = read_u16(data, at + 4);
         let key_size = u64::from(read_u16(data, at + 6));
         if record_type != VALUE_BLOCK_TYPE {
-            return Err(invalid(format!(
-                "unsupported value block type at {offset}"
-            )));
+            return Err(invalid(format!("unsupported value block type at {offset}")));
         }
         if key_size == 0 || record_size < 16 + key_size || record_size > file_size - offset {
             return Err(invalid("invalid value block size"));

@@ -19,12 +19,12 @@ use opensvr_core::CancelToken;
 use opensvr_dnni::{DnniInference, DnniReader, DnniRunStatistics, DnniTensor};
 use opensvr_g2p::PhonemeDuration;
 
+use crate::noise::GaussianNoise;
 use crate::pitch_context::{PitchContext, PitchContextState};
 use crate::pitch_decoder::{PitchDecoder, PitchDecoderNotes};
 use crate::pitch_features::{PitchFeatureOutput, PitchFeatures, PitchNote};
 use crate::pitch_postprocess::{PitchFrameInterval, apply_pitch_postprocess};
 use crate::{Result, invalid};
-use crate::noise::GaussianNoise;
 
 /// Verified `f0model-dds` wrapper type hashes (root, one child).
 const WRAPPER_TYPES: [u64; 12] = [

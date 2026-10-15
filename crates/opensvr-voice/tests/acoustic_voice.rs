@@ -67,8 +67,11 @@ fn parse_golden(path: &Path) -> Golden {
             Some("in") => {
                 let language = words.next().expect("syllable language").to_owned();
                 let midi_pitch: i32 = words.next().expect("midi").parse().expect("midi int");
-                let duration_seconds: f64 =
-                    words.next().expect("seconds").parse().expect("seconds float");
+                let duration_seconds: f64 = words
+                    .next()
+                    .expect("seconds")
+                    .parse()
+                    .expect("seconds float");
                 let phonemes: Vec<String> = words.map(str::to_owned).collect();
                 assert!(!phonemes.is_empty(), "golden syllable needs phonemes");
                 golden.syllables.push(opensvr_voice::TimingSyllable {
@@ -108,22 +111,26 @@ fn parse_golden(path: &Path) -> Golden {
             Some("pitch") => {
                 let count: usize = words.next().expect("count").parse().expect("count int");
                 for _ in 0..count {
-                    golden
-                        .pitch
-                        .push(lines.next().expect("pitch entry").parse().expect("pitch float"));
+                    golden.pitch.push(
+                        lines
+                            .next()
+                            .expect("pitch entry")
+                            .parse()
+                            .expect("pitch float"),
+                    );
                 }
             }
             Some("acoustic") => {
-                golden.acoustic_frames =
-                    words.next().expect("frames").parse().expect("frames int");
-                golden.acoustic_channels =
-                    words.next().expect("channels").parse().expect("channels int");
+                golden.acoustic_frames = words.next().expect("frames").parse().expect("frames int");
+                golden.acoustic_channels = words
+                    .next()
+                    .expect("channels")
+                    .parse()
+                    .expect("channels int");
                 for _ in 0..golden.acoustic_frames {
                     let entry = lines.next().expect("acoustic frame");
                     for value in entry.split_whitespace() {
-                        golden
-                            .acoustic
-                            .push(value.parse().expect("acoustic float"));
+                        golden.acoustic.push(value.parse().expect("acoustic float"));
                     }
                 }
             }
@@ -199,12 +206,13 @@ fn real_acoustic_model_matches_cpp_goldens() {
     let pitch_entry = db
         .find_entry("f0model-dds")
         .expect("voice must contain the pitch entry");
-    let pitch_bytes = db.read_entry(pitch_entry).expect("entry must read").to_vec();
+    let pitch_bytes = db
+        .read_entry(pitch_entry)
+        .expect("entry must read")
+        .to_vec();
     let pitch_reader = DnniReader::from_bytes(pitch_bytes).expect("pitch entry must parse");
     let mut pitch = PitchModel::new();
-    pitch
-        .load(&pitch_reader, 0)
-        .expect("pitch model must load");
+    pitch.load(&pitch_reader, 0).expect("pitch model must load");
 
     let acoustic_key = config.acoustic_model().key.clone();
     assert_eq!(config.acoustic_model().architecture, "dds");
@@ -234,12 +242,7 @@ fn real_acoustic_model_matches_cpp_goldens() {
     }
 }
 
-fn check_case(
-    timing: &PhonemeTiming,
-    pitch: &PitchModel,
-    acoustic: &AcousticModel,
-    case: &Path,
-) {
+fn check_case(timing: &PhonemeTiming, pitch: &PitchModel, acoustic: &AcousticModel, case: &Path) {
     let golden = parse_golden(case);
 
     let mut durations = Vec::new();
@@ -253,8 +256,18 @@ fn check_case(
         case.display()
     );
     for (index, (got, want)) in durations.iter().zip(&golden.durations).enumerate() {
-        assert_eq!(got.language, want.language, "{} phoneme {index} language", case.display());
-        assert_eq!(got.symbol, want.symbol, "{} phoneme {index} symbol", case.display());
+        assert_eq!(
+            got.language,
+            want.language,
+            "{} phoneme {index} language",
+            case.display()
+        );
+        assert_eq!(
+            got.symbol,
+            want.symbol,
+            "{} phoneme {index} symbol",
+            case.display()
+        );
         check_close(
             got.duration_seconds,
             want.duration_seconds,
@@ -273,7 +286,16 @@ fn check_case(
     let cancel = CancelToken::new();
     let mut midi_pitch = Vec::new();
     pitch
-        .run(&notes, &durations, &mut midi_pitch, 0, None, &cancel, None, &[])
+        .run(
+            &notes,
+            &durations,
+            &mut midi_pitch,
+            0,
+            None,
+            &cancel,
+            None,
+            &[],
+        )
         .unwrap_or_else(|error| panic!("{} pitch must predict: {error}", case.display()));
     assert_eq!(
         midi_pitch.len(),
@@ -299,7 +321,10 @@ fn check_case(
     // The chosen phrases quantize to exactly the pitch frame count, so no
     // renderer-style resampling stands between the stages here.
     assert_eq!(
-        timed.iter().map(|phoneme| phoneme.frame_count).sum::<usize>(),
+        timed
+            .iter()
+            .map(|phoneme| phoneme.frame_count)
+            .sum::<usize>(),
         golden.pitch.len(),
         "{} quantized frames match pitch frames",
         case.display()
@@ -307,19 +332,43 @@ fn check_case(
     // The acoustic comparison runs from the golden (exact C++) stage outputs
     // so stage tolerances cannot stack; the Rust predictions above are
     // asserted against the same goldens.
-    let log_f0: Vec<f32> = golden.pitch.iter().map(|pitch| midi_to_log_f0(*pitch)).collect();
+    let log_f0: Vec<f32> = golden
+        .pitch
+        .iter()
+        .map(|pitch| midi_to_log_f0(*pitch))
+        .collect();
 
     let mut frames = opensvr_dnni::DnniTensor::default();
     acoustic
-        .run(&timed, &log_f0, &mut frames, NOISE_SEED, None, &cancel, None, &[])
+        .run(
+            &timed,
+            &log_f0,
+            &mut frames,
+            NOISE_SEED,
+            None,
+            &cancel,
+            None,
+            &[],
+        )
         .unwrap_or_else(|error| panic!("{} acoustic must predict: {error}", case.display()));
-    assert_eq!(frames.frames, golden.acoustic_frames, "{} frame count", case.display());
     assert_eq!(
-        frames.channels, golden.acoustic_channels,
+        frames.frames,
+        golden.acoustic_frames,
+        "{} frame count",
+        case.display()
+    );
+    assert_eq!(
+        frames.channels,
+        golden.acoustic_channels,
         "{} channel count",
         case.display()
     );
-    assert_eq!(frames.channels, 72, "{} vocoder-ready width", case.display());
+    assert_eq!(
+        frames.channels,
+        72,
+        "{} vocoder-ready width",
+        case.display()
+    );
     for (index, (&got, &want)) in frames.values.iter().zip(&golden.acoustic).enumerate() {
         check_close(
             f64::from(got),
@@ -332,12 +381,30 @@ fn check_case(
     let mut state = AcousticModelState::default();
     let mut rerun = opensvr_dnni::DnniTensor::default();
     acoustic
-        .run(&timed, &log_f0, &mut rerun, NOISE_SEED, Some(&mut state), &cancel, None, &[])
+        .run(
+            &timed,
+            &log_f0,
+            &mut rerun,
+            NOISE_SEED,
+            Some(&mut state),
+            &cancel,
+            None,
+            &[],
+        )
         .expect("stateful run must predict");
     assert!(state.get_bytes() > 0, "phrase caches are retained");
     let mut cached = opensvr_dnni::DnniTensor::default();
     acoustic
-        .run(&timed, &log_f0, &mut cached, NOISE_SEED, Some(&mut state), &cancel, None, &[])
+        .run(
+            &timed,
+            &log_f0,
+            &mut cached,
+            NOISE_SEED,
+            Some(&mut state),
+            &cancel,
+            None,
+            &[],
+        )
         .expect("cached run must predict");
     assert_eq!(cached.values, rerun.values, "cached frames are verbatim");
     assert_eq!(rerun.values, frames.values, "stateful run matches");

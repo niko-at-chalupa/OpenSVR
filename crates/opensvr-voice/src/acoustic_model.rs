@@ -20,7 +20,9 @@
 //! `rand_distr` substitutes.
 
 use opensvr_core::CancelToken;
-use opensvr_dnni::{DnniCache, DnniInference, DnniMatrix, DnniReader, DnniRunStatistics, DnniTensor};
+use opensvr_dnni::{
+    DnniCache, DnniInference, DnniMatrix, DnniReader, DnniRunStatistics, DnniTensor,
+};
 
 use crate::acoustic_features::AcousticFeatures;
 use crate::noise::GaussianNoise;
@@ -47,7 +49,9 @@ fn check_shape(tensor: &DnniTensor, frames: usize, channels: usize, name: &str) 
         || tensor.channels != channels
         || tensor.values.len() != frames * channels
     {
-        return Err(failure(format!("{name} returned an unexpected tensor shape")));
+        return Err(failure(format!(
+            "{name} returned an unexpected tensor shape"
+        )));
     }
     if !tensor.values.iter().all(|value| value.is_finite()) {
         return Err(failure(format!("{name} returned a non-finite value")));
@@ -90,9 +94,7 @@ impl AcousticFrameInterval {
     /// Builds an interval; rejects non-finite and non-positive values.
     pub fn new(seconds: f32) -> Result<Self> {
         if !seconds.is_finite() || seconds <= 0.0 {
-            return Err(invalid(
-                "Acoustic model: invalid frame interval.",
-            ));
+            return Err(invalid("Acoustic model: invalid frame interval."));
         }
         Ok(Self(seconds))
     }
@@ -230,9 +232,10 @@ impl AcousticModel {
         root_node: usize,
     ) -> Result<()> {
         let nodes = reader.nodes();
-        let Some(root) = nodes.get(root_node).filter(|root| {
-            root.name == "_rldtg0" && root.children.len() == 2
-        }) else {
+        let Some(root) = nodes
+            .get(root_node)
+            .filter(|root| root.name == "_rldtg0" && root.children.len() == 2)
+        else {
             return Err(failure(
                 "expected an _rldtg0 root with model and style children",
             ));
@@ -309,8 +312,7 @@ impl AcousticModel {
             }
             candidate.vocal_mode_styles.push(mode_style);
         }
-        candidate.language_embedding =
-            reader.read_float_matrix(embedding.children[0])?;
+        candidate.language_embedding = reader.read_float_matrix(embedding.children[0])?;
         if candidate.speaker.len() != 32
             || candidate.default_style.len() != 32
             || candidate.language_embedding.rows != 8
@@ -370,7 +372,6 @@ impl Default for AcousticModel {
 }
 
 impl AcousticModel {
-
     /// Predicts vocoder-ready acoustic frames (72 channels per frame).
     ///
     /// `phonemes` carry per-phoneme frame counts on the acoustic grid and
@@ -582,7 +583,8 @@ impl AcousticModel {
         vocal_mode_weights: &[f32],
     ) -> Result<()> {
         let mut phone_features = DnniTensor::default();
-        self.features.encode_phonemes(phonemes, &mut phone_features)?;
+        self.features
+            .encode_phonemes(phonemes, &mut phone_features)?;
         let mut encoded = DnniTensor::default();
         self.phoneme_encoder.run_with_cache(
             &phone_features,
@@ -674,7 +676,12 @@ impl AcousticModel {
             cancel,
             crate::reborrow_stats(&mut statistics),
         )?;
-        check_shape(&latent_input, context.frames, LATENT_CHANNELS, "latent projection")?;
+        check_shape(
+            &latent_input,
+            context.frames,
+            LATENT_CHANNELS,
+            "latent projection",
+        )?;
 
         // Editor normal-take diffusion controls (the low-level empty-queue
         // defaults are not the editor defaults).
@@ -698,8 +705,7 @@ impl AcousticModel {
         for frame in 0..context.frames {
             let destination =
                 &mut condition.values[frame * CONDITION_CHANNELS..(frame + 1) * CONDITION_CHANNELS];
-            destination[..256]
-                .copy_from_slice(&context.values[frame * 256..(frame + 1) * 256]);
+            destination[..256].copy_from_slice(&context.values[frame * 256..(frame + 1) * 256]);
             destination[256..384].copy_from_slice(&controls);
             for channel in 0..LATENT_CHANNELS {
                 destination[384 + channel] = noise.next() * SOURCE_TEMPERATURE;
@@ -744,7 +750,10 @@ mod tests {
 
     #[test]
     fn typed_interval_rejects_non_positive_grids() {
-        assert_eq!(AcousticFrameInterval::new(0.005).expect("valid").seconds(), 0.005);
+        assert_eq!(
+            AcousticFrameInterval::new(0.005).expect("valid").seconds(),
+            0.005
+        );
         for bad in [0.0, -0.005, f32::INFINITY, f32::NAN] {
             assert_eq!(
                 AcousticFrameInterval::new(bad).unwrap_err().to_string(),
@@ -773,7 +782,10 @@ mod tests {
             "Acoustic model: no model has been loaded"
         );
         assert_eq!(
-            AcousticModel::new().frame_interval().unwrap_err().to_string(),
+            AcousticModel::new()
+                .frame_interval()
+                .unwrap_err()
+                .to_string(),
             "Acoustic model: no model has been loaded"
         );
         assert_eq!(AcousticModel::new().frame_interval_seconds(), 0.0);
@@ -787,7 +799,10 @@ mod tests {
         ])
         .expect("blob must parse");
         assert_eq!(
-            AcousticModel::new().load(&reader, 0).unwrap_err().to_string(),
+            AcousticModel::new()
+                .load(&reader, 0)
+                .unwrap_err()
+                .to_string(),
             "Acoustic model: expected an _rldtg0 root with model and style children"
         );
     }

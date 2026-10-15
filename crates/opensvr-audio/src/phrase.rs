@@ -32,8 +32,8 @@ pub fn split_phrases<'a>(notes: &'a [TimedNote<'a>]) -> Vec<Phrase<'a>> {
     let mut phrases = Vec::new();
     let mut begin = 0_usize;
     for end in 1..=notes.len() {
-        let boundary = end == notes.len()
-            || notes[end].start - notes[end - 1].end >= PHRASE_BREAK_SECONDS;
+        let boundary =
+            end == notes.len() || notes[end].start - notes[end - 1].end >= PHRASE_BREAK_SECONDS;
         if boundary {
             phrases.push(Phrase {
                 notes: &notes[begin..end],

@@ -142,7 +142,13 @@ fn curve_notes(note: &TimedNote<'_>) -> (PitchCurveNote, PitchCurveNote) {
         editor.midi_pitch += resolve_rap(score, PitchAttribute::RTone);
         editor.rap_intonation = resolve_rap(score, PitchAttribute::RIntonation);
     }
-    editor.t_f0_offset = resolve_pitch(score, voice_pitch, PitchAttribute::TF0Offset, 0.0, Some(0.0));
+    editor.t_f0_offset = resolve_pitch(
+        score,
+        voice_pitch,
+        PitchAttribute::TF0Offset,
+        0.0,
+        Some(0.0),
+    );
     editor.t_f0_left = resolve_pitch(
         score,
         voice_pitch,
@@ -158,23 +164,18 @@ fn curve_notes(note: &TimedNote<'_>) -> (PitchCurveNote, PitchCurveNote) {
         Some(generated_width),
     );
     editor.d_f0_left = resolve_pitch(score, voice_pitch, PitchAttribute::DF0Left, 0.15, Some(0.0));
-    editor.d_f0_right = resolve_pitch(score, voice_pitch, PitchAttribute::DF0Right, 0.15, Some(0.0));
-    editor.t_f0_vbr_start = resolve_pitch(
+    editor.d_f0_right = resolve_pitch(
         score,
         voice_pitch,
-        PitchAttribute::TF0VbrStart,
-        0.25,
-        None,
+        PitchAttribute::DF0Right,
+        0.15,
+        Some(0.0),
     );
-    editor.t_f0_vbr_left =
-        resolve_pitch(score, voice_pitch, PitchAttribute::TF0VbrLeft, 0.2, None);
-    editor.t_f0_vbr_right = resolve_pitch(
-        score,
-        voice_pitch,
-        PitchAttribute::TF0VbrRight,
-        0.2,
-        None,
-    );
+    editor.t_f0_vbr_start =
+        resolve_pitch(score, voice_pitch, PitchAttribute::TF0VbrStart, 0.25, None);
+    editor.t_f0_vbr_left = resolve_pitch(score, voice_pitch, PitchAttribute::TF0VbrLeft, 0.2, None);
+    editor.t_f0_vbr_right =
+        resolve_pitch(score, voice_pitch, PitchAttribute::TF0VbrRight, 0.2, None);
     editor.d_f0_vbr = resolve_pitch(score, voice_pitch, PitchAttribute::DF0Vbr, 1.0, Some(0.0));
     editor.p_f0_vbr = resolve_pitch(score, voice_pitch, PitchAttribute::PF0Vbr, 0.0, None);
     editor.f_f0_vbr = resolve_pitch(score, voice_pitch, PitchAttribute::FF0Vbr, 5.5, None);
@@ -202,8 +203,10 @@ pub fn build_vibrato_envelope(
             note_index += 1;
         }
         let note = &notes[note_index];
-        let position =
-            local_curve_position(note.tempo_map.seconds_to_blick(seconds), note.reference.time_offset);
+        let position = local_curve_position(
+            note.tempo_map.seconds_to_blick(seconds),
+            note.reference.time_offset,
+        );
         *slot = sample_curve(&note.group.vibrato_env, position, 1.0) as f32;
     }
     envelope
@@ -222,9 +225,9 @@ pub fn phrase_has_vocal_modes(notes: &[TimedNote<'_>]) -> bool {
     if reference_has_vocal_modes(first.main_reference) {
         return true;
     }
-    notes.iter().any(|note| {
-        reference_has_vocal_modes(note.reference) || !note.group.vocal_modes.is_empty()
-    })
+    notes
+        .iter()
+        .any(|note| reference_has_vocal_modes(note.reference) || !note.group.vocal_modes.is_empty())
 }
 
 fn reference_has_vocal_modes(reference: &GroupReference) -> bool {
@@ -256,9 +259,7 @@ pub fn build_vocal_mode_weights(
                 .into(),
         ));
     }
-    if mode_names.len()
-        > (128 << 20) / size_of::<f32>() / frame_count.max(1)
-    {
+    if mode_names.len() > (128 << 20) / size_of::<f32>() / frame_count.max(1) {
         return Err(BackendError(
             "Vocal-mode automation exceeds the phrase memory limit.".into(),
         ));
@@ -315,8 +316,10 @@ pub fn build_vocal_mode_weights(
                 row[index] = amount.clamp(0.0, 1.0) as f32;
             }
         }
-        let position =
-            local_curve_position(note.tempo_map.seconds_to_blick(seconds), note.reference.time_offset);
+        let position = local_curve_position(
+            note.tempo_map.seconds_to_blick(seconds),
+            note.reference.time_offset,
+        );
         for (name, setting) in &note.group.vocal_modes {
             let Some(index) = mode_index(name) else {
                 return Err(BackendError(format!(
@@ -370,10 +373,17 @@ pub fn build_log_f0(
 
     let interval = f64::from(frame_interval_seconds);
     let first_frame_seconds = start_seconds + 0.5 * interval;
-    let transitions = render_pitch_transitions(&editor_notes, first_frame_seconds, interval, frame_count);
+    let transitions =
+        render_pitch_transitions(&editor_notes, first_frame_seconds, interval, frame_count);
     let vibrato = render_pitch_vibrato(&editor_notes, first_frame_seconds, interval, frame_count);
-    let mask = render_automatic_pitch_mask(&editor_notes, first_frame_seconds, interval, frame_count);
-    let envelope = build_vibrato_envelope(notes, first_frame_seconds, frame_interval_seconds, frame_count);
+    let mask =
+        render_automatic_pitch_mask(&editor_notes, first_frame_seconds, interval, frame_count);
+    let envelope = build_vibrato_envelope(
+        notes,
+        first_frame_seconds,
+        frame_interval_seconds,
+        frame_count,
+    );
 
     let mut residual = Vec::new();
     if !automatic_pitch.is_empty() {
@@ -401,8 +411,10 @@ pub fn build_log_f0(
             note_index += 1;
         }
         let note = &notes[note_index];
-        let position =
-            local_curve_position(note.tempo_map.seconds_to_blick(seconds), note.reference.time_offset);
+        let position = local_curve_position(
+            note.tempo_map.seconds_to_blick(seconds),
+            note.reference.time_offset,
+        );
         // Rust has no `systemPitchDelta` field (the SVP reader strips it), so
         // the C++ gate on its emptiness always passes here.
         let mut automatic_delta = 0.0;
@@ -412,20 +424,20 @@ pub fn build_log_f0(
             let left = model_frame as usize;
             let right = (left + 1).min(residual.len() - 1);
             let fraction = model_frame - left as f64;
-            automatic_delta = f64::from(residual[left])
-                + f64::from(residual[right] - residual[left]) * fraction;
+            automatic_delta =
+                f64::from(residual[left]) + f64::from(residual[right] - residual[left]) * fraction;
         }
         // The group pitch correction rides on top of the (always empty)
         // imported system contour.
         let cents = sample_curve(&note.group.pitch_delta, position, 0.0);
-        let note_progress =
-            ((seconds - note.start) / (note.end - note.start)).clamp(0.0, 1.0);
+        let note_progress = ((seconds - note.start) / (note.end - note.start)).clamp(0.0, 1.0);
         let rap_intonation = if note.note.musical_type == "rap" {
             editor_notes[note_index].rap_intonation * (note_progress - 0.5)
         } else {
             0.0
         };
-        let pitch = f64::from(transitions[frame]) + f64::from(mask[frame]) * automatic_delta
+        let pitch = f64::from(transitions[frame])
+            + f64::from(mask[frame]) * automatic_delta
             + f64::from(envelope[frame]) * f64::from(vibrato[frame])
             + cents / 100.0
             + rap_intonation;
@@ -471,7 +483,9 @@ mod tests {
     static TEMPO: std::sync::LazyLock<TempoMap> = std::sync::LazyLock::new(TempoMap::default);
 
     fn note(start: f64, end: f64, pitch: u8) -> TimedNote<'static> {
-        timed_note(start, end, pitch, &SCORE, &GROUP, &REFERENCE, &REFERENCE, &TEMPO)
+        timed_note(
+            start, end, pitch, &SCORE, &GROUP, &REFERENCE, &REFERENCE, &TEMPO,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -555,7 +569,11 @@ mod tests {
             duration("japanese", "a", 1, 0.4),
             duration("japanese", "k", 2, 0.2),
         ];
-        let phonemes = vec![timed("japanese", "a", 80), timed("japanese", "a", 80), timed("japanese", "k", 40)];
+        let phonemes = vec![
+            timed("japanese", "a", 80),
+            timed("japanese", "a", 80),
+            timed("japanese", "k", 40),
+        ];
         let merged = merge_continuation_phones(&durations, &syllables, &phonemes);
         assert_eq!(
             merged,
@@ -635,7 +653,10 @@ mod tests {
     #[test]
     fn vibrato_envelopes_default_to_unity() {
         let notes = [note(0.0, 0.5, 60)];
-        assert_eq!(build_vibrato_envelope(&notes, 0.0, 0.005, 100), vec![1.0; 100]);
+        assert_eq!(
+            build_vibrato_envelope(&notes, 0.0, 0.005, 100),
+            vec![1.0; 100]
+        );
     }
 
     #[test]
@@ -646,7 +667,9 @@ mod tests {
             vibrato_env: linear_curve(&[(0, 0.0), (Q, 2.0)]),
             ..NoteGroup::default()
         };
-        let notes = [timed_note(0.0, 0.5, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO)];
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO,
+        )];
         let envelope = build_vibrato_envelope(&notes, 0.0, 0.005, 100);
         assert_eq!(envelope.len(), 100);
         assert!((envelope[0] - 0.0).abs() < 1e-6, "got {}", envelope[0]);
@@ -671,7 +694,9 @@ mod tests {
             ..NoteGroup::default()
         };
         let plain = [note(1.0, 2.0, 60)];
-        let deep = [timed_note(1.0, 2.0, 60, &score, &group, &REFERENCE, &REFERENCE, &TEMPO)];
+        let deep = [timed_note(
+            1.0, 2.0, 60, &score, &group, &REFERENCE, &REFERENCE, &TEMPO,
+        )];
         let plain_f0 = build_log_f0(&plain, 1.0, 0.005, 200, &[], 1.0, 0.005).unwrap();
         let deep_f0 = build_log_f0(&deep, 1.0, 0.005, 200, &[], 1.0, 0.005).unwrap();
         assert_ne!(plain_f0, deep_f0, "vibrato depth must reach the sung pitch");
@@ -690,7 +715,9 @@ mod tests {
             ..NoteGroup::default()
         };
         let plain = [note(1.0, 2.0, 60)];
-        let bent = [timed_note(1.0, 2.0, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO)];
+        let bent = [timed_note(
+            1.0, 2.0, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO,
+        )];
         let plain_f0 = build_log_f0(&plain, 1.0, 0.005, 200, &[], 1.0, 0.005).unwrap();
         let bent_f0 = build_log_f0(&bent, 1.0, 0.005, 200, &[], 1.0, 0.005).unwrap();
         let semitone = std::f64::consts::LN_2 / 12.0;
@@ -715,7 +742,10 @@ mod tests {
         let plain = [note(0.5, 1.0, 60), note(1.0, 1.5, 62)];
         let wide_f0 = build_log_f0(&wide, 0.0, 0.005, 300, &[], 0.0, 0.005).unwrap();
         let plain_f0 = build_log_f0(&plain, 0.0, 0.005, 300, &[], 0.0, 0.005).unwrap();
-        assert_ne!(wide_f0, plain_f0, "an explicit width must reshape the transition");
+        assert_ne!(
+            wide_f0, plain_f0,
+            "an explicit width must reshape the transition"
+        );
     }
 
     #[test]
@@ -747,7 +777,9 @@ mod tests {
     #[test]
     fn group_modes_produce_per_frame_weights() {
         let group = modal_group();
-        let notes = [timed_note(0.0, 0.5, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO)];
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO,
+        )];
         assert!(phrase_has_vocal_modes(&notes));
         let weights = build_vocal_mode_weights(
             &notes,
@@ -771,7 +803,9 @@ mod tests {
             vocal_mode_params: [("tender".to_owned(), 0.25)].into_iter().collect(),
             ..GroupReference::default()
         };
-        let notes = [timed_note(0.0, 0.5, 60, &SCORE, &GROUP, &reference, &REFERENCE, &TEMPO)];
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &GROUP, &reference, &REFERENCE, &TEMPO,
+        )];
         let weights = build_vocal_mode_weights(
             &notes,
             0.0,
@@ -797,16 +831,12 @@ mod tests {
             vocal_mode_inherited: true,
             ..GroupReference::default()
         };
-        let notes = [timed_note(0.0, 0.5, 60, &SCORE, &GROUP, &reference, &main, &TEMPO)];
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &GROUP, &reference, &main, &TEMPO,
+        )];
         assert!(phrase_has_vocal_modes(&notes));
-        let weights = build_vocal_mode_weights(
-            &notes,
-            0.0,
-            0.005,
-            4,
-            &["power".to_owned()],
-        )
-        .unwrap();
+        let weights =
+            build_vocal_mode_weights(&notes, 0.0, 0.005, 4, &["power".to_owned()]).unwrap();
         assert_eq!(weights, vec![1.0; 4]);
         // A disabled group curve still counts as a phrase mode but writes
         // zeros: the vector stays non-empty so the cache key differs from a
@@ -823,7 +853,9 @@ mod tests {
             vocal_modes: modes,
             ..NoteGroup::default()
         };
-        let notes = [timed_note(0.0, 0.5, 60, &SCORE, &group, &reference, &REFERENCE, &TEMPO)];
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &group, &reference, &REFERENCE, &TEMPO,
+        )];
         assert_eq!(
             build_vocal_mode_weights(&notes, 0.0, 0.005, 4, &["power".to_owned()]).unwrap(),
             vec![0.0; 4]
@@ -833,7 +865,9 @@ mod tests {
     #[test]
     fn unknown_vocal_modes_fail_like_the_cxx_build() {
         let group = modal_group();
-        let modal = [timed_note(0.0, 0.5, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO)];
+        let modal = [timed_note(
+            0.0, 0.5, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO,
+        )];
         // The voice exposes no style vectors at all.
         assert_eq!(
             build_vocal_mode_weights(&modal, 0.0, 0.005, 8, &[])
@@ -853,7 +887,9 @@ mod tests {
             vocal_mode_preset: "opera".to_owned(),
             ..GroupReference::default()
         };
-        let notes = [timed_note(0.0, 0.5, 60, &SCORE, &GROUP, &reference, &REFERENCE, &TEMPO)];
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &GROUP, &reference, &REFERENCE, &TEMPO,
+        )];
         assert_eq!(
             build_vocal_mode_weights(&notes, 0.0, 0.005, 8, &["power".to_owned()])
                 .unwrap_err()
@@ -862,7 +898,9 @@ mod tests {
         );
         reference.vocal_mode_preset.clear();
         reference.vocal_mode_params.insert("opera".to_owned(), 0.5);
-        let notes = [timed_note(0.0, 0.5, 60, &SCORE, &GROUP, &reference, &REFERENCE, &TEMPO)];
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &GROUP, &reference, &REFERENCE, &TEMPO,
+        )];
         assert_eq!(
             build_vocal_mode_weights(&notes, 0.0, 0.005, 8, &["power".to_owned()])
                 .unwrap_err()
@@ -892,14 +930,25 @@ mod tests {
         }];
         let log_f0 = vec![4.0_f32; 8];
         let mut cache = PhraseCache::default();
-        cache.retain(stamp.clone(), syllables.clone(), log_f0.clone(), Vec::new(), 48_000, vec![0.1; 8]);
+        cache.retain(
+            stamp.clone(),
+            syllables.clone(),
+            log_f0.clone(),
+            Vec::new(),
+            48_000,
+            vec![0.1; 8],
+        );
         let group = modal_group();
-        let notes = [timed_note(0.0, 0.5, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO)];
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &group, &REFERENCE, &REFERENCE, &TEMPO,
+        )];
         let weights =
             build_vocal_mode_weights(&notes, 0.0, 0.005, 8, &["tender".to_owned()]).unwrap();
         assert!(!weights.is_empty());
         assert!(
-            cache.lookup(&stamp, &syllables, &log_f0, &weights).is_none(),
+            cache
+                .lookup(&stamp, &syllables, &log_f0, &weights)
+                .is_none(),
             "a mode change must miss the modeless cache entry"
         );
     }
