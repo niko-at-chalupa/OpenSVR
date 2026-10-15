@@ -4,8 +4,10 @@
 //! mirror the file layout, then validated and converted into the domain types of
 //! [`opensvr_core`]. Group automation curves (`parameters.pitchDelta` and
 //! `parameters.vibratoEnv`) and per-mode vocal-mode curves are read with the
-//! same validation as OpenSV's `readCurve`; fields the command-line tools do
-//! not use yet (take lists, ...) are ignored; see `ROADMAP.md` for lossless saving.
+//! same validation as OpenSV's `readCurve`; unknown vendor fields at every
+//! level are captured into [`Extra`](opensvr_core::Extra) exactly like
+//! OpenSV's `preserve`, so a future saver can round-trip them; see
+//! `ROADMAP.md` for lossless saving.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -19,7 +21,7 @@ use opensvr_core::{
     TimeSignature, Track, VocalModeSetting, VoiceSettings,
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 /// The only project format version this reader understands (Synthesizer V Studio 1.11.2).
@@ -47,6 +49,19 @@ type Result<T> = std::result::Result<T, SvpError>;
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(SvpError::Invalid(message.into()))
+}
+
+/// Mirrors OpenSV's `preserve` in `src/core/ProjectFile.cpp`: strips the
+/// handled keys from a clone of the original object and serializes the rest.
+/// Key order is the document order (via `preserve_order`), as with JUCE's
+/// insertion-ordered properties; the empty form is `"{}"` on both sides
+/// (JUCE `writeAsJSON` emits `{` … `}` with no entries).
+fn preserve(fields: &Map<String, Value>, strips: &[&str]) -> Result<Extra> {
+    let mut kept = fields.clone();
+    for strip in strips {
+        kept.shift_remove(*strip);
+    }
+    Ok(Extra::new(serde_json::to_string(&kept)?))
 }
 
 /// Loads a project from disk. Relative voice, dictionary, and backing-track paths resolve against the file's directory.
@@ -82,19 +97,27 @@ pub fn parse(bytes: &[u8], name: impl Into<String>, base_dir: &Path) -> Result<P
     let library = raw
         .library
         .into_iter()
-        .map(RawGroup::into_group)
+        .map(|value| RawGroup::into_group(&value))
         .collect::<Result<Vec<_>>>()?;
     let tracks = raw
         .tracks
         .into_iter()
-        .map(|track| track.into_track(base_dir))
+        .map(|track| RawTrack::into_track(&track, base_dir))
         .collect::<Result<Vec<_>>>()?;
+    // The whole document parses (above), so the root object exists; its
+    // unknown fields are preserved like every other level. C++ strips only
+    // `tracks`/`library` here (`ProjectFile.cpp:814`), keeping `version`,
+    // `time` and vendor keys.
+    let doc: Value = serde_json::from_slice(bytes)?;
+    let Some(root) = doc.as_object() else {
+        return invalid("the project root must be an object");
+    };
     let project = Project {
         name: name.into(),
         tracks,
         library,
         tempo_map: raw.time.into_tempo_map()?,
-        extra: Extra::default(),
+        extra: preserve(root, &["tracks", "library"])?,
     };
     check_references(&project)?;
     Ok(project)
@@ -136,15 +159,15 @@ struct Header {
 
 #[derive(Deserialize)]
 struct RawProject {
-    tracks: Vec<RawTrack>,
-    library: Vec<RawGroup>,
+    tracks: Vec<Value>,
+    library: Vec<Value>,
     time: RawTime,
 }
 
 #[derive(Deserialize)]
 struct RawTime {
-    tempo: Vec<RawTempo>,
-    meter: Vec<RawMeter>,
+    tempo: Vec<Value>,
+    meter: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -165,9 +188,9 @@ struct RawMeter {
 struct RawTrack {
     #[serde(default)]
     name: String,
-    main_group: RawGroup,
-    main_ref: RawReference,
-    groups: Vec<RawReference>,
+    main_group: Value,
+    main_ref: Value,
+    groups: Vec<Value>,
     sv_voice: Option<RawVoice>,
     mixer: RawMixer,
 }
@@ -196,24 +219,18 @@ struct RawGroup {
     uuid: String,
     #[serde(default)]
     name: String,
-    notes: Vec<RawNote>,
+    notes: Vec<Value>,
+    /// `parameters` stays as [`Value`]: the two automation curves are read
+    /// out of it, while every other key (and the key itself) is preserved
+    /// verbatim, exactly like `readGroup`'s massaged clone in
+    /// `src/core/ProjectFile.cpp`.
     #[serde(default)]
-    parameters: Option<RawParameters>,
+    parameters: Option<Value>,
     /// `vocalModes` stays as [`Value`] so a non-object fails with the same
     /// `Invalid` error OpenSV's `readGroup` reports, rather than a JSON error.
     /// (`None`/JSON null both mean absent, as JUCE parses null to void.)
     #[serde(default, rename = "vocalModes")]
     vocal_modes: Option<Value>,
-}
-
-/// The `parameters` object of a group: only the two automation curves the
-/// engine consumes are read, the rest is left for the lossless-saving PR.
-#[derive(Debug, Default, Deserialize)]
-struct RawParameters {
-    #[serde(default, rename = "pitchDelta")]
-    pitch_delta: Option<RawCurve>,
-    #[serde(default, rename = "vibratoEnv")]
-    vibrato_env: Option<RawCurve>,
 }
 
 /// A `{"mode": ..., "points": [pos0, val0, ...]}` automation curve.
@@ -297,22 +314,28 @@ impl RawTime {
         let tempos = self
             .tempo
             .into_iter()
-            .map(|tempo| {
+            .map(|value| {
+                let tempo: RawTempo = serde_json::from_value(value.clone())?;
                 let position = blick(tempo.position, "a tempo position")?;
                 if position < 0 || !tempo.bpm.is_finite() || tempo.bpm <= 0.0 {
                     return invalid("a tempo marker is invalid");
                 }
+                let Some(entry) = value.as_object() else {
+                    return invalid("a tempo marker is invalid");
+                };
                 Ok(TempoChange {
                     position,
                     bpm: tempo.bpm,
-                    extra: Extra::default(),
+                    // C++ `ProjectFile.cpp:847` strips only position/bpm.
+                    extra: preserve(entry, &["position", "bpm"])?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         let signatures = self
             .meter
             .into_iter()
-            .map(|meter| {
+            .map(|value| {
+                let meter: RawMeter = serde_json::from_value(value.clone())?;
                 let signature = TimeSignature {
                     bar: u32::try_from(meter.index).unwrap_or(u32::MAX),
                     numerator: u32::try_from(meter.numerator).unwrap_or(0),
@@ -322,7 +345,12 @@ impl RawTime {
                 if meter.index < 0 || meter.index > i64::from(i32::MAX) || !signature.is_valid() {
                     return invalid("a meter marker is invalid");
                 }
-                Ok(signature)
+                let Some(entry) = value.as_object() else {
+                    return invalid("a meter marker is invalid");
+                };
+                // C++ `ProjectFile.cpp:862` strips only index/numerator/denominator.
+                let extra = preserve(entry, &["index", "numerator", "denominator"])?;
+                Ok(TimeSignature { extra, ..signature })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(TempoMap::new(tempos, signatures))
@@ -330,50 +358,100 @@ impl RawTime {
 }
 
 impl RawNote {
-    fn into_note(self) -> Result<Note> {
-        let onset = blick(self.onset, "a note onset")?;
-        let duration = blick(self.duration, "a note duration")?;
-        let pitch = u8::try_from(self.pitch).ok().filter(|&pitch| pitch <= 127);
-        match pitch {
-            Some(pitch) if duration > 0 && self.detune.is_finite() => Ok(Note {
-                onset,
-                duration,
-                pitch,
-                lyrics: self.lyrics,
-                phonemes: self.phonemes,
-                detune: self.detune,
-                attributes: read_pitch_attributes(self.attributes.as_ref(), "note attributes")?,
-                system_attributes: read_pitch_attributes(
-                    self.system_attributes.as_ref(),
-                    "note systemAttributes",
-                )?,
-                extra: Extra::default(),
-            }),
-            _ => invalid("a note has invalid timing, pitch, or detune"),
-        }
+    fn into_note(value: &Value) -> Result<Note> {
+        let raw: RawNote = serde_json::from_value(value.clone())?;
+        let onset = blick(raw.onset, "a note onset")?;
+        let duration = blick(raw.duration, "a note duration")?;
+        let pitch = u8::try_from(raw.pitch).ok().filter(|&pitch| pitch <= 127);
+        let Some(pitch) = pitch.filter(|_| duration > 0 && raw.detune.is_finite()) else {
+            return invalid("a note has invalid timing, pitch, or detune");
+        };
+        let attributes = read_pitch_attributes(raw.attributes.as_ref(), "note attributes")?;
+        let system_attributes =
+            read_pitch_attributes(raw.system_attributes.as_ref(), "note systemAttributes")?;
+        let Some(note) = value.as_object() else {
+            return invalid("a note has invalid timing, pitch, or detune");
+        };
+        // C++ `ProjectFile.cpp:329` strips the handled keys, including the
+        // legacy `accent`/`instantMode`/`musicalType` members Rust has no
+        // fields for yet (a later PR adds the fields and their validation);
+        // only truly unknown keys survive into `extra`, exactly as there.
+        let extra = preserve(
+            note,
+            &[
+                "onset",
+                "duration",
+                "pitch",
+                "lyrics",
+                "phonemes",
+                "accent",
+                "detune",
+                "instantMode",
+                "musicalType",
+                "attributes",
+                "systemAttributes",
+            ],
+        )?;
+        Ok(Note {
+            onset,
+            duration,
+            pitch,
+            lyrics: raw.lyrics,
+            phonemes: raw.phonemes,
+            detune: raw.detune,
+            attributes,
+            system_attributes,
+            extra,
+        })
     }
 }
 
 impl RawGroup {
-    fn into_group(self) -> Result<NoteGroup> {
-        if self.uuid.is_empty() {
+    fn into_group(value: &Value) -> Result<NoteGroup> {
+        let raw: RawGroup = serde_json::from_value(value.clone())?;
+        if raw.uuid.is_empty() {
             return invalid("a note group needs a UUID");
         }
-        let mut notes = self
+        let mut notes = raw
             .notes
             .into_iter()
-            .map(RawNote::into_note)
+            .map(|note| RawNote::into_note(&note))
             .collect::<Result<Vec<_>>>()?;
         notes.sort_by_key(|note| note.onset);
-        let parameters = self.parameters.unwrap_or_default();
+        let parameters = raw.parameters.as_ref().and_then(Value::as_object);
+        let pitch_delta = read_curve_inner(
+            parameters.and_then(|map| map.get("pitchDelta")),
+            "pitchDelta",
+            true,
+        )?;
+        let vibrato_env = read_curve_inner(
+            parameters.and_then(|map| map.get("vibratoEnv")),
+            "vibratoEnv",
+            true,
+        )?;
+        let vocal_modes = read_vocal_modes(raw.vocal_modes.as_ref())?;
+        let Some(group) = value.as_object() else {
+            return invalid("a note group needs a UUID");
+        };
+        // Mirror `readGroup` (`ProjectFile.cpp:277-281`): the preserved
+        // `parameters` blob is the original minus the two curves Rust reads,
+        // and is always present (empty when the file omits it).
+        let mut massaged = parameters.cloned().unwrap_or_default();
+        massaged.shift_remove("pitchDelta");
+        massaged.shift_remove("vibratoEnv");
+        let mut kept = group.clone();
+        kept.insert("parameters".to_owned(), Value::Object(massaged));
+        // C++ strips `uuid`/`name`/`notes`/`vocalModes`, keeping the massaged
+        // `parameters` blob and unknown keys.
+        let extra = preserve(&kept, &["uuid", "name", "notes", "vocalModes"])?;
         Ok(NoteGroup {
-            id: self.uuid,
-            name: self.name,
+            id: raw.uuid,
+            name: raw.name,
             notes,
-            pitch_delta: read_curve(parameters.pitch_delta, "pitchDelta")?,
-            vibrato_env: read_curve(parameters.vibrato_env, "vibratoEnv")?,
-            vocal_modes: read_vocal_modes(self.vocal_modes.as_ref())?,
-            extra: Extra::default(),
+            pitch_delta,
+            vibrato_env,
+            vocal_modes,
+            extra,
         })
     }
 }
@@ -416,6 +494,9 @@ fn read_vocal_modes(raw: Option<&Value>) -> Result<BTreeMap<String, VocalModeSet
                             amount,
                             has_curve: false,
                             curve: Curve::default(),
+                            // A plain amount carries no preserved JSON: the
+                            // C++ `preserve` call sits in the object branch
+                            // only, so this keeps the default empty string.
                             extra: Extra::default(),
                         },
                     );
@@ -449,16 +530,14 @@ fn read_vocal_modes(raw: Option<&Value>) -> Result<BTreeMap<String, VocalModeSet
         }
         if fields.contains_key("mode") || fields.contains_key("points") {
             let curve_name = format!("vocalModes.{name}");
-            let raw_curve: RawCurve = serde_json::from_value(mode_value.clone()).map_err(|_| {
-                SvpError::Invalid(format!(
-                    "{curve_name} must contain a mode and points array."
-                ))
-            })?;
             // Unlike `pitchDelta`/`vibratoEnv`, `normaliseProject` never
             // normalises per-mode curves, so the points stay in file order.
-            setting.curve = read_curve_inner(Some(raw_curve), &curve_name, false)?;
+            setting.curve = read_curve_inner(Some(mode_value), &curve_name, false)?;
             setting.has_curve = true;
         }
+        // C++ `ProjectFile.cpp:386` preserves the settings object minus the
+        // four handled keys.
+        setting.extra = preserve(fields, &["enabled", "amount", "mode", "points"])?;
         out.insert(name.clone(), setting);
     }
     Ok(out)
@@ -550,8 +629,9 @@ fn read_audio(raw: Option<&Value>, base_dir: &Path) -> Result<(Option<PathBuf>, 
 /// void) keeps the defaults; a non-object is an error; each present field
 /// must be a finite number. The loop runs over the [`PitchAttribute::ALL`]
 /// table, so the 14 keys live in `opensvr-core` rather than in 14 blocks
-/// here. (Preserved unknown fields land with the round-trip PR, so there is
-/// nothing to strip yet.)
+/// here. Unknown fields are preserved like everywhere else; the three
+/// `vocalMode*` keys are stripped too because the reference `voice` object
+/// doubles as the `voicePitch` container (`ProjectFile.cpp:208-210`).
 fn read_pitch_attributes(raw: Option<&Value>, context: &str) -> Result<PitchAttributes> {
     let mut out = PitchAttributes::default();
     let Some(raw) = raw else {
@@ -577,6 +657,14 @@ fn read_pitch_attributes(raw: Option<&Value>, context: &str) -> Result<PitchAttr
             }
         }
     }
+    let mut kept = fields.clone();
+    for field in PitchAttribute::ALL {
+        kept.shift_remove(field.name());
+    }
+    for strip in ["vocalModeInherited", "vocalModePreset", "vocalModeParams"] {
+        kept.shift_remove(strip);
+    }
+    out.extra = Extra::new(serde_json::to_string(&kept)?);
     Ok(out)
 }
 
@@ -589,17 +677,24 @@ fn read_pitch_attributes(raw: Option<&Value>, context: &str) -> Result<PitchAttr
 /// points are stable-sorted by position and the last point at each position
 /// wins, matching the editor behavior where later edits overwrite.
 ///
-/// Per-mode vocal curves bypass the sort/dedup via [`read_curve_inner`] with
-/// `normalise = false`, because the C++ `normaliseProject` never normalises
-/// them (only `pitchDelta`/`vibratoEnv`/`systemPitchDelta`).
-fn read_curve(raw: Option<RawCurve>, name: &str) -> Result<Curve> {
-    read_curve_inner(raw, name, true)
-}
-
-fn read_curve_inner(raw: Option<RawCurve>, name: &str, normalise: bool) -> Result<Curve> {
-    let Some(raw) = raw else {
+/// Unknown curve keys are preserved (`ProjectFile.cpp:261` strips only
+/// `mode`/`points`); absent curves keep the default empty string.
+///
+/// Per-mode vocal curves bypass the sort/dedup via `normalise = false`,
+/// because the C++ `normaliseProject` never normalises them (only
+/// `pitchDelta`/`vibratoEnv`/`systemPitchDelta`).
+fn read_curve_inner(value: Option<&Value>, name: &str, normalise: bool) -> Result<Curve> {
+    let Some(value) = value else {
         return Ok(Curve::default());
     };
+    if value.is_null() {
+        return Ok(Curve::default());
+    }
+    let Value::Object(curve) = value else {
+        return invalid(format!("{name} must contain a mode and points array."));
+    };
+    let raw: RawCurve = serde_json::from_value(value.clone())
+        .map_err(|_| SvpError::Invalid(format!("{name} must contain a mode and points array.")))?;
     let mode: Interpolation = raw
         .mode
         .parse()
@@ -641,7 +736,7 @@ fn read_curve_inner(raw: Option<RawCurve>, name: &str, normalise: bool) -> Resul
         return Ok(Curve {
             mode,
             points,
-            extra: Extra::default(),
+            extra: preserve(curve, &["mode", "points"])?,
         });
     }
     if points.len() > 1
@@ -664,20 +759,21 @@ fn read_curve_inner(raw: Option<RawCurve>, name: &str, normalise: bool) -> Resul
     Ok(Curve {
         mode,
         points: deduped,
-        extra: Extra::default(),
+        extra: preserve(curve, &["mode", "points"])?,
     })
 }
 
 impl RawReference {
-    fn into_reference(self, base_dir: &Path) -> Result<GroupReference> {
-        let pitch_offset = i32::try_from(self.pitch_offset)
+    fn into_reference(value: &Value, base_dir: &Path) -> Result<GroupReference> {
+        let raw: RawReference = serde_json::from_value(value.clone())?;
+        let pitch_offset = i32::try_from(raw.pitch_offset)
             .ok()
             .filter(|offset| (-127..=127).contains(offset));
         let Some(pitch_offset) = pitch_offset else {
             return invalid("a group reference has an invalid pitch offset");
         };
-        let begin = blick(self.blick_absolute_begin, "a crop boundary")?;
-        let end = match blick(self.blick_absolute_end, "a crop boundary")? {
+        let begin = blick(raw.blick_absolute_begin, "a crop boundary")?;
+        let end = match blick(raw.blick_absolute_end, "a crop boundary")? {
             -1 => None,
             end => Some(end),
         };
@@ -685,34 +781,56 @@ impl RawReference {
             return invalid("a group reference has invalid crop boundaries");
         }
         let (vocal_mode_inherited, vocal_mode_preset, vocal_mode_params) =
-            read_voice_overrides(self.voice.as_ref())?;
+            read_voice_overrides(raw.voice.as_ref())?;
         // Reference pitch attributes come from the SAME `voice` object, which
         // doubles as the `voicePitch` container in the C++ `readReference`.
-        let voice_pitch = read_pitch_attributes(self.voice.as_ref(), "reference voice")?;
+        let voice_pitch = read_pitch_attributes(raw.voice.as_ref(), "reference voice")?;
         // Backing-track metadata is read regardless of the instrumental flag,
         // as in the C++: the `audio` block sits outside any such check.
-        let (audio_file, audio_duration_seconds) = read_audio(self.audio.as_ref(), base_dir)?;
+        let (audio_file, audio_duration_seconds) = read_audio(raw.audio.as_ref(), base_dir)?;
+        let Some(reference) = value.as_object() else {
+            return invalid("a group reference has an invalid pitch offset");
+        };
+        // C++ `ProjectFile.cpp:484` strips the handled keys but NOT `audio`:
+        // the saver overwrites it from `audioFile`, so the round trip still
+        // works. `systemPitchDelta` is stripped (read into the C++ member Rust
+        // has no field for yet); its value is dropped like the note legacy
+        // keys until the pitch builder lands.
+        let extra = preserve(
+            reference,
+            &[
+                "groupID",
+                "blickOffset",
+                "pitchOffset",
+                "blickAbsoluteBegin",
+                "blickAbsoluteEnd",
+                "isInstrumental",
+                "voice",
+                "systemPitchDelta",
+            ],
+        )?;
         Ok(GroupReference {
-            group_id: self.group_id,
-            time_offset: blick(self.blick_offset, "a group offset")?,
+            group_id: raw.group_id,
+            time_offset: blick(raw.blick_offset, "a group offset")?,
             pitch_offset,
             begin,
             end,
-            instrumental: self.is_instrumental,
+            instrumental: raw.is_instrumental,
             audio_file,
             audio_duration_seconds,
             vocal_mode_inherited,
             vocal_mode_preset,
             vocal_mode_params,
             voice_pitch,
-            extra: Extra::default(),
+            extra,
         })
     }
 }
 
 impl RawTrack {
-    fn into_track(self, base_dir: &Path) -> Result<Track> {
-        let voice = match self.sv_voice {
+    fn into_track(value: &Value, base_dir: &Path) -> Result<Track> {
+        let raw: RawTrack = serde_json::from_value(value.clone())?;
+        let voice = match raw.sv_voice {
             None => VoiceSettings::default(),
             Some(voice) => VoiceSettings {
                 database: resolve(base_dir, &voice.database_path),
@@ -724,27 +842,37 @@ impl RawTrack {
             },
         };
 
-        let main_group = self.main_group.into_group()?;
-        let main_ref = self.main_ref.into_reference(base_dir)?;
+        let main_group = RawGroup::into_group(&raw.main_group)?;
+        let main_ref = RawReference::into_reference(&raw.main_ref, base_dir)?;
         if main_ref.group_id != main_group.id {
             return invalid("a track's mainRef does not refer to its mainGroup");
         }
 
-        let mixer = self.mixer;
+        let mixer = raw.mixer;
         let gain = 10.0_f64.powf(mixer.gain_decibel / 20.0);
         if !gain.is_finite() || !mixer.pan.is_finite() || !(-1.0..=1.0).contains(&mixer.pan) {
             return invalid("a track has invalid mixer settings");
         }
 
+        let groups = raw
+            .groups
+            .into_iter()
+            .map(|reference| RawReference::into_reference(&reference, base_dir))
+            .collect::<Result<_>>()?;
+        let Some(track) = value.as_object() else {
+            return invalid("a track needs a groups array");
+        };
+        // C++ `ProjectFile.cpp:498` strips the five handled keys, keeping the
+        // `mixer` blob and unknown keys verbatim.
+        let extra = preserve(
+            track,
+            &["name", "mainGroup", "mainRef", "groups", "svVoice"],
+        )?;
         Ok(Track {
-            name: self.name,
+            name: raw.name,
             main_group,
             main_ref,
-            groups: self
-                .groups
-                .into_iter()
-                .map(|reference| reference.into_reference(base_dir))
-                .collect::<Result<_>>()?,
+            groups,
             mixer: Mixer {
                 gain,
                 pan: mixer.pan,
@@ -752,7 +880,7 @@ impl RawTrack {
                 solo: mixer.solo,
             },
             voice,
-            extra: Extra::default(),
+            extra,
         })
     }
 }
@@ -1271,6 +1399,147 @@ mod tests {
         let project = parse_value(&value).unwrap();
         assert_eq!(project.tracks[0].groups[0].audio_file, None);
         assert_eq!(project.tracks[0].groups[0].audio_duration_seconds, 12.5);
+    }
+
+    #[test]
+    fn preserves_unknown_fields_at_every_level() {
+        let value = json!({
+            "version": 153,
+            "vendorRoot": { "a": 1 },
+            "time": {
+                "tempo": [{ "position": 0, "bpm": 100.0, "vendorTempo": "t" }],
+                "meter": [{ "index": 0, "numerator": 3, "denominator": 4, "vendorMeter": 2 }],
+            },
+            "library": [],
+            "tracks": [{
+                "name": "Lead",
+                "vendorTrack": [1, 2],
+                "mainGroup": {
+                    "uuid": "main",
+                    "name": "main",
+                    "vendorGroup": true,
+                    "notes": [{
+                        "onset": 0,
+                        "duration": Q,
+                        "pitch": 60,
+                        "lyrics": "do",
+                        "accent": "strong",
+                        "attributes": { "tF0Offset": 1.5, "vendorAttr": "a" },
+                        "systemAttributes": { "vendorSys": 2 },
+                        "vendorNote": "n",
+                    }],
+                    "parameters": {
+                        "pitchDelta": { "mode": "linear", "points": [0, 0.0], "vendorCurve": "c" },
+                        "vendorParam": 7,
+                    },
+                    "vocalModes": {
+                        "Power": 0.5,
+                        "Soft": { "enabled": false, "amount": 0.25, "vendorMode": "m" },
+                    },
+                },
+                "mainRef": {
+                    "groupID": "main",
+                    "blickOffset": 0,
+                    "pitchOffset": 0,
+                    "vendorRef": "r",
+                    "voice": { "vocalModePreset": "p", "vendorVoice": 1 },
+                },
+                "groups": [],
+                "mixer": { "gainDecibel": 0.0, "pan": 0.0 },
+                "svVoice": { "databasePath": "", "language": "japanese", "dictionaryDirectory": "" },
+            }],
+        });
+        let project = parse_value(&value).unwrap();
+
+        // Root keeps everything except tracks/library, in document order.
+        assert_eq!(
+            project.extra.json(),
+            r#"{"version":153,"vendorRoot":{"a":1},"time":{"tempo":[{"position":0,"bpm":100.0,"vendorTempo":"t"}],"meter":[{"index":0,"numerator":3,"denominator":4,"vendorMeter":2}]}}"#
+        );
+        assert_eq!(
+            project.tempo_map.tempos()[0].extra.json(),
+            r#"{"vendorTempo":"t"}"#
+        );
+        assert_eq!(
+            project.tempo_map.time_signatures()[0].extra.json(),
+            r#"{"vendorMeter":2}"#
+        );
+
+        let track = &project.tracks[0];
+        assert_eq!(
+            track.extra.json(),
+            r#"{"vendorTrack":[1,2],"mixer":{"gainDecibel":0.0,"pan":0.0}}"#
+        );
+
+        let group = &track.main_group;
+        // The `parameters` blob survives minus the two curves Rust reads.
+        assert_eq!(
+            group.extra.json(),
+            r#"{"vendorGroup":true,"parameters":{"vendorParam":7}}"#
+        );
+        // Handled curve keys are gone from the curve's own extra.
+        assert_eq!(group.pitch_delta.extra.json(), r#"{"vendorCurve":"c"}"#);
+        // A plain amount keeps the default empty string: the C++ `preserve`
+        // call sits in the settings-object branch only.
+        assert_eq!(group.vocal_modes["Power"].extra.json(), "");
+        assert_eq!(
+            group.vocal_modes["Soft"].extra.json(),
+            r#"{"vendorMode":"m"}"#
+        );
+
+        let note = &group.notes[0];
+        // The legacy `accent` key is stripped (a C++ member holds it) while
+        // only truly unknown keys survive.
+        assert_eq!(note.extra.json(), r#"{"vendorNote":"n"}"#);
+        assert_eq!(note.attributes.get(PitchAttribute::TF0Offset), Some(1.5));
+        assert_eq!(note.attributes.extra.json(), r#"{"vendorAttr":"a"}"#);
+        assert_eq!(note.system_attributes.extra.json(), r#"{"vendorSys":2}"#);
+
+        // The reference keeps `vendorRef`; the `voice` blob is stripped
+        // (handled) while its own unknown keys land on `voice_pitch`.
+        assert_eq!(track.main_ref.extra.json(), r#"{"vendorRef":"r"}"#);
+        assert_eq!(track.main_ref.vocal_mode_preset, "p");
+        assert_eq!(
+            track.main_ref.voice_pitch.extra.json(),
+            r#"{"vendorVoice":1}"#
+        );
+    }
+
+    #[test]
+    fn clean_objects_yield_the_cpp_empty_forms() {
+        let project = parse_value(&sample()).unwrap();
+
+        // Fully handled objects preserve to `"{}"`, exactly like JUCE's
+        // `writeAsJSON` of an empty object; absent attributes/curves keep the
+        // default empty string (C++ returns before its `preserve` call).
+        assert_eq!(
+            project.extra.json(),
+            r#"{"version":153,"time":{"tempo":[{"position":0,"bpm":100.0}],"meter":[{"index":0,"numerator":3,"denominator":4}]}}"#
+        );
+        assert_eq!(project.tempo_map.tempos()[0].extra.json(), "{}");
+        assert_eq!(project.tempo_map.time_signatures()[0].extra.json(), "{}");
+
+        let track = &project.tracks[0];
+        assert_eq!(
+            track.extra.json(),
+            r#"{"mixer":{"gainDecibel":-6.0,"pan":0.5,"mute":false,"solo":true}}"#
+        );
+        assert_eq!(track.main_ref.extra.json(), "{}");
+        assert_eq!(track.main_ref.voice_pitch.extra.json(), "");
+
+        // Groups always carry the (possibly empty) `parameters` blob: the C++
+        // `set` writes it back even when the file omits it.
+        for group in project
+            .library
+            .iter()
+            .chain(std::iter::once(&track.main_group))
+        {
+            assert_eq!(group.extra.json(), r#"{"parameters":{}}"#);
+            assert_eq!(group.pitch_delta.extra.json(), "");
+        }
+        let note = &track.main_group.notes[0];
+        assert_eq!(note.extra.json(), "{}");
+        assert_eq!(note.attributes.extra.json(), "");
     }
 
     #[test]
