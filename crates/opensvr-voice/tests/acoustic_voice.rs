@@ -45,6 +45,8 @@ struct Golden {
     acoustic: Vec<f32>,
 }
 
+/// Data-heavy golden table reader; kept whole so the format stays in one place.
+#[allow(clippy::too_many_lines)]
 fn parse_golden(path: &Path) -> Golden {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("golden {} must read: {error}", path.display()));
@@ -242,6 +244,8 @@ fn real_acoustic_model_matches_cpp_goldens() {
     }
 }
 
+/// Data-heavy golden comparison; kept whole so each stage's assertions stay together.
+#[allow(clippy::too_many_lines)]
 fn check_case(timing: &PhonemeTiming, pitch: &PitchModel, acoustic: &AcousticModel, case: &Path) {
     let golden = parse_golden(case);
 

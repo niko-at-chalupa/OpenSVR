@@ -195,6 +195,8 @@ fn real_pitch_model_matches_cpp_goldens() {
     }
 }
 
+/// Data-heavy golden comparison; kept whole so each stage's assertions stay together.
+#[allow(clippy::too_many_lines)]
 fn check_case(timing: &PhonemeTiming, pitch: &PitchModel, case: &Path) {
     let golden = parse_golden(case);
 
