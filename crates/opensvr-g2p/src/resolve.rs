@@ -262,7 +262,7 @@ pub fn resolve(
                 .rev()
                 .find(|symbol| is_english_vowel_phoneme(symbol))
         {
-            continuation = vowel.clone();
+            continuation.clone_from(vowel);
         }
         return Ok(Resolved {
             phonemes,
@@ -355,6 +355,12 @@ impl NoteResolver {
     }
 
     /// Resolves one note in sequence; state carries to the following note.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic on valid inputs; the internal `expect` only fires when
+    /// a prior `split_english_syllables` result is empty, which is
+    /// unreachable because that helper always returns at least one item.
     pub fn push(
         &mut self,
         lyrics: &str,
@@ -467,12 +473,12 @@ impl NoteResolver {
                     .rev()
                     .find(|symbol| is_english_vowel_phoneme(symbol))
                 {
-                    self.continuation = vowel.clone();
-                    resolved.continuation = vowel.clone();
+                    self.continuation.clone_from(vowel);
+                    resolved.continuation.clone_from(vowel);
                 }
             } else if let Some(last) = resolved.phonemes.last() {
-                self.continuation = last.clone();
-                resolved.continuation = last.clone();
+                self.continuation.clone_from(last);
+                resolved.continuation.clone_from(last);
             }
             return Ok(resolved);
         }
@@ -536,8 +542,8 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
             dict.as_bytes(),
             "phones.txt",
             "dict.txt",
-            "x-phones.txt".to_owned(),
-            "x-dict.txt".to_owned(),
+            "x-phones.txt",
+            "x-dict.txt",
         )
         .expect("synthetic dictionary parses")
     }
@@ -548,8 +554,8 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
             "hello hh ah l ow\ncats k ae t s\n".as_bytes(),
             "english-arpabet-phones.txt",
             "english-arpabet-dict.txt",
-            "english-arpabet-phones.txt".to_owned(),
-            "english-arpabet-dict.txt".to_owned(),
+            "english-arpabet-phones.txt",
+            "english-arpabet-dict.txt",
         )
         .expect("synthetic english dictionary parses")
     }

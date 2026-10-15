@@ -116,11 +116,10 @@ fn normalize_english_phone(symbol: &mut String) {
         "axr" => Some("er"),
         "el" => Some("l"),
         "em" => Some("m"),
-        "en" => Some("n"),
+        "en" | "nx" => Some("n"),
         "eng" => Some("ng"),
         "hv" => Some("hh"),
         "ix" => Some("ih"),
-        "nx" => Some("n"),
         "ux" => Some("uw"),
         "wh" => Some("w"),
         _ => None,
@@ -179,7 +178,7 @@ fn decode_text(bytes: &[u8], label: &str) -> Result<String> {
         .map_err(|_| invalid(format!("{label}: Text is not valid UTF-8.")))?;
     if text
         .bytes()
-        .any(|b| (b < 0x20 && ![b'\t', b'\r', b'\n'].contains(&b)) || b == 0x7f)
+        .any(|b| (b < 0x20 && !b"\t\r\n".contains(&b)) || b == 0x7f)
     {
         return Err(invalid(format!(
             "{label}: Text contains an unsupported control character."
@@ -231,11 +230,11 @@ impl PhonemeDictionary {
             &dictionary_bytes,
             &phones_path.display().to_string(),
             &dictionary_path.display().to_string(),
-            phones_path
+            &phones_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            dictionary_path
+            &dictionary_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -340,21 +339,25 @@ impl PhonemeDictionary {
     /// `phones_name` / `dictionary_name` are the file names, which select the
     /// English ARPABET and CMUDict handling; the `*_label` strings name the
     /// files in error messages.
+    // Mirrors the upstream C++ dictionary parsing flow, so keep it whole.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(
         phones_bytes: &[u8],
         dictionary_bytes: &[u8],
         phones_label: &str,
         dictionary_label: &str,
-        phones_name: String,
-        dictionary_name: String,
+        phones_name: &str,
+        dictionary_name: &str,
     ) -> Result<Self> {
         let phones_text = decode_text(phones_bytes, phones_label)?;
         let dictionary_text = decode_text(dictionary_bytes, dictionary_label)?;
         let phones_path = Path::new(phones_label).to_path_buf();
         let dictionary_path = Path::new(dictionary_label).to_path_buf();
 
-        let mut loaded = PhonemeDictionary::default();
-        loaded.is_english_arpabet = phones_name == "english-arpabet-phones.txt";
+        let mut loaded = PhonemeDictionary {
+            is_english_arpabet: phones_name == "english-arpabet-phones.txt",
+            ..Default::default()
+        };
         let is_cmu = loaded.is_english_arpabet && dictionary_name == "cmudict-07b.txt";
 
         let mut symbols = HashSet::new();
@@ -454,6 +457,14 @@ impl PhonemeDictionary {
     }
 
     /// Translates one lyric syllable into phoneme symbols.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic on valid `&str` input; the internal `expect` only fires
+    /// for a kana table entry that is not two chars, which is unreachable
+    /// for well-formed tables.
+    // Mirrors the upstream C++ lookup control flow, so keep it whole.
+    #[allow(clippy::too_many_lines)]
     pub fn lookup(&self, lyrics: &str) -> Result<Vec<String>> {
         if !self.is_loaded() {
             return Err(invalid("Phoneme dictionary is not loaded."));
@@ -463,7 +474,7 @@ impl PhonemeDictionary {
         }
         if lyrics
             .bytes()
-            .any(|b| (b < 0x20 && ![b'\t', b'\r', b'\n'].contains(&b)) || b == 0x7f)
+            .any(|b| (b < 0x20 && !b"\t\r\n".contains(&b)) || b == 0x7f)
         {
             return Err(invalid("Text contains an unsupported control character."));
         }
@@ -550,7 +561,7 @@ impl PhonemeDictionary {
         }
         let stripped: String = candidate
             .bytes()
-            .filter(|b| b.is_ascii_alphanumeric())
+            .filter(u8::is_ascii_alphanumeric)
             .map(char::from)
             .collect();
         if stripped.is_empty() {
@@ -652,7 +663,7 @@ impl PhonemeDictionary {
         }
         let stripped: String = candidate
             .bytes()
-            .filter(|b| b.is_ascii_alphanumeric())
+            .filter(u8::is_ascii_alphanumeric)
             .map(char::from)
             .collect();
         !stripped.is_empty() && self.entries.contains_key(&stripped)
@@ -792,8 +803,8 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             dict.as_bytes(),
             "phones.txt",
             "dict.txt",
-            phones_name.to_owned(),
-            dict_name.to_owned(),
+            phones_name,
+            dict_name,
         )
     }
 
@@ -823,8 +834,8 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             MINI_ROMAJI_DICT.as_bytes(),
             "phones.txt",
             "dict.txt",
-            "japanese-romaji-phones.txt".to_owned(),
-            "japanese-romaji-dict.txt".to_owned(),
+            "japanese-romaji-phones.txt",
+            "japanese-romaji-dict.txt",
         )
         .expect("synthetic romaji dictionary parses")
     }
@@ -911,8 +922,8 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
             b"hello hh ah l ow\n",
             "phones.txt",
             "dict.txt",
-            "english-arpabet-phones.txt".to_owned(),
-            "english-arpabet-dict.txt".to_owned(),
+            "english-arpabet-phones.txt",
+            "english-arpabet-dict.txt",
         )
         .unwrap();
         assert_eq!(dictionary.lookup("hello").unwrap(), ["hh", "ah", "l", "ow"]);
