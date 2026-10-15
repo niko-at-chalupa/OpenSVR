@@ -33,7 +33,10 @@ Exit codes: 0 ok, 1 usage error, 2 load error, 3 render/write error, 130 cancell
 
 /// Whether `argv[1]` names a subcommand of the new CLI.
 pub fn is_subcommand(name: &str) -> bool {
-    matches!(name, "info" | "render" | "midi" | "convert")
+    matches!(
+        name,
+        "info" | "render" | "midi" | "convert" | "complete" | "man"
+    )
 }
 
 /// Whether `argv[1]` is a clap help/version request that must keep the
