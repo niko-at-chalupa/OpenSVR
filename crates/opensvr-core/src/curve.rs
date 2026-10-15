@@ -13,7 +13,7 @@ use std::{fmt, str::FromStr};
 
 use thiserror::Error;
 
-use crate::{BLICKS_PER_QUARTER, Blick};
+use crate::{BLICKS_PER_QUARTER, Blick, Extra};
 
 /// Interpolation mode of a [`Curve`]; the C++ default is `"cubic"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -73,6 +73,8 @@ pub struct Curve {
     pub mode: Interpolation,
     /// Ordered control points (sorted strictly by position).
     pub points: Vec<AutomationPoint>,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 /// Unsigned distance between two [`Blick`] positions as an `f64`.
@@ -204,6 +206,7 @@ mod tests {
                 .iter()
                 .map(|&(position, value)| AutomationPoint { position, value })
                 .collect(),
+            extra: Extra::default(),
         }
     }
 
@@ -217,6 +220,7 @@ mod tests {
             let empty = Curve {
                 mode,
                 points: Vec::new(),
+                extra: Extra::default(),
             };
             assert_eq!(sample_curve(&empty, 0, 0.0), 0.0);
             assert_eq!(sample_curve(&empty, 42, 1.0), 1.0);
@@ -319,5 +323,10 @@ mod tests {
         }
         assert!("smooth".parse::<Interpolation>().is_err());
         assert!("".parse::<Interpolation>().is_err());
+    }
+
+    #[test]
+    fn fresh_curves_carry_no_preserved_fields() {
+        assert!(Curve::default().extra.is_empty());
     }
 }

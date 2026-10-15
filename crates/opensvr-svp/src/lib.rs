@@ -14,9 +14,9 @@ use std::{
 };
 
 use opensvr_core::{
-    AutomationPoint, Blick, Curve, GroupReference, Interpolation, MAX_FILE_BLICK, Mixer, Note,
-    NoteGroup, PitchAttribute, PitchAttributes, Project, TempoChange, TempoMap, TimeSignature,
-    Track, VocalModeSetting, VoiceSettings,
+    AutomationPoint, Blick, Curve, Extra, GroupReference, Interpolation, MAX_FILE_BLICK, Mixer,
+    Note, NoteGroup, PitchAttribute, PitchAttributes, Project, TempoChange, TempoMap,
+    TimeSignature, Track, VocalModeSetting, VoiceSettings,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -94,6 +94,7 @@ pub fn parse(bytes: &[u8], name: impl Into<String>, base_dir: &Path) -> Result<P
         tracks,
         library,
         tempo_map: raw.time.into_tempo_map()?,
+        extra: Extra::default(),
     };
     check_references(&project)?;
     Ok(project)
@@ -304,6 +305,7 @@ impl RawTime {
                 Ok(TempoChange {
                     position,
                     bpm: tempo.bpm,
+                    extra: Extra::default(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -315,6 +317,7 @@ impl RawTime {
                     bar: u32::try_from(meter.index).unwrap_or(u32::MAX),
                     numerator: u32::try_from(meter.numerator).unwrap_or(0),
                     denominator: u32::try_from(meter.denominator).unwrap_or(0),
+                    extra: Extra::default(),
                 };
                 if meter.index < 0 || meter.index > i64::from(i32::MAX) || !signature.is_valid() {
                     return invalid("a meter marker is invalid");
@@ -344,6 +347,7 @@ impl RawNote {
                     self.system_attributes.as_ref(),
                     "note systemAttributes",
                 )?,
+                extra: Extra::default(),
             }),
             _ => invalid("a note has invalid timing, pitch, or detune"),
         }
@@ -369,6 +373,7 @@ impl RawGroup {
             pitch_delta: read_curve(parameters.pitch_delta, "pitchDelta")?,
             vibrato_env: read_curve(parameters.vibrato_env, "vibratoEnv")?,
             vocal_modes: read_vocal_modes(self.vocal_modes.as_ref())?,
+            extra: Extra::default(),
         })
     }
 }
@@ -411,6 +416,7 @@ fn read_vocal_modes(raw: Option<&Value>) -> Result<BTreeMap<String, VocalModeSet
                             amount,
                             has_curve: false,
                             curve: Curve::default(),
+                            extra: Extra::default(),
                         },
                     );
                 }
@@ -632,7 +638,11 @@ fn read_curve_inner(raw: Option<RawCurve>, name: &str, normalise: bool) -> Resul
         }
     }
     if !normalise {
-        return Ok(Curve { mode, points });
+        return Ok(Curve {
+            mode,
+            points,
+            extra: Extra::default(),
+        });
     }
     if points.len() > 1
         && points
@@ -654,6 +664,7 @@ fn read_curve_inner(raw: Option<RawCurve>, name: &str, normalise: bool) -> Resul
     Ok(Curve {
         mode,
         points: deduped,
+        extra: Extra::default(),
     })
 }
 
@@ -694,6 +705,7 @@ impl RawReference {
             vocal_mode_preset,
             vocal_mode_params,
             voice_pitch,
+            extra: Extra::default(),
         })
     }
 }
@@ -740,6 +752,7 @@ impl RawTrack {
                 solo: mixer.solo,
             },
             voice,
+            extra: Extra::default(),
         })
     }
 }

@@ -366,6 +366,7 @@ mod tests {
                         detune: 0.0,
                         attributes: opensvr_core::PitchAttributes::default(),
                         system_attributes: opensvr_core::PitchAttributes::default(),
+                        extra: opensvr_core::Extra::default(),
                     },
                     opensvr_core::Note {
                         onset: 1,
@@ -376,6 +377,7 @@ mod tests {
                         detune: 0.0,
                         attributes: opensvr_core::PitchAttributes::default(),
                         system_attributes: opensvr_core::PitchAttributes::default(),
+                        extra: opensvr_core::Extra::default(),
                     },
                     opensvr_core::Note {
                         onset: 2,
@@ -386,6 +388,7 @@ mod tests {
                         detune: 0.0,
                         attributes: opensvr_core::PitchAttributes::default(),
                         system_attributes: opensvr_core::PitchAttributes::default(),
+                        extra: opensvr_core::Extra::default(),
                     },
                 ],
                 ..NoteGroup::default()
@@ -422,6 +425,7 @@ mod tests {
                     detune: 0.0,
                     attributes: opensvr_core::PitchAttributes::default(),
                     system_attributes: opensvr_core::PitchAttributes::default(),
+                    extra: opensvr_core::Extra::default(),
                 }],
                 ..NoteGroup::default()
             },

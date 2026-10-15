@@ -1,18 +1,22 @@
-use crate::{BLICKS_PER_QUARTER, Blick};
+use crate::{BLICKS_PER_QUARTER, Blick, Extra};
 
 /// A tempo marker: `bpm` applies from `position` until the next marker.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TempoChange {
     pub position: Blick,
     pub bpm: f64,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 /// A meter marker. `bar` is zero-based.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeSignature {
     pub bar: u32,
     pub numerator: u32,
     pub denominator: u32,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
 }
 
 impl Default for TimeSignature {
@@ -21,20 +25,21 @@ impl Default for TimeSignature {
             bar: 0,
             numerator: 4,
             denominator: 4,
+            extra: Extra::default(),
         }
     }
 }
 
 impl TimeSignature {
     /// Whether the numerator and denominator are in range and the denominator is a power of two.
-    pub fn is_valid(self) -> bool {
+    pub fn is_valid(&self) -> bool {
         (1..=256).contains(&self.numerator)
             && (1..=256).contains(&self.denominator)
             && self.denominator.is_power_of_two()
     }
 
     /// Length of one bar in blicks.
-    pub fn bar_length(self) -> Blick {
+    pub fn bar_length(&self) -> Blick {
         Blick::from(self.numerator) * BLICKS_PER_QUARTER * 4 / Blick::from(self.denominator)
     }
 }
@@ -67,6 +72,7 @@ impl TempoMap {
                 TempoChange {
                     position: 0,
                     bpm: Self::DEFAULT_BPM,
+                    extra: Extra::default(),
                 },
             );
         }
@@ -151,7 +157,11 @@ mod tests {
     fn map(tempos: &[(Blick, f64)]) -> TempoMap {
         let tempos = tempos
             .iter()
-            .map(|&(position, bpm)| TempoChange { position, bpm })
+            .map(|&(position, bpm)| TempoChange {
+                position,
+                bpm,
+                extra: Extra::default(),
+            })
             .collect();
         TempoMap::new(tempos, Vec::new())
     }
@@ -189,7 +199,8 @@ mod tests {
             map.tempos()[0],
             TempoChange {
                 position: 0,
-                bpm: 120.0
+                bpm: 120.0,
+                extra: Extra::default(),
             }
         );
         assert_eq!(map.tempos().len(), 2);
@@ -201,11 +212,13 @@ mod tests {
             bar: 0,
             numerator: 3,
             denominator: 4,
+            extra: Extra::default(),
         };
         let compound = TimeSignature {
             bar: 0,
             numerator: 6,
             denominator: 8,
+            extra: Extra::default(),
         };
         assert_eq!(waltz.bar_length(), 3 * BLICKS_PER_QUARTER);
         assert_eq!(compound.bar_length(), 3 * BLICKS_PER_QUARTER);
@@ -213,9 +226,17 @@ mod tests {
             !TimeSignature {
                 bar: 0,
                 numerator: 4,
-                denominator: 3
+                denominator: 3,
+                extra: Extra::default(),
             }
             .is_valid()
         );
+    }
+
+    #[test]
+    fn fresh_tempo_values_carry_no_preserved_fields() {
+        assert!(TimeSignature::default().extra.is_empty());
+        let map = TempoMap::default();
+        assert!(map.tempos()[0].extra.is_empty());
     }
 }
