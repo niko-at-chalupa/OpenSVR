@@ -342,6 +342,11 @@ pub struct GroupReference {
     pub vocal_mode_params: BTreeMap<String, f64>,
     /// Track/reference-level default pitch attributes (`voicePitch`).
     pub voice_pitch: PitchAttributes,
+    /// Engine-generated pitch deviation curve in cents, sampled at the
+    /// group-local position like `pitch_delta` (`systemPitchDelta` in
+    /// `src/core/ProjectFile.cpp`, consumed in `ProjectRenderer::buildPitch`).
+    /// Empty when the editor never generated one.
+    pub system_pitch_delta: Curve,
     /// Unknown SVP JSON fields kept for a lossless round trip.
     pub extra: Extra,
 }
@@ -361,6 +366,7 @@ impl Default for GroupReference {
             vocal_mode_preset: String::new(),
             vocal_mode_params: BTreeMap::new(),
             voice_pitch: PitchAttributes::default(),
+            system_pitch_delta: Curve::default(),
             extra: Extra::default(),
         }
     }

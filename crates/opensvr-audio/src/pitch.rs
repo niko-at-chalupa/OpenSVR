@@ -15,9 +15,10 @@
 //! fall back to generated widths (`seconds_per_quarter * 0.2`) or system
 //! attributes for rap, and manual notes fall back to the placing reference's
 //! `voicePitch` or the C++ manual default. Group `pitchDelta` curves add cents
-//! offsets; the imported `systemPitchDelta` contour has no Rust field (the SVP
-//! reader strips it and the saver emits the empty default), so its gate
-//! always passes and the neural residual applies wherever one is predicted.
+//! offsets alongside the placing reference's imported `systemPitchDelta`
+//! contour, exactly as in `buildPitch`: a non-empty system contour also gates
+//! the neural residual off for its group, since the editor already generated
+//! pitch motion there.
 
 use opensvr_core::{Blick, GroupReference, Note, PitchAttribute, sample_curve};
 use opensvr_g2p::{PhonemeDuration, TimingSyllable};
@@ -346,11 +347,13 @@ pub fn build_vocal_mode_weights(
 /// pitch-model curve starting at `pitch_start_seconds` on `pitch_frame_interval_seconds`.
 /// An empty prediction contributes no residual, as in C++.
 ///
-/// Per-note attributes, the group `pitchDelta` curve and rap intonation feed
+/// Per-note attributes, the group `pitchDelta` curve, the reference
+/// `systemPitchDelta` contour and rap intonation feed
 /// the assembly exactly as in `buildPitch`; the analytical vibrato layer is
-/// scaled by [`build_vibrato_envelope`]. The imported `systemPitchDelta`
-/// contour has no Rust field (always empty), so its gate always passes and the
-/// neural residual applies wherever one is predicted.
+/// scaled by [`build_vibrato_envelope`]. A non-empty system contour gates the
+/// neural residual off for its group (the editor already generated pitch
+/// motion there), so the prediction only applies where no contour was
+/// imported.
 ///
 /// Errors when the assembled pitch is non-finite, mirroring `buildPitch`.
 #[allow(clippy::too_many_arguments)]
@@ -415,10 +418,12 @@ pub fn build_log_f0(
             note.tempo_map.seconds_to_blick(seconds),
             note.reference.time_offset,
         );
-        // Rust has no `systemPitchDelta` field (the SVP reader strips it), so
-        // the C++ gate on its emptiness always passes here.
+        // SVP's `systemPitchDelta` is already the source editor's generated
+        // pitch contour: adding a second neural prediction over it
+        // double-counts natural pitch motion, so the residual only applies
+        // where the group imported no system contour, as in `buildPitch`.
         let mut automatic_delta = 0.0;
-        if !residual.is_empty() {
+        if note.reference.system_pitch_delta.points.is_empty() && !residual.is_empty() {
             let model_frame =
                 ((seconds - pitch_start_seconds) / pitch_interval).clamp(0.0, last_model_frame);
             let left = model_frame as usize;
@@ -427,9 +432,11 @@ pub fn build_log_f0(
             automatic_delta =
                 f64::from(residual[left]) + f64::from(residual[right] - residual[left]) * fraction;
         }
-        // The group pitch correction rides on top of the (always empty)
-        // imported system contour.
-        let cents = sample_curve(&note.group.pitch_delta, position, 0.0);
+        // The imported system contour rides under the group's editable pitch
+        // correction, in the C++ sampling order: both hold their endpoints
+        // outside their stored range via the shared curve sampler.
+        let cents = sample_curve(&note.reference.system_pitch_delta, position, 0.0)
+            + sample_curve(&note.group.pitch_delta, position, 0.0);
         let note_progress = ((seconds - note.start) / (note.end - note.start)).clamp(0.0, 1.0);
         let rap_intonation = if note.note.musical_type == "rap" {
             editor_notes[note_index].rap_intonation * (note_progress - 0.5)
@@ -727,6 +734,73 @@ mod tests {
                 "got {bent}, want {plain} + one semitone"
             );
         }
+    }
+
+    #[test]
+    fn system_pitch_delta_cents_add_to_the_group_curve() {
+        // The imported system contour rides under the editable `pitchDelta`
+        // correction in the C++ sampling order, so both shift the sung pitch.
+        use opensvr_core::BLICKS_PER_QUARTER as Q;
+        let group = NoteGroup {
+            pitch_delta: linear_curve(&[(0, 50.0), (4 * Q, 50.0)]),
+            ..NoteGroup::default()
+        };
+        let reference = GroupReference {
+            system_pitch_delta: linear_curve(&[(0, 50.0), (4 * Q, 50.0)]),
+            ..GroupReference::default()
+        };
+        let plain = [note(1.0, 2.0, 60)];
+        let bent = [timed_note(
+            1.0, 2.0, 60, &SCORE, &group, &reference, &REFERENCE, &TEMPO,
+        )];
+        let plain_f0 = build_log_f0(&plain, 1.0, 0.005, 200, &[], 1.0, 0.005).unwrap();
+        let bent_f0 = build_log_f0(&bent, 1.0, 0.005, 200, &[], 1.0, 0.005).unwrap();
+        let semitone = std::f64::consts::LN_2 / 12.0;
+        for (plain, bent) in plain_f0.iter().zip(&bent_f0) {
+            assert!(
+                (f64::from(*bent) - f64::from(*plain) - semitone).abs() < 1e-6,
+                "got {bent}, want {plain} + one semitone"
+            );
+        }
+    }
+
+    #[test]
+    fn system_pitch_delta_gates_the_neural_residual() {
+        // A non-empty system contour means the editor already generated pitch
+        // motion there, so the neural residual must not apply on top of it.
+        use opensvr_core::BLICKS_PER_QUARTER as Q;
+        let base = render_pitch_prediction_base(
+            &[PitchCurveNote {
+                start_seconds: 1.0,
+                end_seconds: 2.0,
+                ..PitchCurveNote::default()
+            }],
+            1.0,
+            0.005,
+            200,
+        );
+        let prediction: Vec<f32> = base.iter().map(|value| value + 1.0).collect();
+        let plain = [note(1.0, 2.0, 60)];
+        let plain_f0 = build_log_f0(&plain, 1.0, 0.005, 200, &prediction, 1.0, 0.005).unwrap();
+        let silent = build_log_f0(&plain, 1.0, 0.005, 200, &[], 1.0, 0.005).unwrap();
+        assert_ne!(
+            plain_f0, silent,
+            "the residual must move the sung pitch without a system contour"
+        );
+        // A flat zero contour still counts as imported: it gates the residual
+        // while adding no cents of its own.
+        let reference = GroupReference {
+            system_pitch_delta: linear_curve(&[(0, 0.0), (4 * Q, 0.0)]),
+            ..GroupReference::default()
+        };
+        let gated = [timed_note(
+            1.0, 2.0, 60, &SCORE, &GROUP, &reference, &REFERENCE, &TEMPO,
+        )];
+        assert_eq!(
+            build_log_f0(&gated, 1.0, 0.005, 200, &prediction, 1.0, 0.005).unwrap(),
+            silent,
+            "an imported system contour must switch the residual off"
+        );
     }
 
     #[test]
