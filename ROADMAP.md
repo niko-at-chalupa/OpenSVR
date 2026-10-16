@@ -55,9 +55,6 @@ release automation) with hygiene (workspace clippy denial, `cargo fmt`).
 
 ## Remaining gaps
 
-- **`systemPitchDelta` has no Rust field.** The SVP reader strips it and the
-  saver emits the default empty curve, so `load -> save -> load` is a fixed
-  point except for non-default `systemPitchDelta` contours.
 - **`memmap2` for lazy voice entry slices.** Entries are read eagerly; a 40 MiB
   voice is re-read per unique path only because of the file-stamp cache, not
   mapped.
@@ -86,10 +83,11 @@ The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
 
 Done: `opensvr-core` + `opensvr-svp` + `opensvr-midi` read and write every
 field OpenSV understands — curves (`Linear`/`Cosine`/`Cubic` evaluation plus
-`pitchDelta`, `vibratoEnv`), vocal modes, the 14 pitch attributes, audio
-metadata, unknown-field capture via `Extra`, `load -> save -> load` fixed
-points, integer-valued floats, MIDI import, and `opensvr convert` — with the
-single documented `systemPitchDelta` gap noted above.
+`pitchDelta`, `vibratoEnv` and the per-reference `systemPitchDelta` contour,
+which also gates the neural residual in the pitch builder), vocal modes,
+the 14 pitch attributes, audio metadata, unknown-field capture via `Extra`,
+`load -> save -> load` fixed points, integer-valued floats, MIDI import,
+and `opensvr convert`.
 
 Original plan, kept for reference:
 
