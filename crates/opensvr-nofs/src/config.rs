@@ -7,7 +7,7 @@
 
 use thiserror::Error;
 
-use crate::{NofsError, VoiceDatabase};
+use crate::{NofsError, VoiceDatabase, database::is_safe_model_id};
 
 /// Errors raised while parsing the voice configuration table.
 #[derive(Debug, Error)]
@@ -73,7 +73,17 @@ pub struct VoiceConfiguration {
 
 impl VoiceConfiguration {
     /// Loads and validates the table from an open [`VoiceDatabase`].
+    ///
+    /// Flat document voices carry no `0x91` binary config blob, so the model
+    /// references resolve from the voice document instead, with the
+    /// architecture fixed per role (`duration` → `gen2a`, `acoustic` → `dds`,
+    /// `vocoder` → `nhv`): current packages describe their models in plain
+    /// JSON and no longer carry an architecture string. Container voices keep
+    /// the `0x91` path byte-identical.
     pub fn load(database: &VoiceDatabase) -> Result<Self> {
+        if database.has_document() {
+            return Self::load_document(database);
+        }
         let entry = database
             .entries()
             .iter()
@@ -122,6 +132,51 @@ impl VoiceConfiguration {
 
     pub fn vocoder_model(&self) -> &ModelReference {
         &self.vocoder
+    }
+
+    /// Resolves the three model references from a Flat voice document.
+    ///
+    /// Mirrors the reference `VoiceConfiguration::loadDocument`: each role
+    /// reads its model ID from the document field of the same name, the ID
+    /// must pass the safe-file-name guard, and the architecture is fixed per
+    /// role. The model bytes still resolve through the document-mode entries
+    /// (keyed by the same ID bytes), so a missing entry is the same error as
+    /// on the container path.
+    fn load_document(database: &VoiceDatabase) -> Result<Self> {
+        // (document field, container-style field name for errors, fixed architecture).
+        const FIELDS: [(&str, &str, &str); 3] = [
+            ("duration", "model_duration", "gen2a"),
+            ("acoustic", "model_timbre_pred", "dds"),
+            ("vocoder", "model_vocoder", "nhv"),
+        ];
+        let mut replacement = Self::default();
+        for (field, key_field, architecture) in FIELDS {
+            let id = database
+                .document()
+                .and_then(|document| document.get(field))
+                .and_then(|value| value.as_str())
+                .filter(|id| is_safe_model_id(id))
+                .ok_or_else(|| {
+                    invalid(format!("Voice configuration has no usable {field} model."))
+                })?;
+            let key = id.as_bytes().to_vec();
+            if !database.entries().iter().any(|entry| entry.key == key) {
+                return Err(invalid(format!(
+                    "Voice configuration references a missing model: {key_field}"
+                )));
+            }
+            let reference = ModelReference {
+                key,
+                architecture: architecture.to_owned(),
+                name: id.to_owned(),
+            };
+            match field {
+                "duration" => replacement.duration = reference,
+                "acoustic" => replacement.acoustic = reference,
+                _ => replacement.vocoder = reference,
+            }
+        }
+        Ok(replacement)
     }
 }
 
@@ -603,5 +658,87 @@ mod tests {
         let config = VoiceConfiguration::load(&db).unwrap();
         assert!(!config.entries().is_empty());
         assert_ne!(config.duration_model().architecture.len(), 0);
+    }
+
+    fn write_flat_document(models: &[(&str, &[u8])]) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "opensvr-config-flat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for (id, bytes) in models {
+            std::fs::write(models_dir.join(format!("{id}.dnni")), bytes).unwrap();
+        }
+        let doc = dir.join("info.nofs");
+        let document = serde_json::json!({
+            "name": "Flat Singer",
+            "acoustic": models[0].0,
+            "vocoder": models[1].0,
+            "duration": models[2].0,
+            "f0": models[3].0,
+        });
+        std::fs::write(&doc, serde_json::to_string(&document).unwrap()).unwrap();
+        (dir, doc)
+    }
+
+    const FLAT_MODELS: [(&str, &[u8]); 4] = [
+        ("acoustic-hash", b"acoustic-bytes"),
+        ("vocoder-hash", b"vocoder-bytes"),
+        ("duration-hash", b"duration-bytes"),
+        ("f0-hash", b"f0-bytes"),
+    ];
+
+    #[test]
+    fn document_config_resolves_fixed_architectures() {
+        let (dir, doc) = write_flat_document(&FLAT_MODELS);
+        let db = VoiceDatabase::open(&doc).unwrap();
+        assert!(db.has_document());
+        let config = VoiceConfiguration::load(&db).unwrap();
+        // No binary `0x91` table in document mode.
+        assert!(config.entries().is_empty());
+        assert_eq!(config.duration_model().architecture, "gen2a");
+        assert_eq!(config.acoustic_model().architecture, "dds");
+        assert_eq!(config.vocoder_model().architecture, "nhv");
+        assert_eq!(config.duration_model().key, b"duration-hash");
+        assert_eq!(config.acoustic_model().key, b"acoustic-hash");
+        assert_eq!(config.vocoder_model().key, b"vocoder-hash");
+        assert_eq!(config.duration_model().name, "duration-hash");
+        // References match the document-mode entries by raw key bytes.
+        for reference in [
+            config.duration_model(),
+            config.acoustic_model(),
+            config.vocoder_model(),
+        ] {
+            assert!(db.entries().iter().any(|entry| entry.key == reference.key));
+            assert!(
+                !db.read_entry(
+                    db.entries()
+                        .iter()
+                        .find(|entry| entry.key == reference.key)
+                        .unwrap()
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn real_flat_config_loads_when_provided() {
+        let Some(path) = std::env::var_os("OPENSVR_TEST_FLAT") else {
+            return;
+        };
+        let db = VoiceDatabase::open(std::path::Path::new(&path)).unwrap();
+        assert!(db.has_document());
+        let config = VoiceConfiguration::load(&db).unwrap();
+        assert_eq!(config.duration_model().architecture, "gen2a");
+        assert_eq!(config.acoustic_model().architecture, "dds");
+        assert_eq!(config.vocoder_model().architecture, "nhv");
     }
 }

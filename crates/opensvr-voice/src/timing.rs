@@ -414,6 +414,19 @@ impl PhonemeTiming {
     /// is staged into a candidate first: a failed load preserves the current
     /// model.
     pub fn load(&mut self, reader: &DnniReader, root_node: usize) -> Result<()> {
+        self.load_with_voice_override(reader, root_node, &[])
+    }
+
+    /// Loads the duration model with a Flat voice override for the 128-channel
+    /// voice embedding (`duration_style` from the voice document). An empty
+    /// override keeps the model-embedded defaults, exactly as for container
+    /// voices; a non-empty override replaces them before validation.
+    pub fn load_with_voice_override(
+        &mut self,
+        reader: &DnniReader,
+        root_node: usize,
+        voice_override: &[f32],
+    ) -> Result<()> {
         let nodes = reader.nodes();
         let Some(root) = nodes
             .get(root_node)
@@ -467,9 +480,13 @@ impl PhonemeTiming {
         };
         read_embedding(reader, children[4], 16, 8, &mut position_embedding)?;
 
-        // Speaker / voice embedding vector (128 floats).
-        let voice_embedding = reader.read_float_vector(children[5])?;
-        if voice_embedding.len() != 128 {
+        // Speaker / voice embedding vector (128 floats); a Flat document
+        // override replaces the embedded vector before validation.
+        let mut voice_embedding = reader.read_float_vector(children[5])?;
+        if !voice_override.is_empty() {
+            voice_embedding = voice_override.to_vec();
+        }
+        if voice_embedding.len() != 128 || !voice_embedding.iter().all(|value| value.is_finite()) {
             return Err(failure(
                 "the duration voice embedding must contain 128 channels.",
             ));

@@ -219,6 +219,19 @@ impl PitchModel {
     /// five model children (frontend, 32-channel speaker, enhancement
     /// projection, context, decoder). A failed load preserves the model.
     pub fn load(&mut self, reader: &DnniReader, root_node: usize) -> Result<()> {
+        self.load_with_speaker_override(reader, root_node, &[])
+    }
+
+    /// Loads the pitch model with a Flat voice override for the 32-channel
+    /// speaker vector (`f0_style` from the voice document). An empty override
+    /// keeps the model-embedded defaults, exactly as for container voices; a
+    /// non-empty override replaces them before validation.
+    pub fn load_with_speaker_override(
+        &mut self,
+        reader: &DnniReader,
+        root_node: usize,
+        speaker_override: &[f32],
+    ) -> Result<()> {
         let nodes = reader.nodes();
         let Some(root) = nodes
             .get(root_node)
@@ -253,7 +266,11 @@ impl PitchModel {
         }
         candidate.features.load(reader, children[0])?;
         candidate.speaker = reader.read_float_vector(children[1])?;
+        if !speaker_override.is_empty() {
+            candidate.speaker = speaker_override.to_vec();
+        }
         if candidate.speaker.len() != 32
+            || !candidate.speaker.iter().all(|value| value.is_finite())
             || candidate.features.frame_interval_seconds() != PREDICTION_INTERVAL_SECONDS
         {
             return Err(failure(

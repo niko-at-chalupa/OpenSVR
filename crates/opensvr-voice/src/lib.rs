@@ -23,6 +23,7 @@
 
 mod acoustic_features;
 mod acoustic_model;
+mod embeddings;
 mod excitation;
 mod fft;
 mod filter_bank;
@@ -44,6 +45,7 @@ mod vocoder;
 
 pub use acoustic_features::{AcousticFeatureConfig, AcousticFeatures};
 pub use acoustic_model::{AcousticFrameInterval, AcousticModel, AcousticModelState};
+pub use embeddings::{ACOUSTIC_CHANNELS, DURATION_CHANNELS, VoiceEmbeddings};
 pub use excitation::{
     PeriodicExcitationFrame, render_periodic_excitation, render_periodic_modulation,
 };
