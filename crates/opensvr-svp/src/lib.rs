@@ -4,13 +4,12 @@
 //! file layout, then validate into the domain types of [`opensvr_core`].
 //! Group automation curves (`parameters.pitchDelta` and `parameters.vibratoEnv`)
 //! and per-mode vocal-mode curves are read with the same validation as
-//! OpenSV's `readCurve`; unknown vendor fields at every level are captured
+//! OpenSV's `readCurve`, as is each reference's `systemPitchDelta` contour;
+//! unknown vendor fields at every level are captured
 //! into [`Extra`](opensvr_core::Extra) exactly like OpenSV's `preserve`.
 //! Writes mirror OpenSV's `write*` functions: each level starts from
 //! `retainedObject(extra)` and overwrites the handled keys from the domain
-//! values, so `parse(serialize(project))` is a fixed point (modulo the
-//! documented `systemPitchDelta` gap: Rust has no field for it yet, so the
-//! saver always emits the default empty curve).
+//! values, so `parse(serialize(project))` is a fixed point.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -868,9 +867,11 @@ impl RawReference {
         };
         // C++ `ProjectFile.cpp:484` strips the handled keys but NOT `audio`:
         // the saver overwrites it from `audioFile`, so the round trip still
-        // works. `systemPitchDelta` is stripped (read into the C++ member Rust
-        // has no field for yet); its value is dropped like the note legacy
-        // keys until the pitch builder lands.
+        // works. `systemPitchDelta` is a handled key like the group curves:
+        // it reads into `system_pitch_delta` with the same `readCurve`
+        // validation and `normaliseCurve` sort/dedup as its siblings.
+        let system_pitch_delta =
+            read_curve_inner(reference.get("systemPitchDelta"), "systemPitchDelta", true)?;
         let extra = preserve(
             reference,
             &[
@@ -897,6 +898,7 @@ impl RawReference {
             vocal_mode_preset,
             vocal_mode_params,
             voice_pitch,
+            system_pitch_delta,
             extra,
         })
     }
@@ -1186,12 +1188,11 @@ fn write_reference(reference: &GroupReference, base_dir: &Path) -> Value {
     value.insert("voice".to_owned(), Value::Object(voice));
     set_default(&mut value, "pitchTakes", default_takes());
     set_default(&mut value, "timbreTakes", default_takes());
-    // Rust has no `systemPitchDelta` field yet (it lands with the pitch
-    // builder), so the saver always emits the default empty curve; a loaded
-    // non-default curve cannot round-trip until then.
+    // The imported system contour round-trips like the group curves (C++
+    // `writeReference` always emits it, defaulting to the empty curve).
     value.insert(
         "systemPitchDelta".to_owned(),
-        Value::Object(write_curve(&Curve::default())),
+        Value::Object(write_curve(&reference.system_pitch_delta)),
     );
     if let Some(audio_file) = reference.audio_file.as_ref() {
         let mut audio = object_property(&value, "audio");
@@ -1708,6 +1709,91 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn system_pitch_delta_reads_like_its_siblings() {
+        // `readCurve` plus `normaliseCurve`, as in `ProjectFile.cpp:480` and
+        // `Project.cpp:312`: unsorted points sort, and the last point at each
+        // position wins.
+        let mut value = sample();
+        value["tracks"][0]["mainRef"]["systemPitchDelta"] = json!({
+            "mode": "linear",
+            "points": [1000, 1.0, 0, 2.0, 1000, 3.0],
+        });
+        let project = parse_value(&value).unwrap();
+        let contour = &project.tracks[0].main_ref.system_pitch_delta;
+        assert_eq!(contour.mode, Interpolation::Linear);
+        assert_eq!(
+            contour.points,
+            vec![
+                AutomationPoint {
+                    position: 0,
+                    value: 2.0
+                },
+                AutomationPoint {
+                    position: 1000,
+                    value: 3.0
+                },
+            ]
+        );
+        // Absent contours stay at the C++ default: an empty cubic curve.
+        let plain = parse_value(&sample()).unwrap();
+        assert_eq!(
+            plain.tracks[0].main_ref.system_pitch_delta,
+            Curve::default()
+        );
+        assert_eq!(
+            plain.tracks[0].main_ref.system_pitch_delta.mode,
+            Interpolation::Cubic
+        );
+    }
+
+    #[test]
+    fn non_default_system_pitch_delta_round_trips() {
+        // The case that failed before this generation: `load -> save -> load`
+        // dropped every non-default contour because the reader stripped it.
+        let mut value = sample();
+        value["tracks"][0]["mainRef"]["systemPitchDelta"] = json!({
+            "mode": "linear",
+            "points": [0, 10.0, 1000, -5.0],
+        });
+        let project = parse_value(&value).unwrap();
+        let saved = reserialize(&project);
+        let root: Value = serde_json::from_str(&saved).unwrap();
+        let contour = &root["tracks"][0]["mainRef"]["systemPitchDelta"];
+        assert_eq!(contour["mode"], json!("linear"));
+        assert_eq!(contour["points"], json!([0, 10.0, 1000, -5.0]));
+        let back = reparse(&saved);
+        assert_eq!(
+            back.tracks[0].main_ref.system_pitch_delta,
+            project.tracks[0].main_ref.system_pitch_delta
+        );
+        // The second cycle is byte-stable too. (Handled keys appended after
+        // retained vendor keys change key order on the first save, exactly as
+        // the C++ `set` calls do, so byte-identity only holds from the
+        // second save on.)
+        let saved_twice = reserialize(&back);
+        let as_value = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        assert_eq!(as_value(&saved), as_value(&saved_twice));
+        assert_eq!(reserialize(&reparse(&saved_twice)), saved_twice);
+    }
+
+    #[test]
+    fn rejects_malformed_system_pitch_delta() {
+        for bad in [
+            json!({ "mode": "smooth", "points": [0, 1.0, 100, 2.0] }),
+            json!({ "mode": "linear", "points": [0, 1.0, 500] }),
+            json!({ "mode": "linear", "points": [0.5, 1.0] }),
+            json!(5.0),
+        ] {
+            let mut value = sample();
+            value["tracks"][0]["groups"][0]["systemPitchDelta"] = bad;
+            assert!(
+                parse_value(&value).is_err(),
+                "a malformed systemPitchDelta should be rejected"
+            );
+        }
     }
     #[test]
     fn crop_sentinel_means_unbounded() {
