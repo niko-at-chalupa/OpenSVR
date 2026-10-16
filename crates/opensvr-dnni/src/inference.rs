@@ -1630,12 +1630,16 @@ fn run_layer(
                 "output tensor exceeds the memory limit.",
             ));
         }
-        assign_zero(&mut output.values, output.frames * output.channels);
-        // Scratch for one kernel tap, hoisted out of the frame loop: every
-        // `multiply_matrix` call overwrites all `matrix.rows` elements (each
-        // block writes its disjoint row slice), so the buffer never needs
-        // clearing between taps — `resize` only zero-fills on growth, and
-        // capacity persists across frames. Summation order is unchanged.
+        // Size the buffer without paying for a full zero pass: `resize`
+        // zero-fills only on capacity growth (once per shape in steady
+        // state), and every element below is either tap-written or
+        // explicitly zeroed before the bias pass reads it.
+        output.values.resize(output.frames * output.channels, 0.0);
+        // The first in-range tap overwrites its frame slice via
+        // `multiply_matrix` (identical to zero-then-add, since `0.0 + x == x`),
+        // later taps add through the scratch below, and a frame with every
+        // tap padding-skipped is zeroed explicitly. Bias still adds after the
+        // taps, in the same order as before.
         let mut product = Vec::new();
         for frame in 0..output.frames {
             if frame % CANCEL_POLL_STEPS == 0 && cancel.is_cancelled() {
@@ -1647,6 +1651,7 @@ fn run_layer(
             // [first, first+rows) slice of the output, so a temporary buffer
             // per tap is accumulated and added back in order, mirroring the C++
             // 2-frame unrolling (which keeps independent accumulators per frame).
+            let mut wrote = false;
             for (kernel, matrix) in layer.matrices.iter().enumerate() {
                 // Tensor dimensions are bounded by the memory limit, so the
                 // signed tap arithmetic cannot wrap; the sign carries padding.
@@ -1660,12 +1665,26 @@ fn run_layer(
                     continue;
                 }
                 let source = &input.values[tap as usize * input.channels..];
-                product.clear();
-                product.resize(matrix.rows, 0.0);
-                multiply_matrix(matrix, source, &mut product);
                 let destination = &mut output.values[frame * output.channels..];
-                for channel_out in 0..matrix.rows {
-                    destination[channel_out] += product[channel_out];
+                if wrote {
+                    product.clear();
+                    product.resize(matrix.rows, 0.0);
+                    multiply_matrix(matrix, source, &mut product);
+                    for (slot, value) in destination.iter_mut().zip(&product) {
+                        *slot += *value;
+                    }
+                } else {
+                    // First in-range tap overwrites: `multiply_matrix` fills
+                    // every row, so this equals the old zero-then-add exactly.
+                    multiply_matrix(matrix, source, &mut destination[..matrix.rows]);
+                    wrote = true;
+                }
+            }
+            if !wrote {
+                // Every tap padding-skipped: the old zeroed state, written
+                // explicitly so later passes never read a reused buffer.
+                for slot in &mut output.values[frame * output.channels..][..output.channels] {
+                    *slot = 0.0;
                 }
             }
             if !layer.bias.is_empty() {
