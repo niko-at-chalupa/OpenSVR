@@ -55,8 +55,6 @@ release automation) with hygiene (workspace clippy denial, `cargo fmt`).
 
 ## Remaining gaps
 
-- **No fuzzer for the DNNI parser.** It reads untrusted files; the plan was to
-  fuzz it with `cargo-fuzz`.
 - **No note IDs.** Only needed for editing and incremental caches; add
   `NoteId(u64)` when an editor-side consumer needs it.
 
