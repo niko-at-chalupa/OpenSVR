@@ -1,0 +1,1 @@
+OpenSVR started as a Rust port of [RynthV](https://github.com/cubeww/rynthv)'s engine (formerly a C++ project called OpenSV). (More specifically, [my own fork of it](https://github.com/niko-at-chalupa/OpenSV).) Other research comes from MysticILD's OpenSV+, another C++ fork.
