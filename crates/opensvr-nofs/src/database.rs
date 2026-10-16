@@ -15,6 +15,7 @@
 use std::{
     collections::HashSet,
     fs, io,
+    ops::Deref,
     path::{Path, PathBuf},
 };
 
@@ -82,7 +83,7 @@ impl Default for VoiceDatabase {
     fn default() -> Self {
         Self {
             path: PathBuf::new(),
-            data: Vec::new(),
+            data: Backing::Owned(Vec::new()),
             entries: Vec::new(),
             metadata: VoiceMetadata {
                 version: -1,
@@ -112,30 +113,79 @@ impl VoiceMetadata {
 
 /// An open NOFS archive: the raw bytes plus the parsed entry table.
 ///
-/// Entry payloads are borrowed from the in-memory file image, so large voices
-/// are read once and never copied per entry.
+/// `open` serves entries as borrowed slices over a read-only file mapping,
+/// like the C++ `VoiceDatabase` serving reads from its held-open stream:
+/// the file is never copied into an owned buffer. `from_bytes` keeps an
+/// owned copy for tests and non-file sources.
 #[derive(Debug)]
 pub struct VoiceDatabase {
     path: PathBuf,
-    data: Vec<u8>,
+    data: Backing,
     entries: Vec<VoiceEntry>,
     metadata: VoiceMetadata,
+}
+
+/// Backing bytes for an open archive: a file mapping or an owned copy.
+#[derive(Debug)]
+enum Backing {
+    Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl Deref for Backing {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data,
+            Self::Mapped(map) => map,
+        }
+    }
+}
+
+/// Maps `file` read-only. The single `unsafe` in the workspace lives here
+/// (see the crate lint scope): `memmap2` marks mapping `unsafe` because the
+/// OS may raise `SIGBUS` if the file is truncated under a live mapping.
+///
+/// Why this call is sound: the file is opened read-only and the mapping is
+/// private and read-only, so this process never mutates it; the `Mmap` is
+/// owned by the returned `VoiceDatabase` and borrowed slices never outlive
+/// it. Mutating a voice file while a render holds it open is a caller
+/// contract violation — the same class of misuse as rewriting the file
+/// under the C++ `VoiceDatabase`'s held-open stream — and normal flows
+/// never do it: the stamp-keyed voice cache re-opens on any size/mtime
+/// change, closing the old database with its cache entry.
+#[allow(unsafe_code)]
+fn map_file(file: &fs::File) -> io::Result<memmap2::Mmap> {
+    // SAFETY: upheld as documented above.
+    unsafe { memmap2::Mmap::map(file) }
 }
 
 impl VoiceDatabase {
     /// Opens and validates `path`, parsing the entry table and metadata.
     ///
+    /// The file is mapped read-only and entries borrow from the mapping;
+    /// no owned copy of the image is kept.
+    ///
     /// On failure no partial state is kept; the error message matches the C++
     /// `juce::Result` text (without re-reading: the caller gets `Err` only).
     pub fn open(path: &Path) -> Result<Self> {
-        let data = fs::read(path).map_err(|source| NofsError::Io {
+        let io_error = |source: io::Error| NofsError::Io {
             path: path.to_owned(),
             source,
-        })?;
-        let (entries, metadata) = parse(&data)?;
+        };
+        let file = fs::File::open(path).map_err(io_error)?;
+        let len = file.metadata().map_err(io_error)?.len();
+        if len < FILE_HEADER_SIZE + 10 {
+            // Match `parse`'s verdict without mapping: this also keeps
+            // empty files portable (zero-length mappings fail on Windows).
+            return Err(invalid("truncated file header"));
+        }
+        let map = map_file(&file).map_err(io_error)?;
+        let (entries, metadata) = parse(&map)?;
         Ok(Self {
             path: path.to_owned(),
-            data,
+            data: Backing::Mapped(map),
             entries,
             metadata,
         })
@@ -146,7 +196,7 @@ impl VoiceDatabase {
         let (entries, metadata) = parse(&data)?;
         Ok(Self {
             path,
-            data,
+            data: Backing::Owned(data),
             entries,
             metadata,
         })
@@ -546,6 +596,78 @@ mod tests {
                 .to_string(),
             "NOFS: value block trailer mismatch"
         );
+    }
+
+    #[test]
+    fn open_serves_entries_from_a_mapping() {
+        let dir = std::env::temp_dir().join(format!(
+            "opensvr-nofs-map-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("voice.nofs");
+        let records = &[
+            (b".name".as_slice(), b"Kasane Teto".as_slice()),
+            (b".version".as_slice(), b"104".as_slice()),
+            (b"samples".as_slice(), b"\x00\x01\x02".as_slice()),
+        ];
+        std::fs::write(&path, archive(records, 10)).unwrap();
+
+        let mapped = VoiceDatabase::open(&path).unwrap();
+        let owned = VoiceDatabase::from_bytes(path.clone(), std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(mapped.entries().len(), owned.entries().len());
+        assert_eq!(mapped.metadata().name, "Kasane Teto");
+        for (left, right) in mapped.entries().iter().zip(owned.entries().iter()) {
+            assert_eq!(left.key, right.key);
+            assert_eq!(left.value_offset, right.value_offset);
+            assert_eq!(left.value_size, right.value_size);
+            assert_eq!(
+                mapped.read_entry(left).unwrap(),
+                owned.read_entry(right).unwrap()
+            );
+        }
+        // Payloads read through the map, with the membership check intact.
+        let entry = mapped.find_entry("samples").unwrap().clone();
+        assert_eq!(mapped.read_entry(&entry).unwrap(), [0, 1, 2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_keeps_file_errors_unchanged() {
+        let missing = std::env::temp_dir().join(format!(
+            "opensvr-nofs-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let error = VoiceDatabase::open(&missing).unwrap_err().to_string();
+        assert!(
+            error.starts_with("could not read voice database "),
+            "unexpected: {error}"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "opensvr-nofs-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.nofs");
+        std::fs::write(&empty, []).unwrap();
+        assert_eq!(
+            VoiceDatabase::open(&empty).unwrap_err().to_string(),
+            "NOFS: truncated file header"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
