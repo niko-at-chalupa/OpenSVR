@@ -6,13 +6,7 @@
 
 An engine that uses _(Singing Voice)_ databases to render singing.
 
-<div align="center">
-  
-<video src='https://github.com/user-attachments/assets/130bf1df-6e04-4644-a0cc-19a332642be2'/>
-
-_[FLAVOR FOLEY's "Water the Roses,"](https://youtu.be/NA3MJmcyPpE) rendered by OpenSVR_
-
-</div>
+[Click here](assets/sounds/watertherosessvr.wav) to listen to a snippet of [FLAVOR FOLEY's "Water the Roses,"](https://youtu.be/NA3MJmcyPpE) rendered by OpenSVR_
 
 OpenSVR comes with a CLI but it's meant to be a library. I find it frivolous to come with an editor, this shouldn't act as a direct competitor to a certain other piece of software when such works _perfectly fine_.
 
