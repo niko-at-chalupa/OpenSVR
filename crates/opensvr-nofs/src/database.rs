@@ -11,6 +11,13 @@
 //!   type `0x1000` (u16); the last 4 bytes repeat the size. Contents are ignored.
 //! - Contiguous value records: size (u32), type `1` (u16), key length (u16),
 //!   key bytes, value length (u32), payload, 4-byte trailer repeating the size.
+//!
+//! Flat voices skip the container: the voice file is a JSON document with
+//! singer metadata plus `acoustic`/`vocoder`/`duration`/`f0` model IDs, and
+//! the models are sibling `.dnni` files. A leading `{` (past any byte-order
+//! mark and JSON whitespace) selects document mode in
+//! [`VoiceDatabase::open`]; model bytes are read eagerly into an owned blob
+//! and served through the same entry interface.
 
 use std::{
     collections::HashSet,
@@ -19,6 +26,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde_json::Value;
 use thiserror::Error;
 
 /// Errors raised while opening or reading a NOFS archive.
@@ -50,6 +58,10 @@ const MAXIMUM_METADATA_SIZE: u32 = 1024 * 1024;
 const MAXIMUM_TOTAL_KEY_SIZE: u64 = 16 * 1024 * 1024;
 const MAXIMUM_TOTAL_METADATA_SIZE: u64 = 16 * 1024 * 1024;
 const MAXIMUM_ENTRY_COUNT: usize = 100_000;
+/// Longest accepted Flat model ID, mirroring the reference filename guard.
+const MAXIMUM_MODEL_ID_LENGTH: usize = 240;
+/// Model roles named by a Flat voice document, in entry order.
+const MODEL_FIELDS: [&str; 4] = ["duration", "acoustic", "vocoder", "f0"];
 
 /// One file or resource entry stored in the archive.
 #[derive(Debug, Clone)]
@@ -167,32 +179,66 @@ impl VoiceDatabase {
     /// The file is mapped read-only and entries borrow from the mapping;
     /// no owned copy of the image is kept.
     ///
+    /// A leading `{` (past any byte-order mark and JSON whitespace) selects
+    /// Flat document mode instead: the sibling `.dnni` model files are read
+    /// eagerly into an owned blob. See [`VoiceDatabase::open_with_models`].
+    ///
     /// On failure no partial state is kept; the error message matches the C++
     /// `juce::Result` text (without re-reading: the caller gets `Err` only).
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_models(path, None)
+    }
+
+    /// Opens `path`, resolving Flat document models from `models` instead of
+    /// the document's sibling `models` directory. Container voices ignore it.
+    pub fn open_with_models(path: &Path, models: Option<&Path>) -> Result<Self> {
         let io_error = |source: io::Error| NofsError::Io {
             path: path.to_owned(),
             source,
         };
-        let file = fs::File::open(path).map_err(io_error)?;
+        let mut file = fs::File::open(path).map_err(io_error)?;
         let len = file.metadata().map_err(io_error)?.len();
         if len < FILE_HEADER_SIZE + 10 {
-            // Match `parse`'s verdict without mapping: this also keeps
-            // empty files portable (zero-length mappings fail on Windows).
+            // Too small for a container header; it can only be a (tiny)
+            // document. This also keeps empty files portable (zero-length
+            // mappings fail on Windows).
+            let bytes = fs::read(path).map_err(io_error)?;
+            if !bytes.is_empty() && is_document_probe(&bytes) {
+                let text = String::from_utf8_lossy(&bytes);
+                return open_document(&text, path, models);
+            }
             return Err(invalid("truncated file header"));
         }
-        let map = map_file(&file).map_err(io_error)?;
-        let (entries, metadata) = parse(&map)?;
-        Ok(Self {
-            path: path.to_owned(),
-            data: Backing::Mapped(map),
-            entries,
-            metadata,
-        })
+        let probe_len = len.min(64) as usize;
+        let mut probe = vec![0u8; probe_len];
+        std::io::Read::read_exact(&mut file, &mut probe).map_err(io_error)?;
+        if !is_document_probe(&probe) {
+            let map = map_file(&file).map_err(io_error)?;
+            let (entries, metadata) = parse(&map)?;
+            return Ok(Self {
+                path: path.to_owned(),
+                data: Backing::Mapped(map),
+                entries,
+                metadata,
+            });
+        }
+        drop(file);
+        let bytes = fs::read(path).map_err(io_error)?;
+        // The probe already saw text; lossy decoding only decides which
+        // document error an undecodable file reports.
+        let text = String::from_utf8_lossy(&bytes);
+        open_document(&text, path, models)
     }
 
     /// Parses an in-memory NOFS image. The database owns a copy of `data`.
+    ///
+    /// A leading `{` selects Flat document mode: `data` is parsed as a JSON
+    /// voice document and sibling models resolve under `path`'s parent.
     pub fn from_bytes(path: PathBuf, data: Vec<u8>) -> Result<Self> {
+        if is_document_probe(&data) {
+            let text = String::from_utf8_lossy(&data);
+            return open_document(&text, &path, None);
+        }
         let (entries, metadata) = parse(&data)?;
         Ok(Self {
             path,
@@ -352,6 +398,263 @@ fn parse(data: &[u8]) -> Result<(Vec<VoiceEntry>, VoiceMetadata)> {
     // Metadata must validate too; a failure invalidates the whole open.
     let metadata = read_metadata(data, &entries)?;
     Ok((entries, metadata))
+}
+
+/// Whether `prefix` starts a Flat voice document: first byte past any
+/// byte-order mark and JSON whitespace is `{`, mirroring the reference
+/// document probe (byte-order mark, `space \t \r \n \f`).
+fn is_document_probe(prefix: &[u8]) -> bool {
+    let mut bytes = prefix;
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes = &bytes[3..];
+    }
+    let first = bytes
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | 0x0C));
+    matches!(first, Some(b'{'))
+}
+
+/// Whether a Flat model ID is a safe file name, mirroring the reference
+/// installer-side guard: non-blank, bounded, no separators or reserved
+/// device names, no control characters.
+fn is_safe_model_id(id: &str) -> bool {
+    if id.trim().is_empty()
+        || id.len() > MAXIMUM_MODEL_ID_LENGTH
+        || id == "."
+        || id == ".."
+        || id.ends_with(' ')
+        || id.ends_with('.')
+    {
+        return false;
+    }
+    for character in id.chars() {
+        if character < '\u{20}'
+            || ('\u{7f}'..='\u{9f}').contains(&character)
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+        {
+            return false;
+        }
+    }
+    let device = id
+        .split('.')
+        .next()
+        .unwrap_or(id)
+        .trim_end_matches(' ')
+        .to_uppercase();
+    if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return false;
+    }
+    if device.len() == 4
+        && (device.starts_with("COM") || device.starts_with("LPT"))
+        && matches!(device.as_bytes()[3], b'1'..=b'9')
+    {
+        return false;
+    }
+    true
+}
+
+/// Locates `<directory>/<id>.dnni`, falling back to a case-insensitive
+/// filename match for filesystems that disagree about case. Returns the
+/// expected path even when nothing matches, so missing-file errors name it.
+fn find_model_file(directory: &Path, id: &str) -> PathBuf {
+    let leaf = format!("{id}.dnni");
+    let expected = directory.join(&leaf);
+    if expected.is_file() {
+        return expected;
+    }
+    if let Ok(scan) = fs::read_dir(directory) {
+        for entry in scan.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&leaf)
+            {
+                return entry.path();
+            }
+        }
+    }
+    expected
+}
+
+/// Resolves a Flat model ID to a file: the explicit override directory
+/// first, then the document's sibling `models` directory, then the
+/// document's own directory.
+fn resolve_model(
+    doc_dir: Option<&Path>,
+    models_override: Option<&Path>,
+    id: &str,
+) -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(directory) = models_override {
+        candidates.push(find_model_file(directory, id));
+    }
+    if let Some(directory) = doc_dir {
+        candidates.push(find_model_file(&directory.join("models"), id));
+        candidates.push(find_model_file(directory, id));
+    }
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return Ok(candidate.clone());
+        }
+    }
+    let expected = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(format!("{id}.dnni")));
+    Err(invalid(format!(
+        "model file is missing: {}",
+        expected.display()
+    )))
+}
+
+/// Opens a Flat voice document: validates the four model references,
+/// reads the sibling models eagerly into one owned blob, aliases the `f0`
+/// entry as `f0model-dds`, and maps document metadata onto the fields
+/// `info` prints. All four roles are required; the synthesizer needs each.
+fn open_document(
+    text: &str,
+    doc_path: &Path,
+    models_override: Option<&Path>,
+) -> Result<VoiceDatabase> {
+    if text.is_empty() {
+        return Err(invalid("voice document is empty"));
+    }
+    let document: Value =
+        serde_json::from_str(text).map_err(|_| invalid("voice document is not a JSON object"))?;
+    let Value::Object(object) = &document else {
+        return Err(invalid("voice document is not a JSON object"));
+    };
+    let doc_dir = doc_path.parent();
+    let mut blob = Vec::new();
+    let mut entries = Vec::new();
+    let mut f0_id = String::new();
+    let mut f0_offset = 0u64;
+    let mut f0_size = 0u32;
+    for field in MODEL_FIELDS {
+        let id = match object.get(field) {
+            Some(Value::String(id)) if is_safe_model_id(id) => id.clone(),
+            _ => return Err(invalid(format!("unsafe model identifier for {field}"))),
+        };
+        let model_path = resolve_model(doc_dir, models_override, &id)?;
+        let bytes = fs::read(&model_path).map_err(|source| NofsError::Io {
+            path: model_path.clone(),
+            source,
+        })?;
+        if bytes.len() > MAXIMUM_ENTRY_SIZE as usize {
+            return Err(invalid(format!(
+                "model file exceeds the 512 MiB read limit: {}",
+                model_path.display()
+            )));
+        }
+        let offset = blob.len() as u64;
+        blob.extend_from_slice(&bytes);
+        entries.push(VoiceEntry {
+            key: id.as_bytes().to_vec(),
+            name: id.clone(),
+            value_offset: offset,
+            value_size: bytes.len() as u32,
+        });
+        if field == "f0" {
+            f0_id = id;
+            f0_offset = offset;
+            f0_size = bytes.len() as u32;
+        }
+    }
+    // The pitch model resolves by fixed name rather than through the
+    // document, which names the `f0` role only.
+    entries.push(VoiceEntry {
+        key: f0_id.as_bytes().to_vec(),
+        name: "f0model-dds".to_owned(),
+        value_offset: f0_offset,
+        value_size: f0_size,
+    });
+    let metadata = document_metadata(object);
+    Ok(VoiceDatabase {
+        path: doc_path.to_owned(),
+        data: Backing::Owned(blob),
+        entries,
+        metadata,
+    })
+}
+
+/// Maps Flat document metadata onto the container's dot-prefixed property
+/// fields, so `info` prints both formats identically.
+fn document_metadata(object: &serde_json::Map<String, Value>) -> VoiceMetadata {
+    let string = |key: &str| -> String {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let strings = |key: &str| -> Vec<String> {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let styles: Vec<String> = object
+        .get("styles")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("name"))
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut metadata = VoiceMetadata::empty();
+    metadata.name = string("name");
+    metadata.vendor = string("vendor");
+    metadata.language = string("language");
+    metadata.phoneset = string("phoneset");
+    metadata.languages = strings("support_languages");
+    metadata.timbre_styles = styles;
+    metadata
+        .properties
+        .push((".name".to_owned(), metadata.name.clone()));
+    metadata
+        .properties
+        .push((".vendor".to_owned(), metadata.vendor.clone()));
+    metadata
+        .properties
+        .push((".language".to_owned(), metadata.language.clone()));
+    metadata
+        .properties
+        .push((".phoneset".to_owned(), metadata.phoneset.clone()));
+    let version = string("version");
+    if !version.is_empty()
+        && version.len() <= 9
+        && version.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        metadata.version = version.parse().unwrap_or(-1);
+        metadata.properties.push((".version".to_owned(), version));
+    }
+    if !metadata.languages.is_empty() {
+        metadata
+            .properties
+            .push((".multi".to_owned(), metadata.languages.join(",")));
+    }
+    if !metadata.timbre_styles.is_empty() {
+        metadata.properties.push((
+            ".timbre_styles".to_owned(),
+            metadata.timbre_styles.join(","),
+        ));
+    }
+    metadata
 }
 
 fn read_metadata(data: &[u8], entries: &[VoiceEntry]) -> Result<VoiceMetadata> {
@@ -677,6 +980,234 @@ mod tests {
         };
         let db = VoiceDatabase::open(Path::new(&path)).unwrap();
         assert!(!db.entries().is_empty());
+        assert_ne!(db.metadata().name.len(), 0);
+    }
+
+    fn flat_document(models: &[(&str, &[u8])]) -> serde_json::Value {
+        serde_json::json!({
+            "name": "Flat Singer",
+            "version": "100",
+            "vendor": "Flat Vendor",
+            "language": "japanese",
+            "phoneset": "romaji",
+            "support_languages": ["english", "japanese"],
+            "acoustic": models[0].0,
+            "vocoder": models[1].0,
+            "duration": models[2].0,
+            "f0": models[3].0,
+            "styles": [{"name": "(base)"}, {"name": "Joyful"}],
+        })
+    }
+
+    fn write_flat_voice(models: &[(&str, &[u8])]) -> (TempDirGuard, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "opensvr-nofs-flat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for (id, bytes) in models {
+            std::fs::write(models_dir.join(format!("{id}.dnni")), bytes).unwrap();
+        }
+        let doc = dir.join("info.nofs");
+        std::fs::write(
+            &doc,
+            serde_json::to_string_pretty(&flat_document(models)).unwrap(),
+        )
+        .unwrap();
+        (TempDirGuard(dir), doc)
+    }
+
+    struct TempDirGuard(PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const FLAT_MODELS: [(&str, &[u8]); 4] = [
+        ("acoustic-hash", b"acoustic-bytes"),
+        ("vocoder-hash", b"vocoder-bytes"),
+        ("duration-hash", b"duration-bytes"),
+        ("f0-hash", b"f0-bytes"),
+    ];
+
+    #[test]
+    fn document_probe_skips_bom_and_whitespace() {
+        assert!(is_document_probe(b"{\"a\":1}"));
+        assert!(is_document_probe(b"\xef\xbb\xbf{\"a\":1}"));
+        assert!(is_document_probe(b" \t\r\n\x0c {\"a\":1}"));
+        assert!(is_document_probe(b"{}"));
+        assert!(!is_document_probe(b""));
+        assert!(!is_document_probe(b" \t\r\n\x0c"));
+        assert!(!is_document_probe(b"\xef\xbb\xbf"));
+        // Binary container magic (`0xf580` little-endian) is not a document.
+        assert!(!is_document_probe(&[0x80, 0xF5, 0x00, 0x00]));
+        assert!(!is_document_probe(b"[1,2]"));
+    }
+
+    #[test]
+    fn safe_model_id_table() {
+        for id in ["abc", "04fde26b27b186201780739f06eb7e54", "a.b", "UPPER-1"] {
+            assert!(is_safe_model_id(id), "unexpected rejection: {id}");
+        }
+        for id in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a:b",
+            "a?b",
+            "trailing ",
+            "trailing.",
+            "CON",
+            "con.json",
+            "COM1",
+            "lpt9",
+            "nul",
+            "a\x01b",
+            "a\x7fb",
+        ] {
+            assert!(!is_safe_model_id(id), "unexpected acceptance: {id}");
+        }
+        assert!(!is_safe_model_id(&"a".repeat(241)));
+        assert!(is_safe_model_id(&"a".repeat(240)));
+    }
+
+    #[test]
+    fn opens_flat_document_with_alias_and_metadata() {
+        let (_guard, doc) = write_flat_voice(&FLAT_MODELS);
+        let db = VoiceDatabase::open(&doc).unwrap();
+        // Four models plus the `f0model-dds` alias.
+        assert_eq!(db.entries().len(), 5);
+        for (id, bytes) in FLAT_MODELS {
+            let entry = db.find_entry(id).unwrap();
+            assert_eq!(db.read_entry(entry).unwrap(), bytes);
+        }
+        let alias = db.find_entry("f0model-dds").unwrap();
+        assert_eq!(db.read_entry(alias).unwrap(), b"f0-bytes");
+        assert_eq!(
+            alias.value_offset,
+            db.find_entry("f0-hash").unwrap().value_offset
+        );
+
+        let metadata = db.metadata();
+        assert_eq!(metadata.name, "Flat Singer");
+        assert_eq!(metadata.vendor, "Flat Vendor");
+        assert_eq!(metadata.language, "japanese");
+        assert_eq!(metadata.phoneset, "romaji");
+        assert_eq!(metadata.version, 100);
+        assert_eq!(metadata.languages, ["english", "japanese"]);
+        assert_eq!(metadata.timbre_styles, ["(base)", "Joyful"]);
+        assert_eq!(metadata.property(".multi"), "english,japanese");
+        assert_eq!(metadata.property(".timbre_styles"), "(base),Joyful");
+    }
+
+    #[test]
+    fn document_open_rejects_bad_documents() {
+        let (_guard, doc) = write_flat_voice(&FLAT_MODELS);
+        let parent = doc.parent().unwrap();
+
+        // Not an object.
+        std::fs::write(&doc, b"[1,2]").unwrap();
+        assert_eq!(
+            VoiceDatabase::open(&doc).unwrap_err().to_string(),
+            "NOFS: truncated file header"
+        );
+        // Broken JSON reports the document verdict.
+        std::fs::write(&doc, b"{\"name\":").unwrap();
+        assert_eq!(
+            VoiceDatabase::open(&doc).unwrap_err().to_string(),
+            "NOFS: voice document is not a JSON object"
+        );
+        // Unsafe model ID names its field.
+        let mut bad = flat_document(&FLAT_MODELS);
+        bad["acoustic"] = serde_json::Value::String("../evil".into());
+        std::fs::write(&doc, serde_json::to_string(&bad).unwrap()).unwrap();
+        assert_eq!(
+            VoiceDatabase::open(&doc).unwrap_err().to_string(),
+            "NOFS: unsafe model identifier for acoustic"
+        );
+        // Missing role reports the same verdict.
+        let mut missing = flat_document(&FLAT_MODELS);
+        missing.as_object_mut().unwrap().remove("f0");
+        std::fs::write(&doc, serde_json::to_string(&missing).unwrap()).unwrap();
+        assert_eq!(
+            VoiceDatabase::open(&doc).unwrap_err().to_string(),
+            "NOFS: unsafe model identifier for f0"
+        );
+        // A valid document with a missing model file names the file.
+        std::fs::write(
+            &doc,
+            serde_json::to_string_pretty(&flat_document(&FLAT_MODELS)).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(parent.join("models").join("f0-hash.dnni")).unwrap();
+        let error = VoiceDatabase::open(&doc).unwrap_err().to_string();
+        assert!(
+            error.starts_with("NOFS: model file is missing: "),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn document_models_resolve_case_insensitively_and_by_override() {
+        let (_guard, doc) = write_flat_voice(&FLAT_MODELS);
+        let parent = doc.parent().unwrap();
+        // Uppercase the acoustic file: exact lookup misses, fallback hits.
+        std::fs::rename(
+            parent.join("models").join("acoustic-hash.dnni"),
+            parent.join("models").join("ACOUSTIC-HASH.DNNI"),
+        )
+        .unwrap();
+        let db = VoiceDatabase::open(&doc).unwrap();
+        assert_eq!(
+            db.read_entry(db.find_entry("acoustic-hash").unwrap())
+                .unwrap(),
+            b"acoustic-bytes"
+        );
+
+        // An explicit override directory wins over the sibling directory.
+        let elsewhere = parent.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("acoustic-hash.dnni"), b"override").unwrap();
+        let db = VoiceDatabase::open_with_models(&doc, Some(&elsewhere)).unwrap();
+        assert_eq!(
+            db.read_entry(db.find_entry("acoustic-hash").unwrap())
+                .unwrap(),
+            b"override"
+        );
+    }
+
+    #[test]
+    fn from_bytes_opens_documents_beside_their_models() {
+        let (_guard, doc) = write_flat_voice(&FLAT_MODELS);
+        let bytes = std::fs::read(&doc).unwrap();
+        let db = VoiceDatabase::from_bytes(doc.clone(), bytes).unwrap();
+        assert_eq!(db.entries().len(), 5);
+        assert_eq!(db.metadata().name, "Flat Singer");
+    }
+
+    #[test]
+    fn real_flat_voice_parses_when_provided() {
+        let Some(path) = std::env::var_os("OPENSVR_TEST_FLAT") else {
+            return;
+        };
+        let db = VoiceDatabase::open(Path::new(&path)).unwrap();
+        // Four models plus the `f0model-dds` alias.
+        assert_eq!(db.entries().len(), 5);
+        let pitch = db.find_entry("f0model-dds").unwrap();
+        let bytes = db.read_entry(pitch).unwrap();
+        // Every DNNI model starts with the `0x7fca00ff` magic.
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[..4], &[0xFF, 0x00, 0xCA, 0x7F]);
         assert_ne!(db.metadata().name.len(), 0);
     }
 }
