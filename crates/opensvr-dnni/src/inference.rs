@@ -1938,7 +1938,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "No DNNI inference model has been loaded.");
-        assert!(output.values.is_empty());
+        assert_eq!(output.values.len(), 0);
     }
 
     #[test]
@@ -2042,7 +2042,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(error, "DNNI inference cancelled.");
-        assert!(output.values.is_empty());
+        assert_eq!(output.values.len(), 0);
     }
 
     #[test]
@@ -2231,7 +2231,7 @@ mod tests {
         let output = run_ok(&engine, 2, 1, &[5.0, 6.0]);
         assert_eq!(output.frames, 0);
         assert_eq!(output.channels, 1);
-        assert!(output.values.is_empty());
+        assert_eq!(output.values.len(), 0);
     }
 
     #[test]
@@ -3663,7 +3663,7 @@ mod tests {
         cache.clear();
         assert_eq!(cache.model_identity, 0);
         assert!(!cache.has_condition);
-        assert!(cache.input.values.is_empty());
+        assert_eq!(cache.input.values.len(), 0);
         assert_eq!(cache.get_bytes(), 0);
     }
 

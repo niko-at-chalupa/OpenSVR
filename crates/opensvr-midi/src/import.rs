@@ -737,7 +737,7 @@ mod tests {
             project.tempo_map.time_signatures(),
             &[TimeSignature::default()]
         );
-        assert!(!track.main_group.id.is_empty());
+        assert_ne!(track.main_group.id.len(), 0);
         assert_eq!(track.main_ref.group_id, track.main_group.id);
     }
 
@@ -838,7 +838,7 @@ mod tests {
                 .map(|note| (note.onset, note.duration, note.pitch, note.lyrics.as_str()))
                 .collect();
             assert_eq!(after, before, "track {}", original.name);
-            assert!(!imported.main_group.id.is_empty());
+            assert_ne!(imported.main_group.id.len(), 0);
             assert_eq!(imported.main_ref.group_id, imported.main_group.id);
         }
         let tempos: Vec<_> = back

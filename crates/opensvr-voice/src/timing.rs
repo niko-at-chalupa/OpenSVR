@@ -1095,7 +1095,7 @@ mod tests {
                     .to_string(),
                 "Phoneme timing: time quantization requires positive finite durations and explicit phonemes."
             );
-            assert!(output.is_empty());
+            assert_eq!(output.len(), 0);
         }
     }
 
@@ -1483,7 +1483,7 @@ mod tests {
                 .to_string(),
             "Phoneme timing: an explicit phoneme language is required."
         );
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
     }
 
     #[test]
@@ -1504,7 +1504,7 @@ mod tests {
                 .to_string(),
             "Phoneme timing: unknown phoneme 'xyz' for japanese-romaji-phones."
         );
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
     }
 
     #[test]

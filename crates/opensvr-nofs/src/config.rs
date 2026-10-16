@@ -602,6 +602,6 @@ mod tests {
         let db = VoiceDatabase::open(std::path::Path::new(&path)).unwrap();
         let config = VoiceConfiguration::load(&db).unwrap();
         assert!(!config.entries().is_empty());
-        assert!(!config.duration_model().architecture.is_empty());
+        assert_ne!(config.duration_model().architecture.len(), 0);
     }
 }

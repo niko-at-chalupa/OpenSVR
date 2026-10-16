@@ -1018,7 +1018,7 @@ mod tests {
         )];
         let weights =
             build_vocal_mode_weights(&notes, 0.0, 0.005, 8, &["tender".to_owned()]).unwrap();
-        assert!(!weights.is_empty());
+        assert_ne!(weights.len(), 0);
         assert!(
             cache
                 .lookup(&stamp, &syllables, &log_f0, &weights)

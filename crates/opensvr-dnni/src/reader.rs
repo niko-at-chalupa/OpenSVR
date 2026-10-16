@@ -706,7 +706,7 @@ mod tests {
         assert_eq!(reader.payload(0), b"hi");
         let leaf = &reader.nodes()[1];
         assert_eq!(leaf.name, "prim1");
-        assert!(leaf.children.is_empty());
+        assert_eq!(leaf.children.len(), 0);
         assert_eq!(
             leaf.type_id,
             u64::from_le_bytes({

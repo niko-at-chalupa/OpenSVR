@@ -797,6 +797,6 @@ mod tests {
                 &CancelToken::new(),
             )
             .unwrap();
-        assert!(audio.samples.is_empty());
+        assert_eq!(audio.samples.len(), 0);
     }
 }

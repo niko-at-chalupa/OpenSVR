@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn empty_tracks_yield_no_phrases() {
-        assert!(split_phrases(&[]).is_empty());
+        assert_eq!(split_phrases(&[]).len(), 0);
     }
 
     #[test]

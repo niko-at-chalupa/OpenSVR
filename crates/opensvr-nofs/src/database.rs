@@ -464,7 +464,7 @@ mod tests {
         // Binary keys get no printable name and are skipped by find_entry.
         assert!(db.find_entry("samples").is_some());
         let binary = open_bytes(&[(b"\xff\x00binary", b"payload")]);
-        assert!(binary.entries()[0].name.is_empty());
+        assert_eq!(binary.entries()[0].name.len(), 0);
         assert!(binary.find_entry("").is_none());
 
         let payload = {
@@ -555,6 +555,6 @@ mod tests {
         };
         let db = VoiceDatabase::open(Path::new(&path)).unwrap();
         assert!(!db.entries().is_empty());
-        assert!(!db.metadata().name.is_empty());
+        assert_ne!(db.metadata().name.len(), 0);
     }
 }

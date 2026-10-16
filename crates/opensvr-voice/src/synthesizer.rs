@@ -484,7 +484,7 @@ mod tests {
         let synthesizer = VoiceSynthesizer::new();
         assert_eq!(synthesizer.frame_interval_seconds(), 0.0);
         assert_eq!(synthesizer.pitch_frame_interval_seconds(), 0.0);
-        assert!(synthesizer.vocal_mode_names().is_empty());
+        assert_eq!(synthesizer.vocal_mode_names().len(), 0);
         assert_eq!(VoiceSynthesizerState::default().get_bytes(), 0);
         let mut state = VoiceSynthesizerState::default();
         state.clear();
@@ -605,7 +605,7 @@ mod tests {
             split_rap_languages("japanese english"),
             vec!["japanese".to_owned(), "english".to_owned()]
         );
-        assert!(split_rap_languages("").is_empty());
+        assert_eq!(split_rap_languages("").len(), 0);
         assert_eq!(
             split_rap_languages("japanese  english"),
             vec!["japanese".to_owned(), "english".to_owned()]

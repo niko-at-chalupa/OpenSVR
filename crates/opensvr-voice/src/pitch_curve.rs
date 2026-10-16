@@ -555,7 +555,10 @@ mod tests {
             render_automatic_pitch_mask(&[], 0.0, 0.005, 8),
             vec![0.0; 8]
         );
-        assert!(render_pitch_transitions(&[note(0.0, 1.0, 60.0)], 0.0, 0.005, 0).is_empty());
+        assert_eq!(
+            render_pitch_transitions(&[note(0.0, 1.0, 60.0)], 0.0, 0.005, 0).len(),
+            0
+        );
     }
 
     #[test]
