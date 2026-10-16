@@ -1398,11 +1398,14 @@ fn run_layer(
         return Err(cancelled());
     }
     if layer.operation == Operation::Sequence {
+        // Ping-pong two buffers through the children instead of minting a
+        // fresh tensor per child: same call order, same values, no
+        // per-child allocation.
         let mut current = input.clone();
+        let mut next = Tensor::default();
         for child in &layer.children {
-            let mut next = Tensor::default();
             run_layer(child, &current, &mut next, condition, cancel)?;
-            current = next;
+            std::mem::swap(&mut current, &mut next);
         }
         *output = current;
         return Ok(());
