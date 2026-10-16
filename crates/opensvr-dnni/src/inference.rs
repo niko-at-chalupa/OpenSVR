@@ -1625,6 +1625,12 @@ fn run_layer(
             ));
         }
         assign_zero(&mut output.values, output.frames * output.channels);
+        // Scratch for one kernel tap, hoisted out of the frame loop: every
+        // `multiply_matrix` call overwrites all `matrix.rows` elements (each
+        // block writes its disjoint row slice), so the buffer never needs
+        // clearing between taps — `resize` only zero-fills on growth, and
+        // capacity persists across frames. Summation order is unchanged.
+        let mut product = Vec::new();
         for frame in 0..output.frames {
             if frame % CANCEL_POLL_STEPS == 0 && cancel.is_cancelled() {
                 return Err(cancelled());
@@ -1648,7 +1654,8 @@ fn run_layer(
                     continue;
                 }
                 let source = &input.values[tap as usize * input.channels..];
-                let mut product = vec![0.0_f32; matrix.rows];
+                product.clear();
+                product.resize(matrix.rows, 0.0);
                 multiply_matrix(matrix, source, &mut product);
                 let destination = &mut output.values[frame * output.channels..];
                 for channel_out in 0..matrix.rows {
