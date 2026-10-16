@@ -28,19 +28,18 @@ from relaxed numerics.
 | WAV output | `audio/WaveFile.cpp` | `opensvr-audio::wav` | done |
 | CLI | `cli/Main.cpp` | `opensvr-cli` | done, with subcommands instead of flat flags |
 | Voice synthesis | `synthesis/*` (10.4k lines) | `opensvr-voice` (timing, pitch, acoustic, vocoder, `VoiceSynthesizer`), `opensvr-nofs`, `opensvr-dnni` | done (neural `NeuralBackend` sings voiced tracks; `ToneBackend` stays as the voiceless fallback) |
-| Flat voicebank (document NOFS) | — (post-OpenSV format, not in the commit above) | `opensvr-nofs` + `opensvr-voice` | planned (Phase 8) |
+| Flat voicebank (document NOFS) | — (post-OpenSV format, not in the commit above) | `opensvr-nofs` + `opensvr-voice` | done (Phase 8) |
 | Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done (dictionary + resolution + `info --phonemes`; timing types live here, the duration model in `opensvr-voice`) |
 | Phrase building, pitch/vibrato, caching | `ProjectRenderer.cpp` (1.6k lines) | `opensvr-audio` (phrase splitting, `buildPitch`/vibrato/vocal-mode weights, voice/dictionary/phrase caches) | done |
 | Editor GUI | `ui/*`, `app/*`, `audio/PreviewEngine.*` (5.6k lines) | none | out of scope |
 
 `opensvr render` sings through the neural voice when a voice database resolves,
-and falls back to sine tones otherwise. Phases 1–7 are ported; the remaining
-work is the Flat voicebank format (Phase 8, planned) plus one small gap
-(see "Remaining gaps").
+and falls back to sine tones otherwise. All eight phases are ported; the only
+known gap left is one small item (see "Remaining gaps").
 
 ## What was done
 
-Every phase below is ported except Phase 8 (Flat voicebanks, planned), in the
+Every phase below is ported, in the
 listed order, one PR-sized branch per
 stage. Phase 2 (NOFS + voice config) lets `opensvr info` show singer metadata.
 The `opensvr-dnni` reader parses all real model entries, scalar inference
@@ -58,9 +57,6 @@ release automation) with hygiene (workspace clippy denial, `cargo fmt`).
 
 ## Remaining gaps
 
-- **No Flat voicebank support.** Current voices are binary NOFS containers
-  with embedded models; Flat voices are a JSON voice document naming sibling
-  model files plus hex-encoded speaker/style embeddings. See Phase 8.
 - **No note IDs.** Only needed for editing and incremental caches; add
   `NoteId(u64)` when an editor-side consumer needs it.
 
@@ -275,9 +271,21 @@ Original list, kept for reference:
 - **Config.** `OPENSVR_VOICE` and `OPENSVR_DICT` environment variables as defaults for `--voice` and `--dict`.
 - **Release engineering.** `cargo dist` or a plain CI matrix for Linux, macOS and Windows; cache `target/` and run `cargo clippy -D warnings`.
 
-## Phase 8: Flat voicebanks (planned)
+## Phase 8: Flat voicebanks (done)
 
-Goal: `opensvr info` and `opensvr render` accept Flat voices — a JSON voice
+Done: `opensvr info` and `opensvr render` accept Flat voices — a JSON voice
+document beside sibling `.dnni` model files. `VoiceDatabase` probes document
+mode, `VoiceConfiguration` resolves the fixed-architecture model references,
+`VoiceEmbeddings` decodes the hex speaker/style vectors (`(base)`/`(default)`
+pairing, named vocal modes, `f0_style`/`duration_style` overrides that replace
+the model-embedded vectors at load), document vocal modes mix at render from
+absolute style vectors in sorted-name order, and `--voice` takes the document
+path with `--models-dir` (and its environment-variable default) overriding
+model lookup. No Flat-only DNNI hashes were needed: the sampled voices use
+the already-ported model families, and a gated Flat render test sings the
+example end-to-end (vocal modes included).
+
+Goal (kept for reference): `opensvr info` and `opensvr render` accept Flat voices — a JSON voice
 document (singer metadata plus `acoustic`/`vocoder`/`duration`/`f0` model
 IDs) beside a directory of sibling `.dnni` model files, with speaker and
 style embeddings carried as hex-encoded little-endian float vectors in the

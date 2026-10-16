@@ -985,7 +985,7 @@ mod tests {
 
     #[test]
     fn modal_weights_miss_the_modeless_cache_entry() {
-        use crate::cache::{FileStamp, PhraseCache};
+        use crate::cache::{FileStamp, PhraseCache, VoiceKey};
         use opensvr_g2p::TimingSyllable;
         let dir = std::env::temp_dir().join(format!(
             "opensvr-audio-pitch-{}-weights",
@@ -1005,7 +1005,7 @@ mod tests {
         let log_f0 = vec![4.0_f32; 8];
         let mut cache = PhraseCache::default();
         cache.retain(
-            stamp.clone(),
+            VoiceKey::new(stamp.clone(), None),
             syllables.clone(),
             log_f0.clone(),
             Vec::new(),
@@ -1021,7 +1021,7 @@ mod tests {
         assert_ne!(weights.len(), 0);
         assert!(
             cache
-                .lookup(&stamp, &syllables, &log_f0, &weights)
+                .lookup(&VoiceKey::new(stamp, None), &syllables, &log_f0, &weights)
                 .is_none(),
             "a mode change must miss the modeless cache entry"
         );

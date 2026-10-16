@@ -19,6 +19,8 @@
 //! stream (one contiguous draw sequence per run, default seed 5489), never
 //! `rand_distr` substitutes.
 
+use std::collections::BTreeMap;
+
 use opensvr_core::CancelToken;
 use opensvr_dnni::{
     DnniCache, DnniInference, DnniMatrix, DnniReader, DnniRunStatistics, DnniTensor,
@@ -42,6 +44,34 @@ const FRAME_INTERVAL_SECONDS: f32 = 0.005;
 
 fn failure(reason: impl Into<String>) -> crate::VoiceError {
     invalid(format!("Acoustic model: {}", reason.into()))
+}
+
+/// Resolves document vocal modes to absolute style vectors in sorted-name
+/// order: each offset added onto the (possibly overridden) default style.
+/// The run-path mixing (`weight * (absolute - default)`) then reproduces the
+/// reference (`weight * offset`) exactly.
+fn absolute_document_styles(
+    default_style: &[f32],
+    vocal_modes: &BTreeMap<String, Vec<f32>>,
+) -> Result<Vec<Vec<f32>>> {
+    let mut styles = Vec::with_capacity(vocal_modes.len());
+    for offset in vocal_modes.values() {
+        if offset.len() != default_style.len() {
+            return Err(failure(
+                "a vocal-mode style vector has an unsupported dimension",
+            ));
+        }
+        let absolute: Vec<f32> = default_style
+            .iter()
+            .zip(offset.iter())
+            .map(|(base, delta)| base + delta)
+            .collect();
+        if !absolute.iter().all(|value| value.is_finite()) {
+            return Err(failure("voice speaker/style embeddings must be finite"));
+        }
+        styles.push(absolute);
+    }
+    Ok(styles)
 }
 
 fn check_shape(tensor: &DnniTensor, frames: usize, channels: usize, name: &str) -> Result<()> {
@@ -231,23 +261,34 @@ impl AcousticModel {
         vocal_mode_names: &[String],
         root_node: usize,
     ) -> Result<()> {
-        self.load_inner(reader, vocal_mode_names, &[], &[], root_node)
+        self.load_inner(reader, vocal_mode_names, &[], &[], root_node, None)
     }
 
     /// Loads the acoustic model with Flat voice overrides for the 32-channel
     /// speaker vector (`(base)` style) and default style vector (`(default)`
-    /// style). Empty overrides keep the model-embedded defaults, exactly as
-    /// for container voices; non-empty overrides replace them before
-    /// validation. Document voices pass no vocal-mode names: their named
-    /// styles live in the synthesizer's vocal-mode table, not in the model.
+    /// style), plus the named document vocal modes as offsets from the
+    /// default style. Empty overrides keep the model-embedded defaults,
+    /// exactly as for container voices; non-empty overrides replace them
+    /// before validation. `vocal_modes` iterates in sorted-name order, which
+    /// matches the synthesizer's vocal-mode names from the same table, so
+    /// the existing positional weight mixing in `run` matches the reference
+    /// (`default + weight * offset`) exactly.
     pub fn load_with_overrides(
         &mut self,
         reader: &DnniReader,
         root_node: usize,
         speaker_override: &[f32],
         style_override: &[f32],
+        vocal_modes: &BTreeMap<String, Vec<f32>>,
     ) -> Result<()> {
-        self.load_inner(reader, &[], speaker_override, style_override, root_node)
+        self.load_inner(
+            reader,
+            &[],
+            speaker_override,
+            style_override,
+            root_node,
+            Some(vocal_modes),
+        )
     }
 
     /// Shared loader: `load`/`load_with_vocal_modes` (container voices, model
@@ -260,6 +301,7 @@ impl AcousticModel {
         speaker_override: &[f32],
         style_override: &[f32],
         root_node: usize,
+        document_modes: Option<&BTreeMap<String, Vec<f32>>>,
     ) -> Result<()> {
         let nodes = reader.nodes();
         let Some(root) = nodes
@@ -347,14 +389,23 @@ impl AcousticModel {
             ));
         }
         candidate.vocal_mode_styles.reserve(vocal_mode_names.len());
-        for index in 0..vocal_mode_names.len() {
-            let mode_style = reader.read_float_vector(style_vectors.children[index + 1])?;
-            if mode_style.len() != candidate.default_style.len() {
-                return Err(failure(
-                    "a vocal-mode style vector has an unsupported dimension",
-                ));
+        if let Some(document_modes) = document_modes {
+            // Document styles are offsets from the default style, stored here
+            // as absolute vectors in sorted-name order (the map's iteration
+            // order, matching the synthesizer's vocal-mode names), so the
+            // positional mixing in `run` matches the reference exactly.
+            candidate.vocal_mode_styles =
+                absolute_document_styles(&candidate.default_style, document_modes)?;
+        } else {
+            for index in 0..vocal_mode_names.len() {
+                let mode_style = reader.read_float_vector(style_vectors.children[index + 1])?;
+                if mode_style.len() != candidate.default_style.len() {
+                    return Err(failure(
+                        "a vocal-mode style vector has an unsupported dimension",
+                    ));
+                }
+                candidate.vocal_mode_styles.push(mode_style);
             }
-            candidate.vocal_mode_styles.push(mode_style);
         }
         candidate.language_embedding = reader.read_float_matrix(embedding.children[0])?;
         if candidate.speaker.len() != 32
@@ -790,6 +841,35 @@ mod tests {
         assert_eq!(super::COSINE_PHASES[3].to_bits(), 0xC049_0FDB);
         assert_eq!((6.283_185_5_f32).to_bits(), 0x40C9_0FDB);
         assert_eq!((-26.575_424_f32).to_bits(), 0xC1D4_9A78);
+    }
+
+    #[test]
+    fn document_styles_resolve_to_absolute_vectors_in_name_order() {
+        let modes: BTreeMap<String, Vec<f32>> = [
+            ("Joyful".to_owned(), vec![1.0, 0.0]),
+            ("Cute".to_owned(), vec![0.0, 2.0]),
+        ]
+        .into_iter()
+        .collect();
+        // Sorted-name order (Cute, Joyful), each offset added onto default.
+        assert_eq!(
+            absolute_document_styles(&[10.0, 20.0], &modes).unwrap(),
+            vec![vec![10.0, 22.0], vec![11.0, 20.0]]
+        );
+        assert!(
+            absolute_document_styles(&[10.0, 20.0], &BTreeMap::new())
+                .unwrap()
+                .is_empty()
+        );
+        // Wrong-dimension offsets are errors, never panics.
+        let bad: BTreeMap<String, Vec<f32>> =
+            [("Cute".to_owned(), vec![1.0])].into_iter().collect();
+        assert_eq!(
+            absolute_document_styles(&[10.0, 20.0], &bad)
+                .unwrap_err()
+                .to_string(),
+            "Acoustic model: a vocal-mode style vector has an unsupported dimension"
+        );
     }
 
     #[test]

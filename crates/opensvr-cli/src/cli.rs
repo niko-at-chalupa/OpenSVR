@@ -9,6 +9,7 @@ use opensvr_core::Language;
 const AFTER_HELP: &str = "\
 Voice databases and dictionaries are not bundled; point to files you own.
 OPENSVR_VOICE and OPENSVR_DICT default --voice and --dict when those flags are absent; explicit flags win.
+OPENSVR_MODELS_DIR defaults --models-dir the same way, resolving Flat voice models away from the document.
 Exit codes: 0 ok, 1 usage error, 2 load error, 3 render/write error, 130 cancelled.";
 
 #[derive(Debug, Parser)]
@@ -37,8 +38,8 @@ pub enum Command {
 /// Settings that replace what the project file says, on every track.
 ///
 /// Each path falls back to its environment variable (`OPENSVR_VOICE`,
-/// `OPENSVR_DICT`) when the flag is absent; explicit flags win, and empty
-/// env values count as unset.
+/// `OPENSVR_DICT`, `OPENSVR_MODELS_DIR`) when the flag is absent; explicit
+/// flags win, and empty env values count as unset.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct Overrides {
     /// Use this voice database on every track (default: OPENSVR_VOICE)
@@ -47,6 +48,10 @@ pub struct Overrides {
     /// Use this pronunciation dictionary directory on every track (default: OPENSVR_DICT)
     #[arg(long, value_name = "CLF-DATA")]
     pub dict: Option<PathBuf>,
+    /// Resolve Flat voice models from this directory instead of the voice
+    /// document's sibling `models` directory (default: OPENSVR_MODELS_DIR)
+    #[arg(long, value_name = "DIR")]
+    pub models_dir: Option<PathBuf>,
     /// Override the singing language on every track (japanese, mandarin, english, cantonese, spanish)
     #[arg(long, value_name = "NAME")]
     pub language: Option<Language>,
@@ -206,6 +211,7 @@ mod tests {
             "convert",
             "OPENSVR_VOICE",
             "OPENSVR_DICT",
+            "OPENSVR_MODELS_DIR",
             "Exit codes",
         ] {
             assert!(page.contains(needle), "the man page misses {needle}");

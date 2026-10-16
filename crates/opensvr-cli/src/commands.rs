@@ -129,7 +129,12 @@ fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
     let sink = bar.clone().map(|bar| BarProgress { bar });
     let progress: &dyn ProgressSink = sink.as_ref().map_or(&NoProgress, |sink| sink);
     let result = if voiced {
-        Renderer::new(NeuralBackend::new())
+        let models = args
+            .overrides
+            .models_dir
+            .clone()
+            .or_else(|| env_path("OPENSVR_MODELS_DIR"));
+        Renderer::new(NeuralBackend::with_models_dir(models))
             .render_with_progress(&project, args.rate, cancel, progress)
     } else {
         // Not progress output, so `--quiet` does not hide it: the result is not singing.
