@@ -73,7 +73,24 @@ impl FileStamp {
     }
 }
 
-/// MRU voice-synthesizer cache keyed by [`FileStamp`], cap 2 like C++.
+/// Voice-synthesizer cache key: the database stamp plus the Flat
+/// models-directory override. The override participates so the same document
+/// with different model sources never shares a synthesizer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceKey {
+    voice: FileStamp,
+    models: Option<PathBuf>,
+}
+
+impl VoiceKey {
+    /// Builds a lookup key from the stamped database and the models override
+    /// the synthesizer was loaded with (`None` means sibling resolution).
+    pub fn new(voice: FileStamp, models: Option<PathBuf>) -> Self {
+        Self { voice, models }
+    }
+}
+
+/// MRU voice-synthesizer cache keyed by [`VoiceKey`], cap 2 like C++.
 ///
 /// A hit rotates the entry to the back; a miss loads through the caller's
 /// closure (which reports load failures exactly as the uncached path does)
@@ -87,22 +104,22 @@ pub struct VoiceCache {
 
 #[derive(Debug)]
 struct VoiceEntry {
-    stamp: FileStamp,
+    key: VoiceKey,
     synthesizer: Arc<VoiceSynthesizer>,
 }
 
 impl VoiceCache {
-    /// Returns the synthesizer for `stamp`, loading it on a miss.
+    /// Returns the synthesizer for `key`, loading it on a miss.
     ///
     /// `load` runs only on a miss; its error propagates without caching. The
     /// synthesizer is shared by reference count so worker threads can drop
     /// the cache lock before singing: synthesis itself only needs `&self`.
     pub fn get_or_load(
         &mut self,
-        stamp: FileStamp,
+        key: VoiceKey,
         load: impl FnOnce() -> Result<VoiceSynthesizer, BackendError>,
     ) -> Result<Arc<VoiceSynthesizer>, BackendError> {
-        if let Some(position) = self.entries.iter().position(|entry| entry.stamp == stamp) {
+        if let Some(position) = self.entries.iter().position(|entry| entry.key == key) {
             let entry = self.entries.remove(position);
             let synthesizer = entry.synthesizer.clone();
             self.entries.push(entry);
@@ -113,7 +130,7 @@ impl VoiceCache {
             self.entries.remove(0);
         }
         self.entries.push(VoiceEntry {
-            stamp,
+            key,
             synthesizer: synthesizer.clone(),
         });
         self.loads += 1;
@@ -220,7 +237,7 @@ impl DictionaryCache {
 /// participate: a hit resamples and crops exactly like a fresh render.
 #[derive(Debug, Clone)]
 struct PhraseEntry {
-    voice: FileStamp,
+    voice: VoiceKey,
     syllables: Vec<TimingSyllable>,
     log_f0: Vec<f32>,
     weights: Vec<f32>,
@@ -232,7 +249,7 @@ struct PhraseEntry {
 impl PhraseEntry {
     fn matches(
         &self,
-        voice: &FileStamp,
+        voice: &VoiceKey,
         syllables: &[TimingSyllable],
         log_f0: &[f32],
         weights: &[f32],
@@ -251,14 +268,18 @@ impl PhraseEntry {
 /// (which additionally counts the path text and visualization peaks, neither
 /// of which this port keeps).
 fn phrase_entry_bytes(
-    voice: &FileStamp,
+    voice: &VoiceKey,
     syllables: &[TimingSyllable],
     log_f0: &[f32],
     weights: &[f32],
     samples: &[f32],
 ) -> usize {
     let mut bytes = size_of::<PhraseEntry>()
-        + voice.path().as_os_str().len()
+        + voice.voice.path().as_os_str().len()
+        + voice
+            .models
+            .as_ref()
+            .map_or(0, |models| models.as_os_str().len())
         + (samples.len() + log_f0.len() + weights.len()) * size_of::<f32>();
     for syllable in syllables {
         bytes += size_of::<TimingSyllable>()
@@ -292,7 +313,7 @@ impl PhraseCache {
     /// to the project rate, exactly as with a fresh render.
     pub fn lookup(
         &mut self,
-        voice: &FileStamp,
+        voice: &VoiceKey,
         syllables: &[TimingSyllable],
         log_f0: &[f32],
         weights: &[f32],
@@ -314,7 +335,7 @@ impl PhraseCache {
     /// Retains newly rendered native output under its synthesis key.
     pub fn retain(
         &mut self,
-        voice: FileStamp,
+        voice: VoiceKey,
         syllables: Vec<TimingSyllable>,
         log_f0: Vec<f32>,
         weights: Vec<f32>,
@@ -445,35 +466,65 @@ mod tests {
             *loads += 1;
             Ok(VoiceSynthesizer::new())
         };
+        let key = |stamp: &FileStamp| VoiceKey::new(stamp.clone(), None);
         cache
-            .get_or_load(stamps[0].clone(), || load(&mut loads))
+            .get_or_load(key(&stamps[0]), || load(&mut loads))
             .unwrap();
         cache
-            .get_or_load(stamps[0].clone(), || load(&mut loads))
+            .get_or_load(key(&stamps[0]), || load(&mut loads))
             .unwrap();
         assert_eq!(loads, 1, "a repeated stamp must not reload");
         assert_eq!(cache.loads(), 1);
         cache
-            .get_or_load(stamps[1].clone(), || load(&mut loads))
+            .get_or_load(key(&stamps[1]), || load(&mut loads))
             .unwrap();
         // Touch the first entry so the second becomes least-recently-used.
         cache
-            .get_or_load(stamps[0].clone(), || load(&mut loads))
+            .get_or_load(key(&stamps[0]), || load(&mut loads))
             .unwrap();
         cache
-            .get_or_load(stamps[2].clone(), || load(&mut loads))
+            .get_or_load(key(&stamps[2]), || load(&mut loads))
             .unwrap();
         assert_eq!(cache.len(), MAX_CACHED_VOICES);
         assert_eq!(loads, 3);
         // The rotated first entry survived; the evicted second reloads.
         cache
-            .get_or_load(stamps[0].clone(), || load(&mut loads))
+            .get_or_load(key(&stamps[0]), || load(&mut loads))
             .unwrap();
         assert_eq!(loads, 3);
         cache
-            .get_or_load(stamps[1].clone(), || load(&mut loads))
+            .get_or_load(key(&stamps[1]), || load(&mut loads))
             .unwrap();
         assert_eq!(loads, 4);
+    }
+
+    #[test]
+    fn voice_keys_separate_models_dir_overrides() {
+        let dir = temp_dir("voice-models-key");
+        let path = dir.join("voice.nofs");
+        fs::write(&path, b"voice").unwrap();
+        let stamp = FileStamp::read(&path).unwrap();
+        let mut loads = 0_usize;
+        let mut cache = VoiceCache::default();
+        let load = |loads: &mut usize| {
+            *loads += 1;
+            Ok(VoiceSynthesizer::new())
+        };
+        cache
+            .get_or_load(VoiceKey::new(stamp.clone(), None), || load(&mut loads))
+            .unwrap();
+        // The same database with a models override misses the sibling entry.
+        cache
+            .get_or_load(
+                VoiceKey::new(stamp.clone(), Some(PathBuf::from("models"))),
+                || load(&mut loads),
+            )
+            .unwrap();
+        assert_eq!(loads, 2);
+        cache
+            .get_or_load(VoiceKey::new(stamp, None), || load(&mut loads))
+            .unwrap();
+        assert_eq!(loads, 2, "the sibling entry must still hit");
     }
 
     #[test]
@@ -484,7 +535,7 @@ mod tests {
         let stamp = FileStamp::read(&path).unwrap();
         let mut cache = VoiceCache::default();
         let error = cache
-            .get_or_load(stamp, || {
+            .get_or_load(VoiceKey::new(stamp, None), || {
                 Err(BackendError("Cannot read synthesis resource.".into()))
             })
             .unwrap_err();
@@ -565,7 +616,7 @@ mod tests {
         let samples = vec![0.1_f32, 0.2, 0.3];
         let mut cache = PhraseCache::default();
         cache.retain(
-            stamp.clone(),
+            VoiceKey::new(stamp.clone(), None),
             syllables.clone(),
             log_f0.clone(),
             weights.clone(),
@@ -575,7 +626,12 @@ mod tests {
         assert_eq!(cache.misses(), 1);
         assert!(!cache.is_empty());
         let hit = cache
-            .lookup(&stamp, &syllables, &log_f0, &weights)
+            .lookup(
+                &VoiceKey::new(stamp.clone(), None),
+                &syllables,
+                &log_f0,
+                &weights,
+            )
             .expect("identical inputs must hit");
         assert_eq!(hit, (48_000, samples));
         assert_eq!(cache.hits(), 1);
@@ -585,21 +641,56 @@ mod tests {
         let other_stamp = FileStamp::read(&other_voice).unwrap();
         assert!(
             cache
-                .lookup(&other_stamp, &syllables, &log_f0, &weights)
+                .lookup(
+                    &VoiceKey::new(other_stamp, None),
+                    &syllables,
+                    &log_f0,
+                    &weights,
+                )
                 .is_none()
         );
         let other_syllables = vec![syllable(&["s", "a"])];
         assert!(
             cache
-                .lookup(&stamp, &other_syllables, &log_f0, &weights)
+                .lookup(
+                    &VoiceKey::new(stamp.clone(), None),
+                    &other_syllables,
+                    &log_f0,
+                    &weights,
+                )
                 .is_none()
         );
         assert!(
             cache
-                .lookup(&stamp, &syllables, &[5.0, 4.1], &weights)
+                .lookup(
+                    &VoiceKey::new(stamp.clone(), None),
+                    &syllables,
+                    &[5.0, 4.1],
+                    &weights,
+                )
                 .is_none()
         );
-        assert!(cache.lookup(&stamp, &syllables, &log_f0, &[0.5]).is_none());
+        assert!(
+            cache
+                .lookup(
+                    &VoiceKey::new(stamp.clone(), None),
+                    &syllables,
+                    &log_f0,
+                    &[0.5]
+                )
+                .is_none()
+        );
+        // The models override joins the key: same inputs, other source, miss.
+        assert!(
+            cache
+                .lookup(
+                    &VoiceKey::new(stamp, Some(PathBuf::from("models"))),
+                    &syllables,
+                    &log_f0,
+                    &weights
+                )
+                .is_none()
+        );
         assert_eq!(cache.hits(), 1, "misses must not count as hits");
     }
 
@@ -615,7 +706,7 @@ mod tests {
             let mut syllable = syllable(&["a"]);
             syllable.midi_pitch = i32::try_from(index).expect("loop bound fits");
             cache.retain(
-                stamp.clone(),
+                VoiceKey::new(stamp.clone(), None),
                 vec![syllable],
                 vec![4.0],
                 Vec::new(),
@@ -629,7 +720,7 @@ mod tests {
         let huge = vec![0.0_f32; MAX_PHRASE_CACHE_BYTES];
         let before = cache.len();
         cache.retain(
-            stamp.clone(),
+            VoiceKey::new(stamp.clone(), None),
             vec![syllable(&["a"])],
             vec![4.0; 8],
             Vec::new(),

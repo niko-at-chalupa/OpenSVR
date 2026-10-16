@@ -165,6 +165,7 @@ impl VoiceSynthesizer {
                     0,
                     &embeddings.acoustic_speaker,
                     &embeddings.acoustic_style,
+                    &embeddings.vocal_modes,
                 )?;
             } else {
                 candidate.acoustic.load_with_vocal_modes(
@@ -748,6 +749,47 @@ mod tests {
 
         // Container voices keep the `.feature_rap_languages` tokens (empty here).
         assert_eq!(rap_languages(&VoiceDatabase::default()).len(), 0);
+    }
+
+    #[test]
+    fn models_override_dir_wins_over_the_sibling_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "opensvr-synth-models-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let document = flat_document();
+        let doc = dir.join("info.nofs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&doc, serde_json::to_string(&document).unwrap()).unwrap();
+        // No sibling `models` directory: loading without an override names it.
+        let missing = VoiceSynthesizer::new().load(&doc).unwrap_err().to_string();
+        assert!(
+            missing.starts_with("NOFS: model file is missing: "),
+            "{missing}"
+        );
+
+        // With an override holding (invalid) model bytes, opening consults
+        // the override: the failure moves past lookup to DNNI parsing.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        for role in ["acoustic", "vocoder", "duration", "f0"] {
+            let id = document[role].as_str().unwrap();
+            std::fs::write(elsewhere.join(format!("{id}.dnni")), b"model").unwrap();
+        }
+        let mut synthesizer = VoiceSynthesizer::new();
+        let error = synthesizer
+            .load_with_models(&doc, Some(&elsewhere))
+            .unwrap_err()
+            .to_string();
+        // `DnniReader::from_bytes` fails unprefixed (as on the container
+        // path); the point is the failure moved past model lookup.
+        assert!(!error.contains("model file is missing"), "{error}");
+        assert!(error.contains("DNNI"), "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

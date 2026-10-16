@@ -516,6 +516,15 @@ fn flat_failures_exit_with_usage_errors() {
 }
 
 #[test]
+fn render_help_documents_the_models_dir_override() {
+    let help = opensvr(&["render", "--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--models-dir"), "{text}");
+    assert!(text.contains("OPENSVR_MODELS_DIR"), "{text}");
+}
+
+#[test]
 fn failures_use_the_documented_exit_codes() {
     assert_eq!(opensvr(&[]).status.code(), Some(1), "usage error");
     assert_eq!(

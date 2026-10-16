@@ -126,6 +126,7 @@ pub fn parse_flat(args: &[String]) -> Result<FlatOutcome, String> {
     let overrides = Overrides {
         voice,
         dict,
+        models_dir: None,
         language,
     };
     if info_only {

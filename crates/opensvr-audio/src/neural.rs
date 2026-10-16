@@ -20,6 +20,7 @@
 //! synthesis inputs, so repeated identical phrases resample the cached audio
 //! instead of running the vocoder again.
 
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use opensvr_core::{CancelToken, Language, VoiceSettings};
@@ -31,7 +32,7 @@ use opensvr_voice::{
     TimedPhoneme, VoiceSynthesizer, quantize_phoneme_durations,
 };
 
-use crate::cache::{DictionaryCache, DictionaryKey, FileStamp, PhraseCache, VoiceCache};
+use crate::cache::{DictionaryCache, DictionaryKey, FileStamp, PhraseCache, VoiceCache, VoiceKey};
 use crate::pitch::{
     build_log_f0, build_vibrato_envelope, build_vocal_mode_weights, merge_continuation_phones,
 };
@@ -237,6 +238,9 @@ pub struct NeuralBackend {
     voices: Mutex<VoiceCache>,
     dictionaries: Mutex<DictionaryCache>,
     phrases: Mutex<PhraseCache>,
+    /// Flat models-directory override for document voices (`None` resolves
+    /// sibling to the voice document). Container voices ignore it.
+    models_dir: Option<PathBuf>,
 }
 
 /// Recovers a cache lock after a panicking worker: cache entries stay valid.
@@ -249,6 +253,17 @@ fn lock_cache<T>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
 impl NeuralBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Resolves Flat document voice models from `directory` instead of the
+    /// voice document's sibling `models` directory. Container voices ignore
+    /// it. The override joins the voice cache key, so one backend can serve
+    /// both sources without sharing synthesizers across them.
+    pub fn with_models_dir(directory: Option<PathBuf>) -> Self {
+        Self {
+            models_dir: directory,
+            ..Self::default()
+        }
     }
 
     /// Successful voice-database loads so far (one per distinct file stamp).
@@ -349,10 +364,12 @@ impl VoiceBackend for NeuralBackend {
         // Clone the shared synthesizer out of the cache before singing: the
         // lock is only held for the stamp lookup (or the single load), never
         // for prediction or vocoding, so tracks synthesize in parallel.
-        let synthesizer = lock_cache(&self.voices).get_or_load(voice_stamp.clone(), || {
+        let models_dir = self.models_dir.clone();
+        let key = VoiceKey::new(voice_stamp, models_dir.clone());
+        let synthesizer = lock_cache(&self.voices).get_or_load(key.clone(), || {
             let mut loaded = VoiceSynthesizer::new();
             loaded
-                .load(database)
+                .load_with_models(database, models_dir.as_deref())
                 .map_err(|error| backend_error(error.to_string()))?;
             Ok(loaded)
         })?;
@@ -369,7 +386,7 @@ impl VoiceBackend for NeuralBackend {
             synthesizer.vocal_mode_names(),
         )?;
         if let Some((native_rate, native)) = lock_cache(&self.phrases).lookup(
-            &voice_stamp,
+            &key,
             &inputs.syllables,
             &synthesis.log_f0,
             &vocal_mode_weights,
@@ -393,7 +410,7 @@ impl VoiceBackend for NeuralBackend {
         // project rate and mixer never participate in synthesis, so a hit
         // resamples and crops exactly like this fresh render did.
         lock_cache(&self.phrases).retain(
-            voice_stamp,
+            key,
             inputs.syllables.clone(),
             synthesis.log_f0.clone(),
             vocal_mode_weights,
@@ -713,7 +730,7 @@ mod tests {
     impl CachedStub {
         fn sing(
             &mut self,
-            voice: &FileStamp,
+            voice: &VoiceKey,
             syllables: &[TimingSyllable],
             log_f0: &[f32],
             native: &[f32],
@@ -760,8 +777,20 @@ mod tests {
             cache: PhraseCache::default(),
             renders: 0,
         };
-        let first = stub.sing(&stamp, &syllables, &log_f0, &native, 8000);
-        let second = stub.sing(&stamp, &syllables, &log_f0, &native, 8000);
+        let first = stub.sing(
+            &VoiceKey::new(stamp.clone(), None),
+            &syllables,
+            &log_f0,
+            &native,
+            8000,
+        );
+        let second = stub.sing(
+            &VoiceKey::new(stamp, None),
+            &syllables,
+            &log_f0,
+            &native,
+            8000,
+        );
         assert_eq!(stub.renders, 1, "the identical phrase must synthesize once");
         assert_eq!(first, second, "cache hits stay sample-identical");
         // Cache off (a fresh backend) resamples the same native audio: equal bits.
