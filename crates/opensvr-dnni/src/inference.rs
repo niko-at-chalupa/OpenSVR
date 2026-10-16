@@ -342,12 +342,42 @@ pub struct DnniInference {
     loaded: bool,
 }
 
+/// Reusable per-inference tensor scratch, threaded through [`run_layer`].
+///
+/// Holds four general tensor slots plus one float buffer per recursion
+/// depth. Slots persist capacity across `run_layer` calls, so steady-state
+/// inference performs no temporary allocation: every consumer fully
+/// overwrites its slot before reading (the same discipline that already
+/// governs the freshly allocated temporaries), and depth indexing keeps
+/// nested combinators from clobbering a parent's live data — a child runs
+/// one level deeper, so its slots are disjoint from its caller's.
+#[derive(Debug, Default)]
+struct Scratch {
+    tensors: Vec<[Tensor; 4]>,
+    floats: Vec<Vec<f32>>,
+}
+
+impl Scratch {
+    fn tensors(&mut self, depth: usize) -> &mut [Tensor; 4] {
+        if self.tensors.len() <= depth {
+            self.tensors.resize_with(depth + 1, Default::default);
+        }
+        &mut self.tensors[depth]
+    }
+
+    fn floats(&mut self, depth: usize) -> &mut Vec<f32> {
+        if self.floats.len() <= depth {
+            self.floats.resize_with(depth + 1, Default::default);
+        }
+        &mut self.floats[depth]
+    }
+}
+
 impl DnniInference {
     /// Creates an unloaded engine; [`run`](Self::run) fails until [`load`](Self::load) succeeds.
     pub fn new() -> Self {
         Self::default()
     }
-
     /// Returns true after a successful [`load`](Self::load).
     pub fn is_loaded(&self) -> bool {
         self.loaded
@@ -487,6 +517,9 @@ impl DnniInference {
         let mut computed_frames = 0_usize;
         let mut reused_frames = 0_usize;
         let mut context_frames = 0_usize;
+        // Scratch lives for the whole inference: every nested layer reuses
+        // the same depth-indexed slots, so temporaries allocate once.
+        let mut scratch = Scratch::default();
 
         if has_cached_output {
             let cache_ref = cache
@@ -513,7 +546,7 @@ impl DnniInference {
                 }
                 let local_output = if window.first == 0 && window.end == input.frames {
                     let mut local = Tensor::default();
-                    run_layer(root, input, &mut local, condition, cancel)?;
+                    run_layer(root, input, &mut local, condition, &mut scratch, 0, cancel)?;
                     local
                 } else {
                     let local_input = slice_frames(input, window.first, window.end);
@@ -525,6 +558,8 @@ impl DnniInference {
                         &local_input,
                         &mut local,
                         local_condition.as_ref(),
+                        &mut scratch,
+                        0,
                         cancel,
                     )?;
                     local
@@ -552,7 +587,15 @@ impl DnniInference {
             reused_frames = input.frames - updated_frames;
             context_frames = computed_frames - updated_frames;
         } else {
-            run_layer(root, input, &mut replacement, condition, cancel)?;
+            run_layer(
+                root,
+                input,
+                &mut replacement,
+                condition,
+                &mut scratch,
+                0,
+                cancel,
+            )?;
             computed_frames = replacement.frames;
         }
         if cancel.is_cancelled() {
@@ -1392,21 +1435,37 @@ fn run_layer(
     input: &Tensor,
     output: &mut Tensor,
     condition: Option<&Tensor>,
+    scratch: &mut Scratch,
+    depth: usize,
     cancel: &CancelToken,
 ) -> Result<(), DnniError> {
     if cancel.is_cancelled() {
         return Err(cancelled());
     }
     if layer.operation == Operation::Sequence {
-        // Ping-pong two buffers through the children instead of minting a
-        // fresh tensor per child: same call order, same values, no
-        // per-child allocation.
-        let mut current = input.clone();
+        // Ping-pong through one scratch slot instead of minting a fresh
+        // tensor per child: the slot is checked out (swap), filled by the
+        // child, and swapped back, so its capacity persists across calls.
+        // The child runs one level deeper, so nested sequences never touch
+        // this level's live data; same call order, same values.
+        let mut current = Tensor::default();
+        std::mem::swap(&mut current, &mut scratch.tensors(depth)[0]);
+        assign_tensor(&mut current, input);
         let mut next = Tensor::default();
+        std::mem::swap(&mut next, &mut scratch.tensors(depth)[1]);
         for child in &layer.children {
-            run_layer(child, &current, &mut next, condition, cancel)?;
+            run_layer(
+                child,
+                &current,
+                &mut next,
+                condition,
+                scratch,
+                depth + 1,
+                cancel,
+            )?;
             std::mem::swap(&mut current, &mut next);
         }
+        std::mem::swap(&mut next, &mut scratch.tensors(depth)[1]);
         *output = current;
         return Ok(());
     }
@@ -1424,6 +1483,8 @@ fn run_layer(
         }
         let mut forward = Tensor::default();
         let mut backward = Tensor::default();
+        std::mem::swap(&mut forward, &mut scratch.tensors(depth)[0]);
+        std::mem::swap(&mut backward, &mut scratch.tensors(depth)[1]);
         run_gru(&layer.children[0], input, &mut forward, false, cancel)?;
         run_gru(&layer.children[1], input, &mut backward, true, cancel)?;
         output.frames = input.frames;
@@ -1441,6 +1502,13 @@ fn run_layer(
             destination[forward_channels..].copy_from_slice(
                 &backward.values[frame * backward.channels..(frame + 1) * backward.channels],
             );
+        }
+        // Check both buffers back in; the concatenated `output` keeps its
+        // own (caller-owned) allocation as before.
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut forward, &mut slots[0]);
+            std::mem::swap(&mut backward, &mut slots[1]);
         }
         return Ok(());
     }
@@ -1468,6 +1536,8 @@ fn run_layer(
                 condition.expect("checked"),
                 output,
                 None,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
         } else {
@@ -1481,19 +1551,30 @@ fn run_layer(
             }
             assign_zero(&mut output.values, output.frames * output.channels);
         }
-        let mut current = input.clone();
-        // Stage scratch, hoisted out of the loop: every stage produces the
-        // same output-sized tensors (checked below), so the buffers persist
-        // across stages instead of reallocating three tensors per stage.
+        // Four scratch slots (current plus one per branch), checked out once
+        // for the whole stage loop: every stage produces the same
+        // output-sized tensors (checked below), and children run one level
+        // deeper, so capacities persist across stages and calls.
+        let mut current = Tensor::default();
         let mut residual = Tensor::default();
         let mut gated = Tensor::default();
         let mut skip = Tensor::default();
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut current, &mut slots[0]);
+            std::mem::swap(&mut residual, &mut slots[1]);
+            std::mem::swap(&mut gated, &mut slots[2]);
+            std::mem::swap(&mut skip, &mut slots[3]);
+        }
+        assign_tensor(&mut current, input);
         for stage in 0..layer.stage_count {
             run_layer(
                 &layer.children[stage * 3 + 2],
                 &current,
                 &mut residual,
                 None,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
             run_layer(
@@ -1501,6 +1582,8 @@ fn run_layer(
                 &current,
                 &mut gated,
                 condition,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
             run_layer(
@@ -1508,6 +1591,8 @@ fn run_layer(
                 &gated,
                 &mut skip,
                 None,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
             if residual.frames != output.frames
@@ -1538,6 +1623,14 @@ fn run_layer(
             }
             std::mem::swap(&mut current, &mut gated);
         }
+        // Check every buffer back in so capacities persist across calls.
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut current, &mut slots[0]);
+            std::mem::swap(&mut residual, &mut slots[1]);
+            std::mem::swap(&mut gated, &mut slots[2]);
+            std::mem::swap(&mut skip, &mut slots[3]);
+        }
         return Ok(());
     }
 
@@ -1557,7 +1650,21 @@ fn run_layer(
             ));
         }
         let mut gate_input = Tensor::default();
-        run_layer(&layer.children[0], input, &mut gate_input, None, cancel)?;
+        let mut projected = Tensor::default();
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut gate_input, &mut slots[0]);
+            std::mem::swap(&mut projected, &mut slots[1]);
+        }
+        run_layer(
+            &layer.children[0],
+            input,
+            &mut gate_input,
+            None,
+            scratch,
+            depth + 1,
+            cancel,
+        )?;
         if gate_input.channels != 2 * layer.gate_channels {
             return Err(node_error(
                 layer.source_offset,
@@ -1565,12 +1672,13 @@ fn run_layer(
             ));
         }
         if layer.condition_channels > 0 {
-            let mut projected = Tensor::default();
             run_layer(
                 &layer.children[1],
                 condition.expect("checked"),
                 &mut projected,
                 None,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
             if projected.frames != gate_input.frames || projected.channels != gate_input.channels {
@@ -1599,6 +1707,11 @@ fn run_layer(
                     gate_input.values[gate_offset + channel].tanh()
                         * sigmoid(gate_input.values[gate_offset + layer.gate_channels + channel]);
             }
+        }
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut gate_input, &mut slots[0]);
+            std::mem::swap(&mut projected, &mut slots[1]);
         }
         return Ok(());
     }
@@ -1635,12 +1748,14 @@ fn run_layer(
         // state), and every element below is either tap-written or
         // explicitly zeroed before the bias pass reads it.
         output.values.resize(output.frames * output.channels, 0.0);
-        // The first in-range tap overwrites its frame slice via
-        // `multiply_matrix` (identical to zero-then-add, since `0.0 + x == x`),
-        // later taps add through the scratch below, and a frame with every
-        // tap padding-skipped is zeroed explicitly. Bias still adds after the
-        // taps, in the same order as before.
-        let mut product = Vec::new();
+        // Tap scratch from the depth-indexed float buffer: capacity persists
+        // across calls, and `multiply_matrix` overwrites every element, so
+        // no clearing is ever needed. The first in-range tap overwrites its
+        // frame slice directly (identical to zero-then-add); later taps add
+        // through this scratch; a fully padding-skipped frame is zeroed
+        // explicitly. Bias still adds after the taps, in the same order.
+        let product = scratch.floats(depth);
+        product.clear();
         for frame in 0..output.frames {
             if frame % CANCEL_POLL_STEPS == 0 && cancel.is_cancelled() {
                 return Err(cancelled());
@@ -1669,8 +1784,8 @@ fn run_layer(
                 if wrote {
                     product.clear();
                     product.resize(matrix.rows, 0.0);
-                    multiply_matrix(matrix, source, &mut product);
-                    for (slot, value) in destination.iter_mut().zip(&product) {
+                    multiply_matrix(matrix, source, product);
+                    for (slot, value) in destination.iter_mut().zip(product.iter()) {
                         *slot += *value;
                     }
                 } else {
@@ -1735,6 +1850,17 @@ fn run_layer(
 fn assign_zero(values: &mut Vec<f32>, count: usize) {
     values.clear();
     values.resize(count, 0.0);
+}
+
+/// Copies `source` into `target`, reusing `target`'s allocation instead of
+/// minting a fresh one. Values are identical to `*target = source.clone()`.
+fn assign_tensor(target: &mut Tensor, source: &Tensor) {
+    target.frames = source.frames;
+    target.channels = source.channels;
+    // `extend_from_slice` only allocates when capacity is insufficient, so
+    // steady-state copies are memcpy without malloc.
+    target.values.clear();
+    target.values.extend_from_slice(&source.values);
 }
 
 #[cfg(test)]
