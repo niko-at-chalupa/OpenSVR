@@ -28,17 +28,20 @@ from relaxed numerics.
 | WAV output | `audio/WaveFile.cpp` | `opensvr-audio::wav` | done |
 | CLI | `cli/Main.cpp` | `opensvr-cli` | done, with subcommands instead of flat flags |
 | Voice synthesis | `synthesis/*` (10.4k lines) | `opensvr-voice` (timing, pitch, acoustic, vocoder, `VoiceSynthesizer`), `opensvr-nofs`, `opensvr-dnni` | done (neural `NeuralBackend` sings voiced tracks; `ToneBackend` stays as the voiceless fallback) |
+| Flat voicebank (document NOFS) | — (post-OpenSV format, not in the commit above) | `opensvr-nofs` + `opensvr-voice` | planned (Phase 8) |
 | Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done (dictionary + resolution + `info --phonemes`; timing types live here, the duration model in `opensvr-voice`) |
 | Phrase building, pitch/vibrato, caching | `ProjectRenderer.cpp` (1.6k lines) | `opensvr-audio` (phrase splitting, `buildPitch`/vibrato/vocal-mode weights, voice/dictionary/phrase caches) | done |
 | Editor GUI | `ui/*`, `app/*`, `audio/PreviewEngine.*` (5.6k lines) | none | out of scope |
 
 `opensvr render` sings through the neural voice when a voice database resolves,
-and falls back to sine tones otherwise. Every phase below is ported; only
-small gaps remain (see "Remaining gaps").
+and falls back to sine tones otherwise. Phases 1–7 are ported; the remaining
+work is the Flat voicebank format (Phase 8, planned) plus one small gap
+(see "Remaining gaps").
 
 ## What was done
 
-Every phase below is ported, in the listed order, one PR-sized branch per
+Every phase below is ported except Phase 8 (Flat voicebanks, planned), in the
+listed order, one PR-sized branch per
 stage. Phase 2 (NOFS + voice config) lets `opensvr info` show singer metadata.
 The `opensvr-dnni` reader parses all real model entries, scalar inference
 matches per-op golden tensors, and blocked-`[f32; 16]` weights plus the
@@ -55,6 +58,9 @@ release automation) with hygiene (workspace clippy denial, `cargo fmt`).
 
 ## Remaining gaps
 
+- **No Flat voicebank support.** Current voices are binary NOFS containers
+  with embedded models; Flat voices are a JSON voice document naming sibling
+  model files plus hex-encoded speaker/style embeddings. See Phase 8.
 - **No note IDs.** Only needed for editing and incremental caches; add
   `NoteId(u64)` when an editor-side consumer needs it.
 
@@ -269,6 +275,51 @@ Original list, kept for reference:
 - **Config.** `OPENSVR_VOICE` and `OPENSVR_DICT` environment variables as defaults for `--voice` and `--dict`.
 - **Release engineering.** `cargo dist` or a plain CI matrix for Linux, macOS and Windows; cache `target/` and run `cargo clippy -D warnings`.
 
+## Phase 8: Flat voicebanks (planned)
+
+Goal: `opensvr info` and `opensvr render` accept Flat voices — a JSON voice
+document (singer metadata plus `acoustic`/`vocoder`/`duration`/`f0` model
+IDs) beside a directory of sibling `.dnni` model files, with speaker and
+style embeddings carried as hex-encoded little-endian float vectors in the
+document (`styles` entries, `f0_style`, `duration_style`). The Flat models
+are the same families the ported stages already run (acoustic `_rldtg0`,
+duration `_pdwpv2`, vocoder `_nhntv2`, pitch wrapper roots), so this phase is
+loader plus embedding work, not new kernels. One PR-sized branch per stage,
+in this order:
+
+- **Document-mode database** (in `opensvr-nofs`). Probe the voice file: a
+  leading `{` (past any byte-order mark and whitespace) means a JSON voice
+  document, anything else means the binary container from Phase 2, which stays
+  byte-identical. Validate each model ID as a safe file name (bounded length,
+  no separators or reserved device names, case-insensitive `.dnni` lookup)
+  and resolve it against the document's sibling model directory, with an
+  explicit models-directory override taking precedence. Serve model bytes
+  through the same entry interface as container entries (same size caps);
+  alias the `f0` entry as `f0model-dds`, which the pitch model resolves by
+  fixed name. Map document metadata (name, vendor, language, phoneset,
+  version, languages, timbre styles) onto the same fields `info` prints.
+- **Voice configuration** (in `opensvr-nofs` or `opensvr-voice`, as fits).
+  The document carries no architecture strings, so fix them per role:
+  duration `gen2a`, acoustic `dds`, vocoder `nhv`.
+- **Embeddings** (in `opensvr-voice`). Decode each hex vector with a
+  finite-float check: `styles` `(base)` and `(default)` become the acoustic
+  speaker and default style (they must pair), other named entries become
+  vocal modes, `f0_style` (32 channels) overrides the pitch speaker vector,
+  and `duration_style` (128 channels) overrides the duration voice vector.
+  Extra per-style fields the engine does not consume are ignored.
+- **Model coverage** (in `opensvr-dnni` + `opensvr-voice`). Extend the
+  version-2 type-hash table for any Flat-only hashes (notably pitch wrapper
+  roots) and thread the embedding overrides through the `timing`/`pitch`/
+  `acoustic` loaders and the synthesizer, keeping container-voice renders
+  unchanged.
+- **CLI.** `--voice` accepts the voice document path; model lookup defaults
+  to its sibling directory with a `--models-dir` flag and environment-variable
+  default. No archive handling: packaged voices are extracted before use.
+- **Tests.** Unit tests for document probing, safe-ID validation, embedding
+  decode, and metadata mapping; tests needing a real Flat voice are gated on
+  an environment variable (`OPENSVR_TEST_FLAT`) and skip cleanly when unset,
+  so CI stays green without proprietary data.
+
 ## Out of scope: the editor
 
 `ui/*`, `app/*` and `audio/PreviewEngine.*` (about 5,600 lines) are a JUCE desktop editor: piano roll, arrangement, parameter
@@ -281,7 +332,7 @@ alongside `ProgressSink`. An editor built on these crates would be a different p
 
 ## Suggested order and sizing
 
-All rows below shipped, in this order (the line counts were the original
+Rows 1–7 shipped; row 8 is planned (the line counts were the original
 estimates):
 
 | Phase | Result you can see | Approx. new Rust lines |
@@ -293,9 +344,10 @@ estimates):
 | 5 | First sung output (single phrase) | 4,500 |
 | 6 | Full-project render matching `opensv-cli` | 1,500 |
 | 7 | CLI polish | 300 |
+| 8 | Flat voices load and sing | about 600 |
 
-That table was the original sizing estimate; every row is now done. The C++
-scope it estimated against was about 14,400 lines without the editor; the
-Rust port landed at a comparable size with roughly one test per 25 lines of
+Row 8 is planned (Phase 8). The C++ scope the table estimated against was
+about 14,400 lines without the editor; the Rust port landed at
+a comparable size with roughly one test per 25 lines of
 code, and the workspace suite (555 tests, green without proprietary data)
 is the ground truth for what works.
