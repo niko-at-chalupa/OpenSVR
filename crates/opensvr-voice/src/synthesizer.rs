@@ -12,6 +12,7 @@
 //! golden tests can compare messages. A failed [`VoiceSynthesizer::load`]
 //! preserves the previously loaded voice, exactly as in C++.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -25,7 +26,7 @@ use crate::timing::TimedPhoneme;
 use crate::{
     AcousticFeatures, AcousticModel, AcousticModelState, NeuralVocoder, NeuralVocoderOutput,
     NeuralVocoderState, PhonemeDuration, PhonemeTiming, PitchModel, PitchModelState, Result,
-    TimingSyllable, invalid,
+    TimingSyllable, VoiceEmbeddings, invalid,
 };
 
 /// Silence context padded on each side of the pitch prediction interval.
@@ -68,6 +69,13 @@ pub struct VoiceSynthesizer {
     vocoder: NeuralVocoder,
     rap_languages: Vec<String>,
     vocal_mode_names: Vec<String>,
+    /// Flat document default style (`(default)` embedding): the base the
+    /// named vocal modes offset from at render. Empty for container voices,
+    /// whose styles live in the acoustic model.
+    default_style: Vec<f32>,
+    /// Flat document vocal modes (named style vectors). Empty for container
+    /// voices. Render-time mixing lands in the final Flat wiring generation.
+    vocal_modes: BTreeMap<String, Vec<f32>>,
     frame_interval_seconds: f32,
 }
 
@@ -82,6 +90,8 @@ impl VoiceSynthesizer {
             vocoder: NeuralVocoder::new(),
             rap_languages: Vec::new(),
             vocal_mode_names: Vec::new(),
+            default_style: Vec::new(),
+            vocal_modes: BTreeMap::new(),
             frame_interval_seconds: 0.0,
         }
     }
@@ -92,17 +102,37 @@ impl VoiceSynthesizer {
     /// and vocoder models load through the voice configuration's model
     /// references (`gen2a`, `dds`, `nhv`). The acoustic frame interval is
     /// scanned from the acoustic entry's `_ftmfv2`/`_ftmfv3` configuration.
-    /// Everything is staged into a candidate first: a failed load preserves
-    /// the previously loaded voice.
+    /// Flat document voices additionally decode their speaker/style
+    /// embeddings, which override the model-embedded vectors. Everything is
+    /// staged into a candidate first: a failed load preserves the previously
+    /// loaded voice.
     pub fn load(&mut self, voice: &Path) -> Result<()> {
-        let database = VoiceDatabase::open(voice)?;
+        self.load_with_models(voice, None)
+    }
+
+    /// Opens `voice`, resolving Flat document models from `models` instead of
+    /// the document's sibling `models` directory. Container voices ignore it.
+    pub fn load_with_models(&mut self, voice: &Path, models: Option<&Path>) -> Result<()> {
+        let database = VoiceDatabase::open_with_models(voice, models)?;
         let configuration = VoiceConfiguration::load(&database)?;
         let mut candidate = Self::new();
+        let embeddings = match database.document() {
+            Some(document) => VoiceEmbeddings::load(document)?,
+            None => VoiceEmbeddings::default(),
+        };
+        candidate.rap_languages = rap_languages(&database);
         candidate
-            .vocal_mode_names
-            .clone_from(&database.metadata().timbre_styles);
-        candidate.rap_languages =
-            split_rap_languages(database.metadata().property(".feature_rap_languages"));
+            .default_style
+            .clone_from(&embeddings.acoustic_style);
+        candidate.vocal_modes = embeddings.vocal_modes.clone();
+        if database.has_document() {
+            // Document styles live in the embeddings table, not the model.
+            candidate.vocal_mode_names = embeddings.vocal_modes.keys().cloned().collect();
+        } else {
+            candidate
+                .vocal_mode_names
+                .clone_from(&database.metadata().timbre_styles);
+        }
         {
             let Some(entry) = database.find_entry("f0model-dds") else {
                 return Err(invalid(
@@ -113,7 +143,7 @@ impl VoiceSynthesizer {
             let reader = DnniReader::from_bytes(bytes)?;
             candidate
                 .pitch
-                .load(&reader, 0)
+                .load_with_speaker_override(&reader, 0, &embeddings.pitch_speaker)
                 .map_err(|error| invalid(format!("Voice synthesizer pitch model: {error}")))?;
         }
         {
@@ -123,13 +153,26 @@ impl VoiceSynthesizer {
                 "gen2a",
                 "duration",
             )?;
-            candidate.timing.load(&reader, 0)?;
+            candidate
+                .timing
+                .load_with_voice_override(&reader, 0, &embeddings.duration_voice)?;
         }
         {
             let reader = read_model(&database, configuration.acoustic_model(), "dds", "acoustic")?;
-            candidate
-                .acoustic
-                .load_with_vocal_modes(&reader, &candidate.vocal_mode_names, 0)?;
+            if database.has_document() {
+                candidate.acoustic.load_with_overrides(
+                    &reader,
+                    0,
+                    &embeddings.acoustic_speaker,
+                    &embeddings.acoustic_style,
+                )?;
+            } else {
+                candidate.acoustic.load_with_vocal_modes(
+                    &reader,
+                    &candidate.vocal_mode_names,
+                    0,
+                )?;
+            }
             candidate.frame_interval_seconds = read_frame_interval(&reader)?;
         }
         {
@@ -150,9 +193,22 @@ impl VoiceSynthesizer {
         self.pitch.frame_interval_seconds()
     }
 
-    /// Vocal-mode names from the voice metadata timbre styles.
+    /// Vocal-mode names from the voice metadata timbre styles (container
+    /// voices) or the document embeddings table (Flat voices).
     pub fn vocal_mode_names(&self) -> &[String] {
         &self.vocal_mode_names
+    }
+
+    /// Flat document default style vector (`(default)` embedding). Empty for
+    /// container voices, whose styles live in the acoustic model.
+    pub fn default_style(&self) -> &[f32] {
+        &self.default_style
+    }
+
+    /// Flat document vocal modes (named style vectors). Empty for container
+    /// voices.
+    pub fn vocal_modes(&self) -> &BTreeMap<String, Vec<f32>> {
+        &self.vocal_modes
     }
 
     /// Predicts per-phoneme durations for a timing syllable phrase.
@@ -356,6 +412,35 @@ fn split_rap_languages(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Gathers the rap languages for a voice: the container
+/// `.feature_rap_languages` tokens plus, for Flat document voices, the
+/// document's `rap_languages` array when present, else `support_languages`.
+/// Mirrors the reference loader, which appends the document list after the
+/// container tokens.
+fn rap_languages(database: &VoiceDatabase) -> Vec<String> {
+    let mut languages = split_rap_languages(database.metadata().property(".feature_rap_languages"));
+    let Some(object) = database
+        .document()
+        .and_then(|document| document.as_object())
+    else {
+        return languages;
+    };
+    let key = if object.contains_key("rap_languages") {
+        "rap_languages"
+    } else {
+        "support_languages"
+    };
+    if let Some(array) = object.get(key).and_then(|value| value.as_array()) {
+        languages.extend(
+            array
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::to_owned),
+        );
+    }
+    languages
+}
+
 /// Loads one stage model through its voice-configuration reference.
 ///
 /// Checks the architecture tag, finds the NOFS entry by raw key bytes, reads
@@ -463,6 +548,8 @@ fn padded_notes(notes: &[PitchNote], rap_languages: &[String]) -> Vec<PitchNote>
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn note(language: &str, midi_pitch: i32, is_rap: bool) -> PitchNote {
@@ -485,6 +572,8 @@ mod tests {
         assert_eq!(synthesizer.frame_interval_seconds(), 0.0);
         assert_eq!(synthesizer.pitch_frame_interval_seconds(), 0.0);
         assert_eq!(synthesizer.vocal_mode_names().len(), 0);
+        assert_eq!(synthesizer.default_style().len(), 0);
+        assert!(synthesizer.vocal_modes().is_empty());
         assert_eq!(VoiceSynthesizerState::default().get_bytes(), 0);
         let mut state = VoiceSynthesizerState::default();
         state.clear();
@@ -610,6 +699,85 @@ mod tests {
             split_rap_languages("japanese  english"),
             vec!["japanese".to_owned(), "english".to_owned()]
         );
+    }
+
+    fn flat_database(document: &serde_json::Value) -> (PathBuf, VoiceDatabase) {
+        let dir = std::env::temp_dir().join(format!(
+            "opensvr-synth-flat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        for role in ["acoustic", "vocoder", "duration", "f0"] {
+            let id = document[role].as_str().unwrap();
+            std::fs::write(models_dir.join(format!("{id}.dnni")), b"model").unwrap();
+        }
+        let doc = dir.join("info.nofs");
+        std::fs::write(&doc, serde_json::to_string(&document).unwrap()).unwrap();
+        let database = VoiceDatabase::open(&doc).unwrap();
+        (dir, database)
+    }
+
+    fn flat_document() -> serde_json::Value {
+        serde_json::json!({
+            "acoustic": "aco",
+            "vocoder": "voc",
+            "duration": "dur",
+            "f0": "f0",
+            "support_languages": ["japanese"],
+        })
+    }
+
+    #[test]
+    fn rap_languages_prefer_the_document_list() {
+        // `rap_languages` wins over `support_languages` when present.
+        let mut document = flat_document();
+        document["rap_languages"] = serde_json::json!(["english"]);
+        let (dir, database) = flat_database(&document);
+        assert_eq!(rap_languages(&database), vec!["english".to_owned()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Otherwise the document falls back to `support_languages`.
+        let (dir, database) = flat_database(&flat_document());
+        assert_eq!(rap_languages(&database), vec!["japanese".to_owned()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Container voices keep the `.feature_rap_languages` tokens (empty here).
+        assert_eq!(rap_languages(&VoiceDatabase::default()).len(), 0);
+    }
+
+    #[test]
+    fn real_flat_embeddings_decode_when_provided() {
+        let Some(path) = std::env::var_os("OPENSVR_TEST_FLAT") else {
+            return;
+        };
+        let path = std::path::Path::new(&path);
+        let database = VoiceDatabase::open(path).unwrap();
+        assert!(database.has_document());
+        let document = database.document().unwrap();
+        let embeddings = VoiceEmbeddings::load(document).unwrap();
+        // The document overrides every stage vector; all decode finite.
+        for vector in [
+            &embeddings.acoustic_speaker,
+            &embeddings.acoustic_style,
+            &embeddings.pitch_speaker,
+            &embeddings.duration_voice,
+        ] {
+            assert!(!vector.is_empty());
+            assert!(vector.iter().all(|value| value.is_finite()));
+        }
+        assert_eq!(embeddings.acoustic_speaker.len(), 32);
+        assert_eq!(embeddings.acoustic_style.len(), 32);
+        assert_eq!(embeddings.pitch_speaker.len(), 32);
+        assert_eq!(embeddings.duration_voice.len(), 128);
+        assert!(!embeddings.vocal_modes.is_empty());
+        // No `rap_languages` field: the support list gates rap notes.
+        assert_eq!(rap_languages(&database), database.metadata().languages,);
+        assert!(!rap_languages(&database).is_empty());
     }
 
     // --- Minimal v2 blob builders for the interval-scan error paths ---

@@ -101,6 +101,7 @@ impl Default for VoiceDatabase {
                 version: -1,
                 ..VoiceMetadata::default()
             },
+            document: None,
         }
     }
 }
@@ -135,6 +136,11 @@ pub struct VoiceDatabase {
     data: Backing,
     entries: Vec<VoiceEntry>,
     metadata: VoiceMetadata,
+    /// Parsed Flat voice document in document mode; `None` for containers.
+    /// Retained so configuration and embeddings can read the document fields
+    /// (`acoustic`/`vocoder`/`duration`/`f0` IDs, `styles`, `f0_style`,
+    /// `duration_style`, rap languages) without re-reading the file.
+    document: Option<Value>,
 }
 
 /// Backing bytes for an open archive: a file mapping or an owned copy.
@@ -220,6 +226,7 @@ impl VoiceDatabase {
                 data: Backing::Mapped(map),
                 entries,
                 metadata,
+                document: None,
             });
         }
         drop(file);
@@ -245,6 +252,7 @@ impl VoiceDatabase {
             data: Backing::Owned(data),
             entries,
             metadata,
+            document: None,
         })
     }
 
@@ -258,6 +266,16 @@ impl VoiceDatabase {
 
     pub fn metadata(&self) -> &VoiceMetadata {
         &self.metadata
+    }
+
+    /// Whether this database was opened from a Flat JSON voice document.
+    pub fn has_document(&self) -> bool {
+        self.document.is_some()
+    }
+
+    /// The parsed Flat voice document in document mode, `None` for containers.
+    pub fn document(&self) -> Option<&Value> {
+        self.document.as_ref()
     }
 
     /// Finds the first entry whose printable [`VoiceEntry::name`] equals `name`.
@@ -418,7 +436,7 @@ fn is_document_probe(prefix: &[u8]) -> bool {
 /// Whether a Flat model ID is a safe file name, mirroring the reference
 /// installer-side guard: non-blank, bounded, no separators or reserved
 /// device names, no control characters.
-fn is_safe_model_id(id: &str) -> bool {
+pub(crate) fn is_safe_model_id(id: &str) -> bool {
     if id.trim().is_empty()
         || id.len() > MAXIMUM_MODEL_ID_LENGTH
         || id == "."
@@ -578,6 +596,7 @@ fn open_document(
         data: Backing::Owned(blob),
         entries,
         metadata,
+        document: Some(document),
     })
 }
 

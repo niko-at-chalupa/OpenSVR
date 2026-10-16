@@ -231,6 +231,36 @@ impl AcousticModel {
         vocal_mode_names: &[String],
         root_node: usize,
     ) -> Result<()> {
+        self.load_inner(reader, vocal_mode_names, &[], &[], root_node)
+    }
+
+    /// Loads the acoustic model with Flat voice overrides for the 32-channel
+    /// speaker vector (`(base)` style) and default style vector (`(default)`
+    /// style). Empty overrides keep the model-embedded defaults, exactly as
+    /// for container voices; non-empty overrides replace them before
+    /// validation. Document voices pass no vocal-mode names: their named
+    /// styles live in the synthesizer's vocal-mode table, not in the model.
+    pub fn load_with_overrides(
+        &mut self,
+        reader: &DnniReader,
+        root_node: usize,
+        speaker_override: &[f32],
+        style_override: &[f32],
+    ) -> Result<()> {
+        self.load_inner(reader, &[], speaker_override, style_override, root_node)
+    }
+
+    /// Shared loader: `load`/`load_with_vocal_modes` (container voices, model
+    /// styles) and `load_with_overrides` (Flat voices, document styles).
+    #[allow(clippy::too_many_lines)]
+    fn load_inner(
+        &mut self,
+        reader: &DnniReader,
+        vocal_mode_names: &[String],
+        speaker_override: &[f32],
+        style_override: &[f32],
+        root_node: usize,
+    ) -> Result<()> {
         let nodes = reader.nodes();
         let Some(root) = nodes
             .get(root_node)
@@ -295,6 +325,20 @@ impl AcousticModel {
         }
         candidate.speaker = reader.read_float_vector(model_children[1])?;
         candidate.default_style = reader.read_float_vector(style_vectors.children[0])?;
+        if !speaker_override.is_empty() {
+            candidate.speaker = speaker_override.to_vec();
+        }
+        if !style_override.is_empty() {
+            candidate.default_style = style_override.to_vec();
+        }
+        if !candidate.speaker.iter().all(|value| value.is_finite())
+            || !candidate
+                .default_style
+                .iter()
+                .all(|value| value.is_finite())
+        {
+            return Err(failure("voice speaker/style embeddings must be finite"));
+        }
         if !vocal_mode_names.is_empty()
             && style_vectors.children.len() - 1 != vocal_mode_names.len()
         {

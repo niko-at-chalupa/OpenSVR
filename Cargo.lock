@@ -508,6 +508,7 @@ dependencies = [
  "opensvr-g2p",
  "opensvr-nofs",
  "rustfft",
+ "serde_json",
  "thiserror",
 ]
 
