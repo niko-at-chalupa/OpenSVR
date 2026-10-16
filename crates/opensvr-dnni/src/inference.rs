@@ -1482,8 +1482,13 @@ fn run_layer(
             assign_zero(&mut output.values, output.frames * output.channels);
         }
         let mut current = input.clone();
+        // Stage scratch, hoisted out of the loop: every stage produces the
+        // same output-sized tensors (checked below), so the buffers persist
+        // across stages instead of reallocating three tensors per stage.
+        let mut residual = Tensor::default();
+        let mut gated = Tensor::default();
+        let mut skip = Tensor::default();
         for stage in 0..layer.stage_count {
-            let mut residual = Tensor::default();
             run_layer(
                 &layer.children[stage * 3 + 2],
                 &current,
@@ -1491,7 +1496,6 @@ fn run_layer(
                 None,
                 cancel,
             )?;
-            let mut gated = Tensor::default();
             run_layer(
                 &layer.children[stage * 3],
                 &current,
@@ -1499,7 +1503,6 @@ fn run_layer(
                 condition,
                 cancel,
             )?;
-            let mut skip = Tensor::default();
             run_layer(
                 &layer.children[stage * 3 + 1],
                 &gated,
@@ -1533,7 +1536,7 @@ fn run_layer(
                     "residual convolution accumulation produced a non-finite value.",
                 ));
             }
-            current = gated;
+            std::mem::swap(&mut current, &mut gated);
         }
         return Ok(());
     }
