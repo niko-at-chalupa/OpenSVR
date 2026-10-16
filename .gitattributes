@@ -1,0 +1,4 @@
+# Man pages stay LF everywhere: `opensvr man` prints LF bytes and the
+# byte-exact `man_matches_the_checked_in_page` test compares against the
+# file, so a CRLF checkout on Windows would fail without this.
+crates/opensvr-cli/opensvr.1 text eol=lf

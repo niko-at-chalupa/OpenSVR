@@ -402,6 +402,13 @@ fn flat_info_matches_the_subcommand() {
     assert_eq!(flat.stdout, plain.stdout);
 }
 
+/// Renders an override path exactly as the binary prints it: overrides go
+/// through `std::path::absolute()`, which on Windows yields `C:\...` with
+/// backslashes, so tests must not hardcode Unix separators.
+fn abs_display(path: &str) -> String {
+    std::path::absolute(path).unwrap().display().to_string()
+}
+
 #[test]
 fn env_vars_default_the_overrides_on_every_track() {
     let vars = &[
@@ -412,12 +419,11 @@ fn env_vars_default_the_overrides_on_every_track() {
     assert_eq!(output.status.code(), Some(0));
     let text = String::from_utf8(output.stdout).unwrap();
     // Both tracks pick the env paths up; neither exists, so both are flagged.
-    assert_eq!(
-        text.matches("/env/voice.nofs  [MISSING]").count(),
-        2,
-        "{text}"
-    );
-    assert_eq!(text.matches("/env/dicts  [MISSING]").count(), 2, "{text}");
+    // Overrides are absolutized before display (`C:\...` on Windows).
+    let missing_voice = format!("{}  [MISSING]", abs_display("/env/voice.nofs"));
+    let missing_dict = format!("{}  [MISSING]", abs_display("/env/dicts"));
+    assert_eq!(text.matches(&missing_voice).count(), 2, "{text}");
+    assert_eq!(text.matches(&missing_dict).count(), 2, "{text}");
     // The project file's own voice path is gone, overridden on every track.
     assert!(!text.contains("voices/example/voice.nofs"), "{text}");
 }
@@ -430,12 +436,9 @@ fn explicit_flags_beat_env_vars() {
     );
     assert_eq!(output.status.code(), Some(0));
     let text = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(
-        text.matches("/flag/voice.nofs  [MISSING]").count(),
-        2,
-        "{text}"
-    );
-    assert!(!text.contains("/env/voice.nofs"), "{text}");
+    let missing_flag = format!("{}  [MISSING]", abs_display("/flag/voice.nofs"));
+    assert_eq!(text.matches(&missing_flag).count(), 2, "{text}");
+    assert!(!text.contains(&abs_display("/env/voice.nofs")), "{text}");
 }
 
 #[test]
@@ -459,7 +462,7 @@ fn flat_form_honors_env_vars() {
     assert!(
         String::from_utf8(flat.stdout)
             .unwrap()
-            .contains("/env/voice.nofs")
+            .contains(&abs_display("/env/voice.nofs"))
     );
 }
 
