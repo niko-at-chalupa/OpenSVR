@@ -72,10 +72,11 @@ The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
    (`core` <- `nofs`/`dnni` <- `voice` <- `audio`), and keep `core` free of I/O and heavy dependencies.
 3. **Errors as types.** Each crate gets a `thiserror` enum, as in the existing crates. The C++
    `juce::Result` strings become variants; the CLI maps them to exit codes.
-4. **Determinism.** Output should match the C++ engine closely enough to compare. Pin the RNG
-   and be explicit about summation order in matrix kernels. Fusing a multiply and an add into a
-   single-rounded operation is allowed where the host CPU provides it: it changes the last unit
-   in the last place, not the order of the sum, and stays inside the golden tolerance.
+4. **Determinism.** Output should match the C++ engine closely enough to compare. Pin the RNG, and
+   be explicit about summation order in matrix kernels: the packed kernels may fuse a multiply and
+   an add into a single-rounded operation, and may interleave several partial sums and fold them,
+   when that is faster. Both change the last bits rather than the structure of the sum, and both
+   stay inside the golden tolerance.
 5. **No new public surface without a test.** The existing crates average roughly one test per 25 lines of code; keep that up.
 
 ## Phase 1: finish the project format (about 600 lines)
@@ -172,11 +173,13 @@ units; `CancelToken` moved down to `opensvr-core`).
 Done (SIMD + cache): weights pack into blocked `[f32; 16]` columns at load
 (zero-padded tails) with block-outer/column-inner multiply lowering to packed
 SIMD, plus the incremental dirty-range `Cache` (`DnniCache`,
-`DnniRunStatistics`, `run_with_cache`; `run` delegates unchanged). Scalar
-numerics unchanged: all per-op goldens green unmodified, packed-vs-scalar
-matrix tests agree bitwise. The kernel is picked at runtime — fused AVX2 where
-the CPU reports AVX2 and FMA, the SSE2 baseline otherwise — so the shipped
-binary stays portable and needs no build flags. Note there is
+`DnniRunStatistics`, `run_with_cache`; `run` delegates unchanged). All per-op
+goldens stay green unmodified and packed-vs-scalar matrix tests agree bitwise.
+Each lane's columns are dealt round-robin across two partial sums, folded once
+per block, which cuts the accumulator dependency chain in half. The kernel is
+picked at runtime — fused AVX2 where the CPU reports AVX2 and FMA, the SSE2
+baseline otherwise — so the shipped binary stays portable and needs no build
+flags. Note there is
 no `modl4` branch and no `moda6` in the C++ loader.
 
 Original plan, kept for reference:

@@ -223,6 +223,28 @@ pub const BLOCK: usize = 16;
 /// giving `4 * 4 = 16` output channels per block.
 const VECTORS_PER_BLOCK: usize = 4;
 
+/// Number of independent partial accumulators the packed kernels interleave.
+///
+/// Each lane's column sum is a serial dependency chain: with one accumulator
+/// every column's packed multiply-add waits on the column before it, which makes
+/// the kernel latency-bound rather than throughput-bound — the measurement on an
+/// M4 that ruled out fusing showed how much that chain costs.
+/// Interleaving `N` partial sums, combined once per block, cuts the chain to
+/// `columns / N` deep while leaving the multiply-add count unchanged.
+///
+/// This is a deliberate departure from the C++ summation order (ROADMAP
+/// principle 4). It is a summation-*order* change, not a rounding one: each
+/// partial still accumulates in increasing column order, and combining `N`
+/// shallower sums is at least as accurate as the single deep one.
+///
+/// Two, not four. Four measured a further 0.45% on an M4 (5.28s against 5.31s),
+/// but on the pre-AVX2 baseline it needs all sixteen SSE registers for
+/// accumulators alone, and the edge past that is a cliff rather than a slope:
+/// eight accumulators leave LLVM unable to vectorize at all, scalarizing to
+/// `fmul`/`fadd` at 3.5× the runtime. Two fits any register file and already
+/// takes 96% of the win.
+const ACCUMULATORS: usize = 2;
+
 /// Blocked SIMD weight matrix, transposing row-major storage into per-column
 /// 16-lane blocks.
 ///
@@ -690,26 +712,26 @@ fn read_i32(payload: &[u8], offset: usize) -> i32 {
     ])
 }
 
-/// Blocked SIMD matrix-vector product: `output[block, lane] = sum over columns in order`.
+/// Blocked SIMD matrix-vector product: `output[block, lane] = sum over columns`.
 ///
-/// This is the SIMD equivalent of `multiply_matrix`: the C++ `multiplyMatrix`
-/// zeroes four per-block accumulators and sums column-inner, so each output
-/// element is the columns summed in increasing order, overwriting (not
-/// accumulating into) the target. The packed path keeps that per-element order
-/// (ROADMAP principle 4) — only the vector width of the accumulation changes.
+/// This is the SIMD equivalent of the C++ `multiplyMatrix`, which zeroes four
+/// per-block accumulators and sums column-inner, overwriting (not accumulating
+/// into) the target. The packed path also sums in increasing column order, but
+/// deals the columns round-robin across [`ACCUMULATORS`] partial sums and folds
+/// those once per block, so it does not reproduce the C++ value bit for bit; see
+/// that constant and ROADMAP principle 4.
 ///
-/// For the test suite there is a `#[cfg(test)]` scalar fallback that reads
-/// the same blocked layout but accumulates each lane through a plain `f32`
-/// sum in column order, proving the packed path does not reorder
-/// floating-point additions relative to the scalar reference.
+/// For the test suite there is a `#[cfg(test)]` scalar fallback that reads the
+/// same blocked layout and mirrors that structure, so the packed path can still
+/// be checked against it bit for bit.
 ///
 /// Deliberately outlined (`#[inline(never)]`): the standalone body lowers the
 /// 16-lane accumulator to packed arithmetic with a broadcasted input lane —
 /// four 128-bit `mulps`/`addps` pairs on the generic x86-64 baseline, two
-/// 256-bit `vfmadd` pairs where AVX2 and FMA are present — without changing the
-/// per-element column order. A body inlined into the GRU/dense caller control
-/// flow scalarizes instead. Call overhead is negligible next to `columns × 16`
-/// fused multiplies per invocation.
+/// 256-bit `vfmadd` pairs where AVX2 and FMA are present — across
+/// `ACCUMULATORS` interleaved partial sums. A body inlined into the GRU/dense
+/// caller control flow scalarizes instead. Call overhead is negligible next to
+/// `columns × 16` multiply-adds per invocation.
 ///
 /// On x86-64 the kernel is chosen at runtime so the shipped binary stays
 /// portable: the fused AVX2 path where the CPU reports AVX2 *and* FMA, the SSE2
@@ -759,9 +781,9 @@ fn fused_kernel_active() -> bool {
     }
 }
 
-/// Shared body of both `multiply_matrix` kernels.
+/// Shared body of every `multiply_matrix` kernel.
 ///
-/// Emitted into each kernel so the two differ only in SIMD register width and in
+/// Emitted into each kernel so they differ only in SIMD register width and in
 /// whether `multiply_add!` fuses.
 macro_rules! multiply_matrix_body {
     ($matrix:ident, $input:ident, $output:ident, $step:ident) => {
@@ -769,25 +791,41 @@ macro_rules! multiply_matrix_body {
         let block_count = $matrix.values.len() / $matrix.columns.max(1);
         for (block_index, first_channel) in (0..block_count).map(|b| (b, b * BLOCK)) {
             let row_count = ($matrix.rows - first_channel).min(BLOCK);
-            // One flat 16-lane accumulator per block, column-inner: LLVM lowers
-            // this to packed arithmetic with a broadcasted input lane
+            // `ACCUMULATORS` flat 16-lane partial sums per block, column-inner:
+            // LLVM lowers each to packed arithmetic with a broadcasted input lane
             // (`vfmadd` on the fused AVX2 path, paired SSE `mulps`/`addps`
-            // otherwise) without changing the per-element column order.
+            // otherwise). Columns are dealt round-robin across the partials, so
+            // the lanes of one partial never wait on the partial before them.
             // `VECTORS_PER_BLOCK` documents the C++ `WeightBlock`
             // correspondence: lanes `[4k, 4k+4)` are the k-th SIMD register.
             debug_assert_eq!(BLOCK, 4 * VECTORS_PER_BLOCK);
-            let mut acc = [0.0_f32; BLOCK];
+            let mut acc = [[0.0_f32; BLOCK]; ACCUMULATORS];
             // Bounds checks are hoisted to one per block; the column loop runs
             // over iterators with no per-lane checks, which is what lets LLVM
-            // SLP-vectorize the 16-lane body into packed arithmetic.
+            // SLP-vectorize each 16-lane body into packed arithmetic.
             let block_weights = &$matrix.values[block_index * $matrix.columns..][..$matrix.columns];
-            for (value, weights) in $input.iter().zip(block_weights.iter()) {
-                let value = *value;
-                for lane in 0..BLOCK {
-                    acc[lane] = multiply_add!($step, weights[lane], value, acc[lane]);
+            let mut columns = $input.iter().zip(block_weights.iter());
+            'columns: loop {
+                for partial in acc.iter_mut() {
+                    let Some((value, weights)) = columns.next() else {
+                        break 'columns;
+                    };
+                    let value = *value;
+                    for lane in 0..BLOCK {
+                        partial[lane] = multiply_add!($step, weights[lane], value, partial[lane]);
+                    }
                 }
             }
-            $output[first_channel..first_channel + row_count].copy_from_slice(&acc[..row_count]);
+            // Fold the partials in accumulator order. `0.0 + x == x`, so the
+            // first partial is carried over exactly and the scalar reference can
+            // reproduce this result bit for bit.
+            let mut total = acc[0];
+            for partial in &acc[1..] {
+                for lane in 0..BLOCK {
+                    total[lane] += partial[lane];
+                }
+            }
+            $output[first_channel..first_channel + row_count].copy_from_slice(&total[..row_count]);
         }
     };
 }
@@ -835,11 +873,11 @@ unsafe fn multiply_matrix_avx2_fma(matrix: &DenseMatrix, input: &[f32], output: 
 
 /// Scalar reference for [`multiply_matrix`], gated to test builds.
 ///
-/// Reads the same blocked layout but accumulates each lane through a plain
-/// `f32` sum in column order, proving the packed path does not reorder
-/// floating-point additions relative to a scalar reference. `fused` selects the
-/// same rounding as the kernel the host will run — see [`fused_kernel_active`] —
-/// so unit tests can still assert exact (bitwise) agreement between the two.
+/// Reads the same blocked layout but accumulates each lane with plain `f32`
+/// arithmetic, mirroring the kernel's round-robin partial sums and its `fused`
+/// rounding choice (see [`fused_kernel_active`]). That is what lets the unit
+/// tests prove the *packed* path computes the same values as an obviously
+/// correct scalar one, independent of how LLVM vectorizes.
 #[cfg(test)]
 fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32], fused: bool) {
     debug_assert!(output.len() >= matrix.rows);
@@ -849,13 +887,18 @@ fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32
         let row_count = (matrix.rows - first_channel).min(BLOCK);
         let block_weights = &matrix.values[block * matrix.columns..][..matrix.columns];
         for row in 0..row_count {
-            let mut sum = 0.0_f32;
-            for (weights, input) in block_weights.iter().zip(input.iter()) {
-                sum = if fused {
-                    weights[row].mul_add(*input, sum)
+            let mut partials = [0.0_f32; ACCUMULATORS];
+            for (column, (weights, input)) in block_weights.iter().zip(input.iter()).enumerate() {
+                let partial = &mut partials[column % ACCUMULATORS];
+                *partial = if fused {
+                    weights[row].mul_add(*input, *partial)
                 } else {
-                    sum + weights[row] * *input
+                    *partial + weights[row] * *input
                 };
+            }
+            let mut sum = partials[0];
+            for partial in &partials[1..] {
+                sum += partial;
             }
             output[first_channel + row] = sum;
         }
@@ -3598,9 +3641,9 @@ mod tests {
 
     #[test]
     fn packed_multiply_matches_scalar_exactly() {
-        // Packed vs scalar-fallback agreement must be bitwise: both sum each
-        // lane's columns in increasing order from a zero accumulator, and both
-        // fuse (or not) exactly as this host's kernel does.
+        // Packed vs scalar-fallback agreement must be bitwise: both deal columns
+        // round-robin across ACCUMULATORS partials, fold those in the same
+        // order, and fuse (or not) exactly as this host's kernel does.
         let fused = fused_kernel_active();
         for (rows, columns) in [(1, 1), (2, 3), (16, 16), (17, 3), (31, 5), (5, 33)] {
             let mut state = 0x1234_5678_9abc_def0_u64 ^ (rows as u64 * 31 + columns as u64);
