@@ -13,7 +13,7 @@ const NEURAL_BASIC: &str = concat!(
 );
 
 fn opensvr(arguments: &[&str]) -> Output {
-    // Hermetic by default: ambient OPENSVR_VOICE/OPENSVR_DICT must not leak
+    // Hermetic by default: ambient OPENSVR_VOICE/OPENSVR_DICTIONARY must not leak
     // into assertions about project-file paths (use `opensvr_env` to set them).
     opensvr_env(arguments, &[])
 }
@@ -23,6 +23,7 @@ fn opensvr_env(arguments: &[&str], vars: &[(&str, &str)]) -> Output {
     command
         .args(arguments)
         .env_remove("OPENSVR_VOICE")
+        .env_remove("OPENSVR_DICTIONARY")
         .env_remove("OPENSVR_DICT");
     for (key, value) in vars {
         command.env(key, value);
@@ -112,7 +113,7 @@ fn render_sings_when_a_voice_is_configured() {
         "a voiced render must not print the placeholder warning: {stderr}"
     );
 
-    // Every note carries explicit phonemes, so no --dict is needed. Windows
+    // Every note carries explicit phonemes, so no --dictionary is needed. Windows
     // mirror the audio-crate gated test at 8 kHz: the voiced "k a" region at
     // 0.1..0.3 s must dominate the "sil" note at 1.05..1.15 s.
     let mut reader = hound::WavReader::open(&path).unwrap();
@@ -191,7 +192,7 @@ fn midi_export_writes_a_standard_midi_file() {
 #[test]
 fn convert_svp_to_mid_writes_a_standard_midi_file() {
     let path = scratch("convert.mid");
-    let output = opensvr(&["convert", EXAMPLE, path.to_str().unwrap()]);
+    let output = opensvr(&["convert", EXAMPLE, "-o", path.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(0));
     let bytes = fs::read(&path).unwrap();
     assert_eq!(&bytes[..4], b"MThd");
@@ -220,15 +221,20 @@ fn convert_mid_to_svp_keeps_the_notes() {
     let (mid_b, svp_b) = (there.join("song.mid"), there.join("song.svp"));
 
     assert_eq!(
-        opensvr(&["convert", EXAMPLE, mid_a.to_str().unwrap()])
+        opensvr(&["convert", EXAMPLE, "-o", mid_a.to_str().unwrap()])
             .status
             .code(),
         Some(0)
     );
     assert_eq!(
-        opensvr(&["convert", mid_a.to_str().unwrap(), svp_a.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            mid_a.to_str().unwrap(),
+            "-o",
+            svp_a.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     // The sung notes survive the MIDI leg: Lead keeps its 4 lyric-bearing
@@ -247,15 +253,25 @@ fn convert_mid_to_svp_keeps_the_notes() {
     assert_eq!(after.matches("Tracks: 2").count(), 1);
     // And `.mid` -> `.svp` is a fixed point from here on.
     assert_eq!(
-        opensvr(&["convert", svp_a.to_str().unwrap(), mid_b.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            svp_a.to_str().unwrap(),
+            "-o",
+            mid_b.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     assert_eq!(
-        opensvr(&["convert", mid_b.to_str().unwrap(), svp_b.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            mid_b.to_str().unwrap(),
+            "-o",
+            svp_b.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     let again = opensvr(&["info", svp_b.to_str().unwrap()]);
@@ -275,21 +291,31 @@ fn convert_svp_to_svp_converges_to_a_fixed_point() {
     let twice = scratch("fixed-twice.svp");
     let thrice = scratch("fixed-thrice.svp");
     assert_eq!(
-        opensvr(&["convert", EXAMPLE, once.to_str().unwrap()])
+        opensvr(&["convert", EXAMPLE, "-o", once.to_str().unwrap()])
             .status
             .code(),
         Some(0)
     );
     assert_eq!(
-        opensvr(&["convert", once.to_str().unwrap(), twice.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            once.to_str().unwrap(),
+            "-o",
+            twice.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     assert_eq!(
-        opensvr(&["convert", twice.to_str().unwrap(), thrice.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            twice.to_str().unwrap(),
+            "-o",
+            thrice.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     assert_eq!(fs::read(&twice).unwrap(), fs::read(&thrice).unwrap());
@@ -317,22 +343,28 @@ fn convert_svp_to_svp_converges_to_a_fixed_point() {
 fn convert_uses_the_documented_exit_codes() {
     let mid = scratch("exit-codes.mid");
     assert_eq!(
-        opensvr(&["convert", EXAMPLE, mid.to_str().unwrap()])
+        opensvr(&["convert", EXAMPLE, "-o", mid.to_str().unwrap()])
             .status
             .code(),
         Some(0)
     );
     // Unknown extensions are refused, not misread.
     assert_eq!(
-        opensvr(&["convert", EXAMPLE, scratch("out.txt").to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            EXAMPLE,
+            "-o",
+            scratch("out.txt").to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(3)
     );
     assert_eq!(
         opensvr(&[
             "convert",
             scratch("in.txt").to_str().unwrap(),
+            "-o",
             mid.to_str().unwrap()
         ])
         .status
@@ -341,65 +373,114 @@ fn convert_uses_the_documented_exit_codes() {
     );
     // Missing inputs are load errors.
     assert_eq!(
-        opensvr(&["convert", "/no/such/project.svp", mid.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            "/no/such/project.svp",
+            "-o",
+            mid.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(2)
     );
     assert_eq!(
-        opensvr(&["convert", "/no/such/project.mid", mid.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            "/no/such/project.mid",
+            "-o",
+            mid.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(2)
     );
     fs::remove_file(mid).unwrap();
 }
 
 #[test]
-fn flat_render_matches_the_subcommand() {
-    let flat = scratch("flat.wav");
-    let plain = scratch("flat-plain.wav");
-    let flat_output = opensvr(&[
-        EXAMPLE,
+fn missing_outputs_pair_with_the_input() {
+    // A copied project keeps its default output out of the repository.
+    let dir = scratch("defaults");
+    fs::create_dir_all(&dir).unwrap();
+    let project = dir.join("two-tracks.svp");
+    fs::copy(EXAMPLE, &project).unwrap();
+
+    let wav = project.with_extension("wav");
+    let render = opensvr(&["render", project.to_str().unwrap(), "-q"]);
+    assert_eq!(render.status.code(), Some(0));
+    assert_eq!(&fs::read(&wav).unwrap()[..4], b"RIFF");
+
+    let mid = project.with_extension("mid");
+    let midi = opensvr(&["midi", project.to_str().unwrap()]);
+    assert_eq!(midi.status.code(), Some(0));
+    assert_eq!(&fs::read(&mid).unwrap()[..4], b"MThd");
+
+    // `convert` picks the other format beside the input.
+    let converted = dir.join("converted.mid");
+    let convert = opensvr(&[
+        "convert",
+        project.to_str().unwrap(),
         "-o",
-        flat.to_str().unwrap(),
-        "--rate",
-        "22050",
-        "-q",
+        converted.to_str().unwrap(),
     ]);
-    assert_eq!(
-        flat_output.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&flat_output.stderr)
-    );
-    let plain_output = opensvr(&[
-        "render",
-        EXAMPLE,
-        "-o",
-        plain.to_str().unwrap(),
-        "--rate",
-        "22050",
-        "-q",
-    ]);
-    assert_eq!(
-        plain_output.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&plain_output.stderr)
-    );
-    assert_eq!(fs::read(&flat).unwrap(), fs::read(&plain).unwrap());
-    fs::remove_file(flat).unwrap();
-    fs::remove_file(plain).unwrap();
+    assert_eq!(convert.status.code(), Some(0));
+    assert_eq!(fs::read(&mid).unwrap(), fs::read(&converted).unwrap());
+
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
-fn flat_info_matches_the_subcommand() {
-    let flat = opensvr(&[EXAMPLE, "--info"]);
-    let plain = opensvr(&["info", EXAMPLE]);
-    assert_eq!(flat.status.code(), Some(0));
-    assert_eq!(plain.status.code(), Some(0));
-    assert_eq!(flat.stdout, plain.stdout);
+fn output_dash_streams_to_stdout() {
+    let rendered = opensvr(&["render", EXAMPLE, "-o", "-", "--rate", "8000", "-q"]);
+    assert_eq!(rendered.status.code(), Some(0));
+    assert_eq!(&rendered.stdout[..4], b"RIFF");
+    assert_eq!(&rendered.stdout[8..12], b"WAVE");
+
+    let midi = opensvr(&["midi", EXAMPLE, "-o", "-"]);
+    assert_eq!(midi.status.code(), Some(0));
+    assert_eq!(&midi.stdout[..4], b"MThd");
+
+    // `-` has no extension, so it streams the other format: `.svp` -> MIDI
+    // bytes. That matches omitting `-o` entirely.
+    let svp_to_midi = opensvr(&["convert", EXAMPLE, "-o", "-"]);
+    assert_eq!(svp_to_midi.status.code(), Some(0));
+    assert_eq!(&svp_to_midi.stdout[..4], b"MThd");
+
+    // A `.mid` input streams `.svp`, byte-identical to what `save` writes:
+    // relative paths anchor on the input's directory in both cases.
+    let dir = scratch("stdout-svp");
+    fs::create_dir_all(&dir).unwrap();
+    let project = dir.join("two-tracks.svp");
+    fs::copy(EXAMPLE, &project).unwrap();
+    let mid = dir.join("song.mid");
+    assert_eq!(
+        opensvr(&[
+            "convert",
+            project.to_str().unwrap(),
+            "-o",
+            mid.to_str().unwrap()
+        ])
+        .status
+        .code(),
+        Some(0)
+    );
+    let file = dir.join("out.svp");
+    assert_eq!(
+        opensvr(&[
+            "convert",
+            mid.to_str().unwrap(),
+            "-o",
+            file.to_str().unwrap()
+        ])
+        .status
+        .code(),
+        Some(0)
+    );
+    let svp = opensvr(&["convert", mid.to_str().unwrap(), "-o", "-"]);
+    assert_eq!(svp.status.code(), Some(0));
+    assert_eq!(svp.stdout, fs::read(&file).unwrap());
+    assert_eq!(svp.stdout.last(), Some(&0));
+    fs::remove_dir_all(dir).unwrap();
 }
 
 /// Renders an override path exactly as the binary prints it: overrides go
@@ -413,7 +494,7 @@ fn abs_display(path: &str) -> String {
 fn env_vars_default_the_overrides_on_every_track() {
     let vars = &[
         ("OPENSVR_VOICE", "/env/voice.nofs"),
-        ("OPENSVR_DICT", "/env/dicts"),
+        ("OPENSVR_DICTIONARY", "/env/dicts"),
     ];
     let output = opensvr_env(&["info", EXAMPLE], vars);
     assert_eq!(output.status.code(), Some(0));
@@ -426,6 +507,15 @@ fn env_vars_default_the_overrides_on_every_track() {
     assert_eq!(text.matches(&missing_dict).count(), 2, "{text}");
     // The project file's own voice path is gone, overridden on every track.
     assert!(!text.contains("voices/example/voice.nofs"), "{text}");
+}
+
+#[test]
+fn the_legacy_dict_env_var_still_works() {
+    let output = opensvr_env(&["info", EXAMPLE], &[("OPENSVR_DICT", "/legacy/dicts")]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    let missing = format!("{}  [MISSING]", abs_display("/legacy/dicts"));
+    assert_eq!(text.matches(&missing).count(), 2, "{text}");
 }
 
 #[test]
@@ -450,20 +540,6 @@ fn empty_env_values_count_as_unset() {
     assert_eq!(output.status.code(), Some(0));
     let plain = opensvr(&["info", EXAMPLE]);
     assert_eq!(output.stdout, plain.stdout);
-}
-
-#[test]
-fn flat_form_honors_env_vars() {
-    let vars = &[("OPENSVR_VOICE", "/env/voice.nofs")];
-    let flat = opensvr_env(&[EXAMPLE, "--info"], vars);
-    let plain = opensvr_env(&["info", EXAMPLE], vars);
-    assert_eq!(flat.status.code(), Some(0));
-    assert_eq!(flat.stdout, plain.stdout);
-    assert!(
-        String::from_utf8(flat.stdout)
-            .unwrap()
-            .contains(&abs_display("/env/voice.nofs"))
-    );
 }
 
 #[test]
@@ -493,29 +569,6 @@ fn complete_prints_scripts_naming_every_subcommand() {
 }
 
 #[test]
-fn flat_failures_exit_with_usage_errors() {
-    // C++ texts, same exit status as the subcommand usage errors.
-    let missing_output = opensvr(&[EXAMPLE]);
-    assert_eq!(missing_output.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&missing_output.stderr).contains("no output file given (use -o)")
-    );
-    let unknown = opensvr(&[EXAMPLE, "-o", "out.wav", "--frobnicate"]);
-    assert_eq!(unknown.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown option --frobnicate"));
-    let extra = opensvr(&[EXAMPLE, "extra.svp", "-o", "out.wav"]);
-    assert_eq!(extra.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&extra.stderr).contains("unexpected extra argument extra.svp"));
-    // The bare binary has no input project.
-    assert_eq!(opensvr(&[]).status.code(), Some(1));
-    // Top-level help still documents the subcommands.
-    let help = opensvr(&["--help"]);
-    assert_eq!(help.status.code(), Some(0));
-    let text = String::from_utf8_lossy(&help.stdout);
-    assert!(text.contains("render") && text.contains("info"));
-}
-
-#[test]
 fn render_help_documents_the_models_dir_override() {
     let help = opensvr(&["render", "--help"]);
     assert_eq!(help.status.code(), Some(0));
@@ -528,9 +581,9 @@ fn render_help_documents_the_models_dir_override() {
 fn failures_use_the_documented_exit_codes() {
     assert_eq!(opensvr(&[]).status.code(), Some(1), "usage error");
     assert_eq!(
-        opensvr(&["render", EXAMPLE]).status.code(),
+        opensvr(&["render"]).status.code(),
         Some(1),
-        "missing --output"
+        "missing project"
     );
     assert_eq!(
         opensvr(&["info", "/no/such/project.svp"]).status.code(),

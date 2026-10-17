@@ -1362,13 +1362,25 @@ pub fn serialize(project: &Project, base_dir: &Path) -> Result<String> {
     serde_json::to_string_pretty(&Value::Object(root)).map_err(SvpError::Json)
 }
 
+/// Serializes a project to the exact bytes [`save`] writes: multi-line JSON
+/// plus the trailing NUL byte Synthesizer V appends.
+///
+/// `base_dir` is the directory voice, dictionary, and backing-track paths
+/// relativize against — the file's parent on [`save`], and at the caller's
+/// discretion everywhere else (the CLI uses the input project's parent when
+/// streaming to stdout, where no output directory exists).
+pub fn encode(project: &Project, base_dir: &Path) -> Result<Vec<u8>> {
+    let mut bytes = serialize(project, base_dir)?.into_bytes();
+    bytes.push(0);
+    Ok(bytes)
+}
+
 /// Saves a project to disk: multi-line JSON plus the trailing NUL byte
 /// Synthesizer V appends, written atomically via a sibling temporary file
 /// and rename, as in `saveProjectFile`.
 pub fn save(path: &Path, project: &Project) -> Result<()> {
     let base_dir = path.parent().unwrap_or_else(|| Path::new(""));
-    let mut bytes = serialize(project, base_dir)?.into_bytes();
-    bytes.push(0);
+    let bytes = encode(project, base_dir)?;
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
@@ -2533,6 +2545,20 @@ mod tests {
         let back = load(&path).unwrap();
         assert_eq!(back.name, "song");
         assert_eq!(back.tracks[0].main_group.notes.len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn encode_matches_the_bytes_save_writes() {
+        let project = parse_value(&sample()).unwrap();
+        let dir = std::env::temp_dir().join(format!("opensvr-svp-encode-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.svp");
+        save(&path, &project).unwrap();
+
+        let encoded = encode(&project, path.parent().unwrap()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), encoded);
+        assert_eq!(encoded.last(), Some(&0));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

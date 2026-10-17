@@ -2,21 +2,35 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use opensvr_audio::{MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use opensvr_core::Language;
 
 const AFTER_HELP: &str = "\
 Voice databases and dictionaries are not bundled; point to files you own.
-OPENSVR_VOICE and OPENSVR_DICT default --voice and --dict when those flags are absent; explicit flags win.
+OPENSVR_VOICE and OPENSVR_DICTIONARY default --voice and --dictionary when those flags are absent; explicit flags win.
 OPENSVR_MODELS_DIR defaults --models-dir the same way, resolving Flat voice models away from the document.
+--dict and OPENSVR_DICT are accepted as legacy aliases for --dictionary and OPENSVR_DICTIONARY.
 Exit codes: 0 ok, 1 usage error, 2 load error, 3 render/write error, 130 cancelled.";
 
 #[derive(Debug, Parser)]
 #[command(name = "opensvr", version, about, after_help = AFTER_HELP)]
 pub struct Cli {
+    #[command(flatten)]
+    pub global: GlobalArgs,
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Flags every subcommand accepts, before or after its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Args)]
+pub struct GlobalArgs {
+    /// Suppress progress and non-error messages
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    pub quiet: bool,
+    /// Print extra detail about what each command is doing
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
@@ -38,23 +52,48 @@ pub enum Command {
 /// Settings that replace what the project file says, on every track.
 ///
 /// Each path falls back to its environment variable (`OPENSVR_VOICE`,
-/// `OPENSVR_DICT`, `OPENSVR_MODELS_DIR`) when the flag is absent; explicit
-/// flags win, and empty env values count as unset.
+/// `OPENSVR_DICTIONARY`, `OPENSVR_MODELS_DIR`) when the flag is absent;
+/// explicit flags win, and empty env values count as unset.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct Overrides {
     /// Use this voice database on every track (default: OPENSVR_VOICE)
     #[arg(long, value_name = "VOICE.NOFS")]
     pub voice: Option<PathBuf>,
-    /// Use this pronunciation dictionary directory on every track (default: OPENSVR_DICT)
-    #[arg(long, value_name = "CLF-DATA")]
-    pub dict: Option<PathBuf>,
+    /// Use this pronunciation dictionary directory on every track (default: OPENSVR_DICTIONARY)
+    #[arg(long, alias = "dict", value_name = "CLF-DATA")]
+    pub dictionary: Option<PathBuf>,
     /// Resolve Flat voice models from this directory instead of the voice
     /// document's sibling `models` directory (default: OPENSVR_MODELS_DIR)
     #[arg(long, value_name = "DIR")]
     pub models_dir: Option<PathBuf>,
-    /// Override the singing language on every track (japanese, mandarin, english, cantonese, spanish)
+    /// Override the singing language on every track
     #[arg(long, value_name = "NAME")]
-    pub language: Option<Language>,
+    pub language: Option<LanguageArg>,
+}
+
+/// Singing language, listed in `--help` and offered by shell completions.
+///
+/// `opensvr-core`'s [`Language`] stays free of clap; this mirror is the only
+/// place the CLI spells the names for a user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LanguageArg {
+    Japanese,
+    Mandarin,
+    English,
+    Cantonese,
+    Spanish,
+}
+
+impl From<LanguageArg> for Language {
+    fn from(value: LanguageArg) -> Self {
+        match value {
+            LanguageArg::Japanese => Self::Japanese,
+            LanguageArg::Mandarin => Self::Mandarin,
+            LanguageArg::English => Self::English,
+            LanguageArg::Cantonese => Self::Cantonese,
+            LanguageArg::Spanish => Self::Spanish,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -72,9 +111,9 @@ pub struct InfoArgs {
 pub struct RenderArgs {
     /// The .svp project to render
     pub project: PathBuf,
-    /// Output WAV path
+    /// Output WAV path, or `-` for stdout (default: the project path with `.wav`)
     #[arg(short, long, value_name = "FILE")]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
     #[command(flatten)]
     pub overrides: Overrides,
     /// Output sample rate in Hz
@@ -85,26 +124,24 @@ pub struct RenderArgs {
         value_parser = clap::value_parser!(u32).range(i64::from(MIN_SAMPLE_RATE)..=192_000),
     )]
     pub rate: u32,
-    /// Suppress progress messages
-    #[arg(short, long)]
-    pub quiet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct MidiArgs {
     /// The .svp project to read
     pub project: PathBuf,
-    /// Output MIDI path
+    /// Output MIDI path, or `-` for stdout (default: the project path with `.mid`)
     #[arg(short, long, value_name = "FILE")]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ConvertArgs {
     /// Input project (.svp or .mid)
     pub input: PathBuf,
-    /// Output project (.svp or .mid)
-    pub output: PathBuf,
+    /// Output path, or `-` to stream the other format to stdout (default: the input path with the other extension)
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
 }
 
 /// Target shell for `complete` (one of bash, elvish, fish, powershell, zsh).
@@ -173,33 +210,95 @@ mod tests {
         let Command::Render(args) = cli.command else {
             panic!("expected render")
         };
-        assert_eq!((args.rate, args.quiet), (44_100, true));
-        assert_eq!(args.overrides.language, Some(Language::English));
+        assert_eq!(args.rate, 44_100);
+        assert!(cli.global.quiet, "global flags work after the subcommand");
+        assert_eq!(args.overrides.language, Some(LanguageArg::English));
+    }
+
+    #[test]
+    fn language_choices_are_listed() {
+        let help = Cli::command()
+            .find_subcommand_mut("render")
+            .expect("render exists")
+            .render_long_help()
+            .to_string();
+        for name in ["japanese", "mandarin", "english", "cantonese", "spanish"] {
+            assert!(help.contains(name), "render help misses {name}: {help}");
+        }
+    }
+
+    #[test]
+    fn global_flags_work_before_the_subcommand() {
+        let cli = Cli::try_parse_from(["opensvr", "-v", "info", "song.svp"]).unwrap();
+        assert!(cli.global.verbose && !cli.global.quiet);
+        assert!(matches!(cli.command, Command::Info(_)));
+    }
+
+    #[test]
+    fn quiet_conflicts_with_verbose() {
+        assert!(Cli::try_parse_from(["opensvr", "-q", "-v", "man"]).is_err());
+    }
+
+    #[test]
+    fn dictionary_accepts_a_legacy_dict_alias() {
+        for flag in ["--dictionary", "--dict"] {
+            let cli = Cli::try_parse_from(["opensvr", "info", "song.svp", flag, "clf"]).unwrap();
+            let Command::Info(args) = cli.command else {
+                panic!("expected info")
+            };
+            assert_eq!(
+                args.overrides.dictionary,
+                Some(PathBuf::from("clf")),
+                "{flag}"
+            );
+        }
     }
 
     #[test]
     fn rejects_bad_usage() {
         for arguments in [
             &["opensvr"][..],
-            &["opensvr", "render", "song.svp"],
+            &["opensvr", "render"],
             &[
                 "opensvr", "render", "song.svp", "-o", "out.wav", "--rate", "100",
             ],
             &["opensvr", "info", "song.svp", "--language", "klingon"],
-            &["opensvr", "convert", "song.svp"],
+            &["opensvr", "convert"],
         ] {
             assert!(Cli::try_parse_from(arguments).is_err(), "{arguments:?}");
         }
     }
 
     #[test]
+    fn output_flags_are_optional() {
+        let cli = Cli::try_parse_from(["opensvr", "render", "song.svp"]).unwrap();
+        let Command::Render(args) = cli.command else {
+            panic!("expected render")
+        };
+        assert_eq!(args.output, None, "no -o defaults beside the project");
+
+        let cli = Cli::try_parse_from(["opensvr", "midi", "song.svp", "-o", "-"]).unwrap();
+        let Command::Midi(args) = cli.command else {
+            panic!("expected midi")
+        };
+        assert_eq!(args.output, Some(PathBuf::from("-")));
+    }
+
+    #[test]
     fn parses_convert_options() {
-        let cli = Cli::try_parse_from(["opensvr", "convert", "song.svp", "song.mid"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["opensvr", "convert", "song.svp", "-o", "song.mid"]).unwrap();
         let Command::Convert(args) = cli.command else {
             panic!("expected convert")
         };
         assert_eq!(args.input, PathBuf::from("song.svp"));
-        assert_eq!(args.output, PathBuf::from("song.mid"));
+        assert_eq!(args.output, Some(PathBuf::from("song.mid")));
+
+        let cli = Cli::try_parse_from(["opensvr", "convert", "song.svp"]).unwrap();
+        let Command::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        assert_eq!(args.output, None);
     }
 
     #[test]
@@ -210,7 +309,7 @@ mod tests {
             "complete",
             "convert",
             "OPENSVR_VOICE",
-            "OPENSVR_DICT",
+            "OPENSVR_DICTIONARY",
             "OPENSVR_MODELS_DIR",
             "Exit codes",
         ] {

@@ -28,4 +28,4 @@ pub use render::{
     Renderer, StereoBuffer,
 };
 pub use resample::resample_mono;
-pub use wav::{WavError, write_wav};
+pub use wav::{WavError, encode_wav, write_wav};
