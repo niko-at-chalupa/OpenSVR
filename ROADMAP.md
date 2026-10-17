@@ -268,17 +268,14 @@ Replace `ToneBackend` with `NeuralBackend` and widen the seam as needed. Work in
 
 ## Phase 7: CLI polish
 
-Done: the flat-form shim routes `opensvr project.svp -o out.wav --info` to
-the matching subcommand, the exit-code table is tested and rides in `--help`
-and `opensvr.1`, `complete`/`man` ship completions and the man page (a sync
-test guards the checked-in page byte for byte), `OPENSVR_VOICE` /
-`OPENSVR_DICT` default `--voice` / `--dict`, and CI builds, lints and uploads
-per-OS artifacts on tags.
+Done: the exit-code table is tested and rides in `--help` and `opensvr.1`,
+`complete`/`man` ship completions and the man page (a sync test guards the
+checked-in page byte for byte), `OPENSVR_VOICE` / `OPENSVR_DICTIONARY` default
+`--voice` / `--dictionary`, and CI builds, lints and uploads per-OS artifacts
+on tags.
 
 Original list, kept for reference:
 
-- **Compatibility shim.** Accept the original flat form `opensvr project.svp -o out.wav --info` by routing it to `render`/`info`
-  when the first argument is not a subcommand.
 - **Exit-code table** in the README, kept in sync by the existing integration test.
 - **Shell completions and man page** via `clap_complete` and `clap_mangen`.
 - **Config.** `OPENSVR_VOICE` and `OPENSVR_DICT` environment variables as defaults for `--voice` and `--dict`.

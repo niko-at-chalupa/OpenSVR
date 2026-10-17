@@ -241,9 +241,9 @@ fn format_of(path: &Path) -> Option<Format> {
 
 /// Loads a project and applies the command-line overrides to every track.
 ///
-/// Unset `--voice`/`--dict` flags fall back to `OPENSVR_VOICE`/`OPENSVR_DICT`
-/// (non-empty only), so both the subcommand and flat forms share one
-/// flag-beats-env-beats-file precedence.
+/// Unset `--voice`/`--dictionary` flags fall back to their environment
+/// variables (non-empty only), so flag-beats-env-beats-file precedence holds
+/// everywhere.
 fn load(path: &Path, overrides: &Overrides) -> Result<Project, CliError> {
     let mut project = opensvr_svp::load(path)?;
     let voice = overrides
