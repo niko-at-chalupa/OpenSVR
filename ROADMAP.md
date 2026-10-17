@@ -76,7 +76,9 @@ The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
    be explicit about summation order in matrix kernels: the packed kernels may fuse a multiply and
    an add into a single-rounded operation, and may interleave several partial sums and fold them,
    when that is faster. Both change the last bits rather than the structure of the sum, and both
-   stay inside the golden tolerance.
+   stay inside the golden tolerance. Per-op goldens are necessary but not sufficient, though: some
+   passages synthesize unstably and turn a last-place difference into an audible one, so compare
+   end-to-end renders as well when a change touches the arithmetic.
 5. **No new public surface without a test.** The existing crates average roughly one test per 25 lines of code; keep that up.
 
 ## Phase 1: finish the project format (about 600 lines)
