@@ -8,8 +8,9 @@ use opensvr_core::Language;
 
 const AFTER_HELP: &str = "\
 Voice databases and dictionaries are not bundled; point to files you own.
-OPENSVR_VOICE and OPENSVR_DICT default --voice and --dict when those flags are absent; explicit flags win.
+OPENSVR_VOICE and OPENSVR_DICTIONARY default --voice and --dictionary when those flags are absent; explicit flags win.
 OPENSVR_MODELS_DIR defaults --models-dir the same way, resolving Flat voice models away from the document.
+--dict and OPENSVR_DICT are accepted as legacy aliases for --dictionary and OPENSVR_DICTIONARY.
 Exit codes: 0 ok, 1 usage error, 2 load error, 3 render/write error, 130 cancelled.";
 
 #[derive(Debug, Parser)]
@@ -51,16 +52,16 @@ pub enum Command {
 /// Settings that replace what the project file says, on every track.
 ///
 /// Each path falls back to its environment variable (`OPENSVR_VOICE`,
-/// `OPENSVR_DICT`, `OPENSVR_MODELS_DIR`) when the flag is absent; explicit
-/// flags win, and empty env values count as unset.
+/// `OPENSVR_DICTIONARY`, `OPENSVR_MODELS_DIR`) when the flag is absent;
+/// explicit flags win, and empty env values count as unset.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct Overrides {
     /// Use this voice database on every track (default: OPENSVR_VOICE)
     #[arg(long, value_name = "VOICE.NOFS")]
     pub voice: Option<PathBuf>,
-    /// Use this pronunciation dictionary directory on every track (default: OPENSVR_DICT)
-    #[arg(long, value_name = "CLF-DATA")]
-    pub dict: Option<PathBuf>,
+    /// Use this pronunciation dictionary directory on every track (default: OPENSVR_DICTIONARY)
+    #[arg(long, alias = "dict", value_name = "CLF-DATA")]
+    pub dictionary: Option<PathBuf>,
     /// Resolve Flat voice models from this directory instead of the voice
     /// document's sibling `models` directory (default: OPENSVR_MODELS_DIR)
     #[arg(long, value_name = "DIR")]
@@ -202,6 +203,21 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_accepts_a_legacy_dict_alias() {
+        for flag in ["--dictionary", "--dict"] {
+            let cli = Cli::try_parse_from(["opensvr", "info", "song.svp", flag, "clf"]).unwrap();
+            let Command::Info(args) = cli.command else {
+                panic!("expected info")
+            };
+            assert_eq!(
+                args.overrides.dictionary,
+                Some(PathBuf::from("clf")),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_bad_usage() {
         for arguments in [
             &["opensvr"][..],
@@ -256,7 +272,7 @@ mod tests {
             "complete",
             "convert",
             "OPENSVR_VOICE",
-            "OPENSVR_DICT",
+            "OPENSVR_DICTIONARY",
             "OPENSVR_MODELS_DIR",
             "Exit codes",
         ] {

@@ -13,7 +13,7 @@ const NEURAL_BASIC: &str = concat!(
 );
 
 fn opensvr(arguments: &[&str]) -> Output {
-    // Hermetic by default: ambient OPENSVR_VOICE/OPENSVR_DICT must not leak
+    // Hermetic by default: ambient OPENSVR_VOICE/OPENSVR_DICTIONARY must not leak
     // into assertions about project-file paths (use `opensvr_env` to set them).
     opensvr_env(arguments, &[])
 }
@@ -23,6 +23,7 @@ fn opensvr_env(arguments: &[&str], vars: &[(&str, &str)]) -> Output {
     command
         .args(arguments)
         .env_remove("OPENSVR_VOICE")
+        .env_remove("OPENSVR_DICTIONARY")
         .env_remove("OPENSVR_DICT");
     for (key, value) in vars {
         command.env(key, value);
@@ -112,7 +113,7 @@ fn render_sings_when_a_voice_is_configured() {
         "a voiced render must not print the placeholder warning: {stderr}"
     );
 
-    // Every note carries explicit phonemes, so no --dict is needed. Windows
+    // Every note carries explicit phonemes, so no --dictionary is needed. Windows
     // mirror the audio-crate gated test at 8 kHz: the voiced "k a" region at
     // 0.1..0.3 s must dominate the "sil" note at 1.05..1.15 s.
     let mut reader = hound::WavReader::open(&path).unwrap();
@@ -493,7 +494,7 @@ fn abs_display(path: &str) -> String {
 fn env_vars_default_the_overrides_on_every_track() {
     let vars = &[
         ("OPENSVR_VOICE", "/env/voice.nofs"),
-        ("OPENSVR_DICT", "/env/dicts"),
+        ("OPENSVR_DICTIONARY", "/env/dicts"),
     ];
     let output = opensvr_env(&["info", EXAMPLE], vars);
     assert_eq!(output.status.code(), Some(0));
@@ -506,6 +507,15 @@ fn env_vars_default_the_overrides_on_every_track() {
     assert_eq!(text.matches(&missing_dict).count(), 2, "{text}");
     // The project file's own voice path is gone, overridden on every track.
     assert!(!text.contains("voices/example/voice.nofs"), "{text}");
+}
+
+#[test]
+fn the_legacy_dict_env_var_still_works() {
+    let output = opensvr_env(&["info", EXAMPLE], &[("OPENSVR_DICT", "/legacy/dicts")]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    let missing = format!("{}  [MISSING]", abs_display("/legacy/dicts"));
+    assert_eq!(text.matches(&missing).count(), 2, "{text}");
 }
 
 #[test]

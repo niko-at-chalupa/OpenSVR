@@ -354,14 +354,17 @@ fn format_of(path: &Path) -> Option<Format> {
 ///
 /// Unset `--voice`/`--dictionary` flags fall back to their environment
 /// variables (non-empty only), so flag-beats-env-beats-file precedence holds
-/// everywhere.
+/// everywhere. `OPENSVR_DICT` is kept as a legacy alias.
 fn load(path: &Path, overrides: &Overrides) -> Result<Project, CliError> {
     let mut project = opensvr_svp::load(path)?;
     let voice = overrides
         .voice
         .clone()
         .or_else(|| env_path("OPENSVR_VOICE"));
-    let dictionary = overrides.dict.clone().or_else(|| env_path("OPENSVR_DICT"));
+    let dictionary = overrides
+        .dictionary
+        .clone()
+        .or_else(|| env_path("OPENSVR_DICTIONARY").or_else(|| env_path("OPENSVR_DICT")));
     let absolute = |path: &Path| path::absolute(path);
     for track in &mut project.tracks {
         if let Some(voice) = &voice {
