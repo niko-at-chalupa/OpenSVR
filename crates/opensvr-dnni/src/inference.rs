@@ -703,48 +703,78 @@ fn read_i32(payload: &[u8], offset: usize) -> i32 {
 /// sum in column order, proving the packed path does not reorder
 /// floating-point additions relative to the scalar reference.
 ///
-/// Deliberately outlined (`#[inline(never)]`): in the final linked release
-/// binary the standalone body lowers the 16-lane accumulator to packed
-/// `mulps`/`addps` with a broadcasted input lane — four 128-bit pairs on the
-/// generic x86-64 baseline, two 256-bit pairs where AVX2 is present — without
-/// changing the per-element column order. A body inlined into the GRU/dense
-/// caller control flow scalarizes instead. Call overhead is negligible next to
-/// `columns × 16` fused multiplies per invocation.
+/// Deliberately outlined (`#[inline(never)]`): the standalone body lowers the
+/// 16-lane accumulator to packed arithmetic with a broadcasted input lane —
+/// four 128-bit `mulps`/`addps` pairs on the generic x86-64 baseline, two
+/// 256-bit `vfmadd` pairs where AVX2 and FMA are present — without changing the
+/// per-element column order. A body inlined into the GRU/dense caller control
+/// flow scalarizes instead. Call overhead is negligible next to `columns × 16`
+/// fused multiplies per invocation.
 ///
 /// On x86-64 the kernel is chosen at runtime so the shipped binary stays
-/// portable: AVX2 where the CPU reports it, the SSE2 baseline otherwise. Both
-/// kernels come from one shared body macro, so they differ only in SIMD
-/// register width and produce bitwise-identical results.
+/// portable: the fused AVX2 path where the CPU reports AVX2 *and* FMA, the SSE2
+/// baseline otherwise. Both kernels share one body macro, so they differ only in
+/// SIMD width and in whether they route each accumulate through a fused or a
+/// separate rounding. Other architectures deliberately do not fuse; see
+/// [`multiply_matrix_baseline`] for the measurement behind that.
+///
+/// The fused path rounds once per multiply-add instead of twice, and so does
+/// **not** reproduce the C++ `mulps`/`addps` result bit-for-bit; ROADMAP
+/// principle 4 asks only that stages match closely enough to compare. Because
+/// the baseline keeps the C++ rounding, two hosts can differ in the last unit in
+/// the last place for the same project.
 #[inline(never)]
-#[allow(unsafe_code)] // one guarded AVX2 call; the kernels themselves stay safe.
+#[allow(unsafe_code)] // one guarded fused-kernel call; the kernels stay safe.
 pub fn multiply_matrix(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: the branch is guarded by the AVX2 runtime feature check
-        // directly above, and the callee enables no feature beyond `avx2`.
-        unsafe { multiply_matrix_avx2(matrix, input, output) };
+    if fused_kernel_available() {
+        // SAFETY: the branch is guarded by the AVX2+FMA runtime check in
+        // `fused_kernel_available`, and the callee enables nothing beyond
+        // `avx2` and `fma`.
+        unsafe { multiply_matrix_avx2_fma(matrix, input, output) };
         return;
     }
     multiply_matrix_baseline(matrix, input, output);
 }
 
+/// Whether this host can run the fused `vfmadd` kernel.
+#[cfg(target_arch = "x86_64")]
+fn fused_kernel_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+}
+
+/// Whether [`multiply_matrix`] fuses multiply-adds on this host.
+///
+/// The scalar reference below mirrors the choice so the two can still be
+/// compared exactly, on any host.
+#[cfg(test)]
+fn fused_kernel_active() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        fused_kernel_available()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// Shared body of both `multiply_matrix` kernels.
 ///
-/// Emitted into each kernel so the two differ only in the target features their
-/// enclosing function declares — never in the arithmetic, and so never in the
-/// floating-point result.
+/// Emitted into each kernel so the two differ only in SIMD register width and in
+/// whether `multiply_add!` fuses.
 macro_rules! multiply_matrix_body {
-    ($matrix:ident, $input:ident, $output:ident) => {
+    ($matrix:ident, $input:ident, $output:ident, $step:ident) => {
         debug_assert!($output.len() >= $matrix.rows);
         let block_count = $matrix.values.len() / $matrix.columns.max(1);
         for (block_index, first_channel) in (0..block_count).map(|b| (b, b * BLOCK)) {
             let row_count = ($matrix.rows - first_channel).min(BLOCK);
             // One flat 16-lane accumulator per block, column-inner: LLVM lowers
-            // this to packed `mulps`/`addps` with a broadcasted input lane
-            // (16-wide on AVX2, paired SSE ops otherwise) without changing the
-            // per-element column order. `VECTORS_PER_BLOCK` documents the C++
-            // `WeightBlock` correspondence: lanes `[4k, 4k+4)` are the k-th
-            // SIMD register.
+            // this to packed arithmetic with a broadcasted input lane
+            // (`vfmadd` on the fused AVX2 path, paired SSE `mulps`/`addps`
+            // otherwise) without changing the per-element column order.
+            // `VECTORS_PER_BLOCK` documents the C++ `WeightBlock`
+            // correspondence: lanes `[4k, 4k+4)` are the k-th SIMD register.
             debug_assert_eq!(BLOCK, 4 * VECTORS_PER_BLOCK);
             let mut acc = [0.0_f32; BLOCK];
             // Bounds checks are hoisted to one per block; the column loop runs
@@ -754,7 +784,7 @@ macro_rules! multiply_matrix_body {
             for (value, weights) in $input.iter().zip(block_weights.iter()) {
                 let value = *value;
                 for lane in 0..BLOCK {
-                    acc[lane] += weights[lane] * value;
+                    acc[lane] = multiply_add!($step, weights[lane], value, acc[lane]);
                 }
             }
             $output[first_channel..first_channel + row_count].copy_from_slice(&acc[..row_count]);
@@ -762,32 +792,56 @@ macro_rules! multiply_matrix_body {
     };
 }
 
-/// Baseline `multiply_matrix` kernel, used wherever AVX2 is unavailable.
-#[inline(never)]
-fn multiply_matrix_baseline(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
-    multiply_matrix_body!(matrix, input, output);
+/// One lane of the packed accumulation: `acc = weight.mul_add(value, acc)` when
+/// fusing, `acc + weight * value` otherwise.
+macro_rules! multiply_add {
+    (fused, $weight:expr, $value:expr, $acc:expr) => {
+        $weight.mul_add($value, $acc)
+    };
+    (separate, $weight:expr, $value:expr, $acc:expr) => {
+        $acc + $weight * $value
+    };
 }
 
-/// AVX2 `multiply_matrix` kernel, selected by runtime feature detection.
+/// `multiply_matrix` kernel used wherever AVX2 and FMA are unavailable: a
+/// separate multiply and add, byte-for-byte the C++ rounding.
+///
+/// Fusing here is a trap, so resist it. AArch64 carries `fmla` in its base ISA,
+/// which makes `mul_add` look like a free win — but this is a latency-bound
+/// accumulator recurrence, and Apple Silicon retires `fadd` a cycle sooner than
+/// `fmla`. Measured on an M4 over a 148-note project, fusing this kernel made it
+/// **14.6% slower** (5.87s → 6.73s, 0.6% run-to-run spread): the unfused form's
+/// chain runs through the cheap `fadd` while its `fmul`s issue in parallel off
+/// to the side. On x86-64 `vfmadd` has the same latency as `mulps` plus `addps`
+/// and halves the µops, so fusing pays there — hence the split.
+#[inline(never)]
+#[allow(clippy::assign_op_pattern)] // the `separate` arm must stay an expression.
+fn multiply_matrix_baseline(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+    multiply_matrix_body!(matrix, input, output, separate);
+}
+
+/// Fused AVX2 `multiply_matrix` kernel, selected by runtime feature detection.
 ///
 /// # Safety
 ///
-/// The caller must have confirmed AVX2 support, as `multiply_matrix` does.
+/// The caller must have confirmed AVX2 and FMA support, as `multiply_matrix`
+/// does.
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)] // `#[target_feature]` requires an `unsafe fn`.
-#[target_feature(enable = "avx2")]
-unsafe fn multiply_matrix_avx2(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
-    multiply_matrix_body!(matrix, input, output);
+#[target_feature(enable = "avx2,fma")]
+unsafe fn multiply_matrix_avx2_fma(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+    multiply_matrix_body!(matrix, input, output, fused);
 }
 
 /// Scalar reference for [`multiply_matrix`], gated to test builds.
 ///
 /// Reads the same blocked layout but accumulates each lane through a plain
 /// `f32` sum in column order, proving the packed path does not reorder
-/// floating-point additions relative to a scalar reference. Unit tests assert
-/// exact (bitwise) agreement between the two.
+/// floating-point additions relative to a scalar reference. `fused` selects the
+/// same rounding as the kernel the host will run — see [`fused_kernel_active`] —
+/// so unit tests can still assert exact (bitwise) agreement between the two.
 #[cfg(test)]
-fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32], fused: bool) {
     debug_assert!(output.len() >= matrix.rows);
     let block_count = matrix.values.len() / matrix.columns.max(1);
     for block in 0..block_count {
@@ -797,7 +851,11 @@ fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32
         for row in 0..row_count {
             let mut sum = 0.0_f32;
             for (weights, input) in block_weights.iter().zip(input.iter()) {
-                sum += weights[row] * input;
+                sum = if fused {
+                    weights[row].mul_add(*input, sum)
+                } else {
+                    sum + weights[row] * *input
+                };
             }
             output[first_channel + row] = sum;
         }
@@ -3541,7 +3599,9 @@ mod tests {
     #[test]
     fn packed_multiply_matches_scalar_exactly() {
         // Packed vs scalar-fallback agreement must be bitwise: both sum each
-        // lane's columns in increasing order from a zero accumulator.
+        // lane's columns in increasing order from a zero accumulator, and both
+        // fuse (or not) exactly as this host's kernel does.
+        let fused = fused_kernel_active();
         for (rows, columns) in [(1, 1), (2, 3), (16, 16), (17, 3), (31, 5), (5, 33)] {
             let mut state = 0x1234_5678_9abc_def0_u64 ^ (rows as u64 * 31 + columns as u64);
             let values: Vec<f32> = (0..rows * columns).map(|_| lcg(&mut state)).collect();
@@ -3550,7 +3610,7 @@ mod tests {
             let mut packed = vec![0.0_f32; rows];
             let mut scalar = vec![0.0_f32; rows];
             multiply_matrix(&matrix, &input, &mut packed);
-            multiply_matrix_scalar(&matrix, &input, &mut scalar);
+            multiply_matrix_scalar(&matrix, &input, &mut scalar, fused);
             assert_eq!(packed, scalar, "rows={rows} columns={columns}");
             // Independent row-major reference agrees within float tolerance.
             let mut reference = vec![0.0_f32; rows];
