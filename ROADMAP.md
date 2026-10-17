@@ -13,8 +13,10 @@ It is mostly a library with a thin CLI harness: it has no GUI and will not
 gain one. It is not a successor to or competitor with standard SV (SV1 still
 ships and works); it is a headless engine for offline rendering and
 embedding. Parity with OpenSV comes first; speed comes from clean structure
-(packed weight layouts, batch-level parallelism, no JUCE overhead), never
-from relaxed numerics.
+(packed weight layouts, batch-level parallelism, no JUCE overhead) and from
+kernel arithmetic that is at least as accurate as OpenSV's. What the engine
+trades for speed is bit-for-bit reproducibility with the C++, never accuracy —
+see the determinism principle below.
 
 ## Where things stand
 
@@ -44,7 +46,8 @@ listed order, one PR-sized branch per
 stage. Phase 2 (NOFS + voice config) lets `opensvr info` show singer metadata.
 The `opensvr-dnni` reader parses all real model entries, scalar inference
 matches per-op golden tensors, and blocked-`[f32; 16]` weights plus the
-incremental dirty-range `Cache` keep those goldens green. The dictionary +
+incremental dirty-range `Cache` keep those goldens green, with the packed
+kernel dispatching to fused AVX2 or SSE2 at runtime. The dictionary +
 `resolvePhonemes` half of Phase 3 became `opensvr-g2p`, and
 `opensvr info --phonemes` prints resolved phonemes per note. Phase 5 landed
 stage by stage (timing → pitch → acoustic → vocoder) behind `VoiceSynthesizer`,
@@ -72,8 +75,13 @@ The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
    (`core` <- `nofs`/`dnni` <- `voice` <- `audio`), and keep `core` free of I/O and heavy dependencies.
 3. **Errors as types.** Each crate gets a `thiserror` enum, as in the existing crates. The C++
    `juce::Result` strings become variants; the CLI maps them to exit codes.
-4. **Determinism.** Output should match the C++ engine closely enough to compare. Pin the RNG,
-   avoid `fast-math`-style shortcuts, and be explicit about summation order in matrix kernels.
+4. **Determinism.** Output should match the C++ engine closely enough to compare. Pin the RNG, and
+   be explicit about summation order in matrix kernels: the packed kernels may fuse a multiply and
+   an add into a single-rounded operation, and may interleave several partial sums and fold them,
+   when that is faster. Both change the last bits rather than the structure of the sum, and both
+   stay inside the golden tolerance. Per-op goldens are necessary but not sufficient, though: some
+   passages synthesize unstably and turn a last-place difference into an audible one, so compare
+   end-to-end renders as well when a change touches the arithmetic.
 5. **No new public surface without a test.** The existing crates average roughly one test per 25 lines of code; keep that up.
 
 ## Phase 1: finish the project format (about 600 lines)
@@ -170,9 +178,13 @@ units; `CancelToken` moved down to `opensvr-core`).
 Done (SIMD + cache): weights pack into blocked `[f32; 16]` columns at load
 (zero-padded tails) with block-outer/column-inner multiply lowering to packed
 SIMD, plus the incremental dirty-range `Cache` (`DnniCache`,
-`DnniRunStatistics`, `run_with_cache`; `run` delegates unchanged). Scalar
-numerics unchanged: all per-op goldens green unmodified, packed-vs-scalar
-matrix tests agree bitwise. Note there is
+`DnniRunStatistics`, `run_with_cache`; `run` delegates unchanged). All per-op
+goldens stay green unmodified and packed-vs-scalar matrix tests agree bitwise.
+Each lane's columns are dealt round-robin across two partial sums, folded once
+per block, which cuts the accumulator dependency chain in half. The kernel is
+picked at runtime — fused AVX2 where the CPU reports AVX2 and FMA, the SSE2
+baseline otherwise — so the shipped binary stays portable and needs no build
+flags. Note there is
 no `modl4` branch and no `moda6` in the C++ loader.
 
 Original plan, kept for reference:
@@ -220,9 +232,10 @@ Notes on exactness:
 - **Random numbers.** Both models use `std::mt19937` with the default seed 5489, fed into a hand-written Box-Muller
   (not `std::normal_distribution`), so the stream is portable. Use `rand_mt::Mt19937GenRand32` or a 30-line port,
   and copy the Box-Muller rejection loop exactly. Do not substitute `rand_distr`.
-- **Float behavior.** Use `f32` where C++ does, convert at the same points, and keep the same summation order in reductions.
-  Expect small differences from FMA and different `exp`/`tanh` implementations; set tolerances per stage (start near `1e-5` relative)
-  rather than demanding bit-identical output.
+- **Float behavior.** Use `f32` where C++ does and convert at the same points. Reductions need not
+  reproduce the C++ summation order — see the determinism principle — but document the order they
+  do use. Expect small differences from FMA and different `exp`/`tanh` implementations; set
+  tolerances per stage (start near `1e-5` relative) rather than demanding bit-identical output.
 - **State.** `VoiceSynthesizer::State` holds per-phrase caches. In Rust make it an owned struct passed as `Option<&mut State>`.
 
 ## Phase 6: renderer parity (about 1,500 lines)

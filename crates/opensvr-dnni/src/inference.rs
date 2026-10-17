@@ -223,6 +223,28 @@ pub const BLOCK: usize = 16;
 /// giving `4 * 4 = 16` output channels per block.
 const VECTORS_PER_BLOCK: usize = 4;
 
+/// Number of independent partial accumulators the packed kernels interleave.
+///
+/// Each lane's column sum is a serial dependency chain: with one accumulator
+/// every column's packed multiply-add waits on the column before it, which makes
+/// the kernel latency-bound rather than throughput-bound — the measurement on an
+/// M4 that ruled out fusing showed how much that chain costs.
+/// Interleaving `N` partial sums, combined once per block, cuts the chain to
+/// `columns / N` deep while leaving the multiply-add count unchanged.
+///
+/// This is a deliberate departure from the C++ summation order (ROADMAP
+/// principle 4). It is a summation-*order* change, not a rounding one: each
+/// partial still accumulates in increasing column order, and combining `N`
+/// shallower sums is at least as accurate as the single deep one.
+///
+/// Two, not four. Four measured a further 0.45% on an M4 (5.28s against 5.31s),
+/// but on the pre-AVX2 baseline it needs all sixteen SSE registers for
+/// accumulators alone, and the edge past that is a cliff rather than a slope:
+/// eight accumulators leave LLVM unable to vectorize at all, scalarizing to
+/// `fmul`/`fadd` at 3.5× the runtime. Two fits any register file and already
+/// takes 96% of the win.
+const ACCUMULATORS: usize = 2;
+
 /// Blocked SIMD weight matrix, transposing row-major storage into per-column
 /// 16-lane blocks.
 ///
@@ -342,12 +364,42 @@ pub struct DnniInference {
     loaded: bool,
 }
 
+/// Reusable per-inference tensor scratch, threaded through [`run_layer`].
+///
+/// Holds four general tensor slots plus one float buffer per recursion
+/// depth. Slots persist capacity across `run_layer` calls, so steady-state
+/// inference performs no temporary allocation: every consumer fully
+/// overwrites its slot before reading (the same discipline that already
+/// governs the freshly allocated temporaries), and depth indexing keeps
+/// nested combinators from clobbering a parent's live data — a child runs
+/// one level deeper, so its slots are disjoint from its caller's.
+#[derive(Debug, Default)]
+struct Scratch {
+    tensors: Vec<[Tensor; 4]>,
+    floats: Vec<Vec<f32>>,
+}
+
+impl Scratch {
+    fn tensors(&mut self, depth: usize) -> &mut [Tensor; 4] {
+        if self.tensors.len() <= depth {
+            self.tensors.resize_with(depth + 1, Default::default);
+        }
+        &mut self.tensors[depth]
+    }
+
+    fn floats(&mut self, depth: usize) -> &mut Vec<f32> {
+        if self.floats.len() <= depth {
+            self.floats.resize_with(depth + 1, Default::default);
+        }
+        &mut self.floats[depth]
+    }
+}
+
 impl DnniInference {
     /// Creates an unloaded engine; [`run`](Self::run) fails until [`load`](Self::load) succeeds.
     pub fn new() -> Self {
         Self::default()
     }
-
     /// Returns true after a successful [`load`](Self::load).
     pub fn is_loaded(&self) -> bool {
         self.loaded
@@ -487,6 +539,9 @@ impl DnniInference {
         let mut computed_frames = 0_usize;
         let mut reused_frames = 0_usize;
         let mut context_frames = 0_usize;
+        // Scratch lives for the whole inference: every nested layer reuses
+        // the same depth-indexed slots, so temporaries allocate once.
+        let mut scratch = Scratch::default();
 
         if has_cached_output {
             let cache_ref = cache
@@ -513,7 +568,7 @@ impl DnniInference {
                 }
                 let local_output = if window.first == 0 && window.end == input.frames {
                     let mut local = Tensor::default();
-                    run_layer(root, input, &mut local, condition, cancel)?;
+                    run_layer(root, input, &mut local, condition, &mut scratch, 0, cancel)?;
                     local
                 } else {
                     let local_input = slice_frames(input, window.first, window.end);
@@ -525,6 +580,8 @@ impl DnniInference {
                         &local_input,
                         &mut local,
                         local_condition.as_ref(),
+                        &mut scratch,
+                        0,
                         cancel,
                     )?;
                     local
@@ -552,7 +609,15 @@ impl DnniInference {
             reused_frames = input.frames - updated_frames;
             context_frames = computed_frames - updated_frames;
         } else {
-            run_layer(root, input, &mut replacement, condition, cancel)?;
+            run_layer(
+                root,
+                input,
+                &mut replacement,
+                condition,
+                &mut scratch,
+                0,
+                cancel,
+            )?;
             computed_frames = replacement.frames;
         }
         if cancel.is_cancelled() {
@@ -647,62 +712,174 @@ fn read_i32(payload: &[u8], offset: usize) -> i32 {
     ])
 }
 
-/// Blocked SIMD matrix-vector product: `output[block, lane] = sum over columns in order`.
+/// Blocked SIMD matrix-vector product: `output[block, lane] = sum over columns`.
 ///
-/// This is the SIMD equivalent of `multiply_matrix`: the C++ `multiplyMatrix`
-/// zeroes four per-block accumulators and sums column-inner, so each output
-/// element is the columns summed in increasing order, overwriting (not
-/// accumulating into) the target. The packed path keeps that per-element order
-/// (ROADMAP principle 4) — only the vector width of the accumulation changes.
+/// This is the SIMD equivalent of the C++ `multiplyMatrix`, which zeroes four
+/// per-block accumulators and sums column-inner, overwriting (not accumulating
+/// into) the target. The packed path also sums in increasing column order, but
+/// deals the columns round-robin across [`ACCUMULATORS`] partial sums and folds
+/// those once per block, so it does not reproduce the C++ value bit for bit; see
+/// that constant and ROADMAP principle 4.
 ///
-/// For the test suite there is a `#[cfg(test)]` scalar fallback that reads
-/// the same blocked layout but accumulates each lane through a plain `f32`
-/// sum in column order, proving the packed path does not reorder
-/// floating-point additions relative to the scalar reference.
+/// For the test suite there is a `#[cfg(test)]` scalar fallback that reads the
+/// same blocked layout and mirrors that structure, so the packed path can still
+/// be checked against it bit for bit.
 ///
-/// Deliberately outlined (`#[inline(never)]`): in the final linked release
-/// binary the standalone body lowers the 16-lane accumulator to four packed
-/// `mulps`/`addps` pairs with a broadcasted input lane (verified with
-/// `objdump -d` on the release test harness; note `cargo rustc -- --emit=asm`
-/// is misleading here because workspace ThinLTO defers codegen to link time).
-/// A body inlined into the GRU/dense caller control flow scalarizes instead.
-/// Call overhead is negligible next to `columns × 16` fused multiplies per
-/// invocation.
+/// Deliberately outlined (`#[inline(never)]`): the standalone body lowers the
+/// 16-lane accumulator to packed arithmetic with a broadcasted input lane —
+/// four 128-bit `mulps`/`addps` pairs on the generic x86-64 baseline, two
+/// 256-bit `vfmadd` pairs where AVX2 and FMA are present — across
+/// `ACCUMULATORS` interleaved partial sums. A body inlined into the GRU/dense
+/// caller control flow scalarizes instead. Call overhead is negligible next to
+/// `columns × 16` multiply-adds per invocation.
+///
+/// On x86-64 the kernel is chosen at runtime so the shipped binary stays
+/// portable: the fused AVX2 path where the CPU reports AVX2 *and* FMA, the SSE2
+/// baseline otherwise. Both kernels share one body macro, so they differ only in
+/// SIMD width and in whether they route each accumulate through a fused or a
+/// separate rounding. Other architectures deliberately do not fuse; see
+/// [`multiply_matrix_baseline`] for the measurement behind that.
+///
+/// The fused path rounds once per multiply-add instead of twice, and so does
+/// **not** reproduce the C++ `mulps`/`addps` result bit-for-bit; ROADMAP
+/// principle 4 asks only that stages match closely enough to compare. Because
+/// the baseline keeps the C++ rounding, two hosts can differ in the last unit in
+/// the last place for the same project.
 #[inline(never)]
+#[allow(unsafe_code)] // one guarded fused-kernel call; the kernels stay safe.
 pub fn multiply_matrix(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
-    debug_assert!(output.len() >= matrix.rows);
-    let block_count = matrix.values.len() / matrix.columns.max(1);
-    for (block_index, first_channel) in (0..block_count).map(|b| (b, b * BLOCK)) {
-        let row_count = (matrix.rows - first_channel).min(BLOCK);
-        // One flat 16-lane accumulator per block, column-inner: LLVM lowers
-        // this to packed `mulps`/`addps` with a broadcasted input lane (16-wide
-        // on AVX2, paired SSE ops otherwise) without changing the per-element
-        // column order. `VECTORS_PER_BLOCK` documents the C++ `WeightBlock`
-        // correspondence: lanes `[4k, 4k+4)` are the k-th SIMD register.
-        debug_assert_eq!(BLOCK, 4 * VECTORS_PER_BLOCK);
-        let mut acc = [0.0_f32; BLOCK];
-        // Bounds checks are hoisted to one per block; the column loop runs
-        // over iterators with no per-lane checks, which is what lets LLVM
-        // SLP-vectorize the 16-lane body into packed arithmetic.
-        let block_weights = &matrix.values[block_index * matrix.columns..][..matrix.columns];
-        for (value, weights) in input.iter().zip(block_weights.iter()) {
-            let value = *value;
-            for lane in 0..BLOCK {
-                acc[lane] += weights[lane] * value;
-            }
-        }
-        output[first_channel..first_channel + row_count].copy_from_slice(&acc[..row_count]);
+    #[cfg(target_arch = "x86_64")]
+    if fused_kernel_available() {
+        // SAFETY: the branch is guarded by the AVX2+FMA runtime check in
+        // `fused_kernel_available`, and the callee enables nothing beyond
+        // `avx2` and `fma`.
+        unsafe { multiply_matrix_avx2_fma(matrix, input, output) };
+        return;
     }
+    multiply_matrix_baseline(matrix, input, output);
+}
+
+/// Whether this host can run the fused `vfmadd` kernel.
+#[cfg(target_arch = "x86_64")]
+fn fused_kernel_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+}
+
+/// Whether [`multiply_matrix`] fuses multiply-adds on this host.
+///
+/// The scalar reference below mirrors the choice so the two can still be
+/// compared exactly, on any host.
+#[cfg(test)]
+fn fused_kernel_active() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        fused_kernel_available()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Shared body of every `multiply_matrix` kernel.
+///
+/// Emitted into each kernel so they differ only in SIMD register width and in
+/// whether `multiply_add!` fuses.
+macro_rules! multiply_matrix_body {
+    ($matrix:ident, $input:ident, $output:ident, $step:ident) => {
+        debug_assert!($output.len() >= $matrix.rows);
+        let block_count = $matrix.values.len() / $matrix.columns.max(1);
+        for (block_index, first_channel) in (0..block_count).map(|b| (b, b * BLOCK)) {
+            let row_count = ($matrix.rows - first_channel).min(BLOCK);
+            // `ACCUMULATORS` flat 16-lane partial sums per block, column-inner:
+            // LLVM lowers each to packed arithmetic with a broadcasted input lane
+            // (`vfmadd` on the fused AVX2 path, paired SSE `mulps`/`addps`
+            // otherwise). Columns are dealt round-robin across the partials, so
+            // the lanes of one partial never wait on the partial before them.
+            // `VECTORS_PER_BLOCK` documents the C++ `WeightBlock`
+            // correspondence: lanes `[4k, 4k+4)` are the k-th SIMD register.
+            debug_assert_eq!(BLOCK, 4 * VECTORS_PER_BLOCK);
+            let mut acc = [[0.0_f32; BLOCK]; ACCUMULATORS];
+            // Bounds checks are hoisted to one per block; the column loop runs
+            // over iterators with no per-lane checks, which is what lets LLVM
+            // SLP-vectorize each 16-lane body into packed arithmetic.
+            let block_weights = &$matrix.values[block_index * $matrix.columns..][..$matrix.columns];
+            let mut columns = $input.iter().zip(block_weights.iter());
+            'columns: loop {
+                for partial in acc.iter_mut() {
+                    let Some((value, weights)) = columns.next() else {
+                        break 'columns;
+                    };
+                    let value = *value;
+                    for lane in 0..BLOCK {
+                        partial[lane] = multiply_add!($step, weights[lane], value, partial[lane]);
+                    }
+                }
+            }
+            // Fold the partials in accumulator order. `0.0 + x == x`, so the
+            // first partial is carried over exactly and the scalar reference can
+            // reproduce this result bit for bit.
+            let mut total = acc[0];
+            for partial in &acc[1..] {
+                for lane in 0..BLOCK {
+                    total[lane] += partial[lane];
+                }
+            }
+            $output[first_channel..first_channel + row_count].copy_from_slice(&total[..row_count]);
+        }
+    };
+}
+
+/// One lane of the packed accumulation: `acc = weight.mul_add(value, acc)` when
+/// fusing, `acc + weight * value` otherwise.
+macro_rules! multiply_add {
+    (fused, $weight:expr, $value:expr, $acc:expr) => {
+        $weight.mul_add($value, $acc)
+    };
+    (separate, $weight:expr, $value:expr, $acc:expr) => {
+        $acc + $weight * $value
+    };
+}
+
+/// `multiply_matrix` kernel used wherever AVX2 and FMA are unavailable: a
+/// separate multiply and add, byte-for-byte the C++ rounding.
+///
+/// Fusing here is a trap, so resist it. AArch64 carries `fmla` in its base ISA,
+/// which makes `mul_add` look like a free win — but this is a latency-bound
+/// accumulator recurrence, and Apple Silicon retires `fadd` a cycle sooner than
+/// `fmla`. Measured on an M4 over a 148-note project, fusing this kernel made it
+/// **14.6% slower** (5.87s → 6.73s, 0.6% run-to-run spread): the unfused form's
+/// chain runs through the cheap `fadd` while its `fmul`s issue in parallel off
+/// to the side. On x86-64 `vfmadd` has the same latency as `mulps` plus `addps`
+/// and halves the µops, so fusing pays there — hence the split.
+#[inline(never)]
+#[allow(clippy::assign_op_pattern)] // the `separate` arm must stay an expression.
+fn multiply_matrix_baseline(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+    multiply_matrix_body!(matrix, input, output, separate);
+}
+
+/// Fused AVX2 `multiply_matrix` kernel, selected by runtime feature detection.
+///
+/// # Safety
+///
+/// The caller must have confirmed AVX2 and FMA support, as `multiply_matrix`
+/// does.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)] // `#[target_feature]` requires an `unsafe fn`.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn multiply_matrix_avx2_fma(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+    multiply_matrix_body!(matrix, input, output, fused);
 }
 
 /// Scalar reference for [`multiply_matrix`], gated to test builds.
 ///
-/// Reads the same blocked layout but accumulates each lane through a plain
-/// `f32` sum in column order, proving the packed path does not reorder
-/// floating-point additions relative to a scalar reference. Unit tests assert
-/// exact (bitwise) agreement between the two.
+/// Reads the same blocked layout but accumulates each lane with plain `f32`
+/// arithmetic, mirroring the kernel's round-robin partial sums and its `fused`
+/// rounding choice (see [`fused_kernel_active`]). That is what lets the unit
+/// tests prove the *packed* path computes the same values as an obviously
+/// correct scalar one, independent of how LLVM vectorizes.
 #[cfg(test)]
-fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32], fused: bool) {
     debug_assert!(output.len() >= matrix.rows);
     let block_count = matrix.values.len() / matrix.columns.max(1);
     for block in 0..block_count {
@@ -710,9 +887,18 @@ fn multiply_matrix_scalar(matrix: &DenseMatrix, input: &[f32], output: &mut [f32
         let row_count = (matrix.rows - first_channel).min(BLOCK);
         let block_weights = &matrix.values[block * matrix.columns..][..matrix.columns];
         for row in 0..row_count {
-            let mut sum = 0.0_f32;
-            for (weights, input) in block_weights.iter().zip(input.iter()) {
-                sum += weights[row] * input;
+            let mut partials = [0.0_f32; ACCUMULATORS];
+            for (column, (weights, input)) in block_weights.iter().zip(input.iter()).enumerate() {
+                let partial = &mut partials[column % ACCUMULATORS];
+                *partial = if fused {
+                    weights[row].mul_add(*input, *partial)
+                } else {
+                    *partial + weights[row] * *input
+                };
+            }
+            let mut sum = partials[0];
+            for partial in &partials[1..] {
+                sum += partial;
             }
             output[first_channel + row] = sum;
         }
@@ -1392,18 +1578,37 @@ fn run_layer(
     input: &Tensor,
     output: &mut Tensor,
     condition: Option<&Tensor>,
+    scratch: &mut Scratch,
+    depth: usize,
     cancel: &CancelToken,
 ) -> Result<(), DnniError> {
     if cancel.is_cancelled() {
         return Err(cancelled());
     }
     if layer.operation == Operation::Sequence {
-        let mut current = input.clone();
+        // Ping-pong through one scratch slot instead of minting a fresh
+        // tensor per child: the slot is checked out (swap), filled by the
+        // child, and swapped back, so its capacity persists across calls.
+        // The child runs one level deeper, so nested sequences never touch
+        // this level's live data; same call order, same values.
+        let mut current = Tensor::default();
+        std::mem::swap(&mut current, &mut scratch.tensors(depth)[0]);
+        assign_tensor(&mut current, input);
+        let mut next = Tensor::default();
+        std::mem::swap(&mut next, &mut scratch.tensors(depth)[1]);
         for child in &layer.children {
-            let mut next = Tensor::default();
-            run_layer(child, &current, &mut next, condition, cancel)?;
-            current = next;
+            run_layer(
+                child,
+                &current,
+                &mut next,
+                condition,
+                scratch,
+                depth + 1,
+                cancel,
+            )?;
+            std::mem::swap(&mut current, &mut next);
         }
+        std::mem::swap(&mut next, &mut scratch.tensors(depth)[1]);
         *output = current;
         return Ok(());
     }
@@ -1421,6 +1626,8 @@ fn run_layer(
         }
         let mut forward = Tensor::default();
         let mut backward = Tensor::default();
+        std::mem::swap(&mut forward, &mut scratch.tensors(depth)[0]);
+        std::mem::swap(&mut backward, &mut scratch.tensors(depth)[1]);
         run_gru(&layer.children[0], input, &mut forward, false, cancel)?;
         run_gru(&layer.children[1], input, &mut backward, true, cancel)?;
         output.frames = input.frames;
@@ -1438,6 +1645,13 @@ fn run_layer(
             destination[forward_channels..].copy_from_slice(
                 &backward.values[frame * backward.channels..(frame + 1) * backward.channels],
             );
+        }
+        // Check both buffers back in; the concatenated `output` keeps its
+        // own (caller-owned) allocation as before.
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut forward, &mut slots[0]);
+            std::mem::swap(&mut backward, &mut slots[1]);
         }
         return Ok(());
     }
@@ -1465,6 +1679,8 @@ fn run_layer(
                 condition.expect("checked"),
                 output,
                 None,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
         } else {
@@ -1478,30 +1694,48 @@ fn run_layer(
             }
             assign_zero(&mut output.values, output.frames * output.channels);
         }
-        let mut current = input.clone();
+        // Four scratch slots (current plus one per branch), checked out once
+        // for the whole stage loop: every stage produces the same
+        // output-sized tensors (checked below), and children run one level
+        // deeper, so capacities persist across stages and calls.
+        let mut current = Tensor::default();
+        let mut residual = Tensor::default();
+        let mut gated = Tensor::default();
+        let mut skip = Tensor::default();
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut current, &mut slots[0]);
+            std::mem::swap(&mut residual, &mut slots[1]);
+            std::mem::swap(&mut gated, &mut slots[2]);
+            std::mem::swap(&mut skip, &mut slots[3]);
+        }
+        assign_tensor(&mut current, input);
         for stage in 0..layer.stage_count {
-            let mut residual = Tensor::default();
             run_layer(
                 &layer.children[stage * 3 + 2],
                 &current,
                 &mut residual,
                 None,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
-            let mut gated = Tensor::default();
             run_layer(
                 &layer.children[stage * 3],
                 &current,
                 &mut gated,
                 condition,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
-            let mut skip = Tensor::default();
             run_layer(
                 &layer.children[stage * 3 + 1],
                 &gated,
                 &mut skip,
                 None,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
             if residual.frames != output.frames
@@ -1530,7 +1764,15 @@ fn run_layer(
                     "residual convolution accumulation produced a non-finite value.",
                 ));
             }
-            current = gated;
+            std::mem::swap(&mut current, &mut gated);
+        }
+        // Check every buffer back in so capacities persist across calls.
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut current, &mut slots[0]);
+            std::mem::swap(&mut residual, &mut slots[1]);
+            std::mem::swap(&mut gated, &mut slots[2]);
+            std::mem::swap(&mut skip, &mut slots[3]);
         }
         return Ok(());
     }
@@ -1551,7 +1793,21 @@ fn run_layer(
             ));
         }
         let mut gate_input = Tensor::default();
-        run_layer(&layer.children[0], input, &mut gate_input, None, cancel)?;
+        let mut projected = Tensor::default();
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut gate_input, &mut slots[0]);
+            std::mem::swap(&mut projected, &mut slots[1]);
+        }
+        run_layer(
+            &layer.children[0],
+            input,
+            &mut gate_input,
+            None,
+            scratch,
+            depth + 1,
+            cancel,
+        )?;
         if gate_input.channels != 2 * layer.gate_channels {
             return Err(node_error(
                 layer.source_offset,
@@ -1559,12 +1815,13 @@ fn run_layer(
             ));
         }
         if layer.condition_channels > 0 {
-            let mut projected = Tensor::default();
             run_layer(
                 &layer.children[1],
                 condition.expect("checked"),
                 &mut projected,
                 None,
+                scratch,
+                depth + 1,
                 cancel,
             )?;
             if projected.frames != gate_input.frames || projected.channels != gate_input.channels {
@@ -1593,6 +1850,11 @@ fn run_layer(
                     gate_input.values[gate_offset + channel].tanh()
                         * sigmoid(gate_input.values[gate_offset + layer.gate_channels + channel]);
             }
+        }
+        {
+            let slots = scratch.tensors(depth);
+            std::mem::swap(&mut gate_input, &mut slots[0]);
+            std::mem::swap(&mut projected, &mut slots[1]);
         }
         return Ok(());
     }
@@ -1624,7 +1886,16 @@ fn run_layer(
                 "output tensor exceeds the memory limit.",
             ));
         }
-        assign_zero(&mut output.values, output.frames * output.channels);
+        // Size the buffer without paying for a full zero pass: `resize`
+        // zero-fills only on capacity growth (once per shape in steady
+        // state), and every element below is either tap-written or
+        // explicitly zeroed before the bias pass reads it.
+        output.values.resize(output.frames * output.channels, 0.0);
+        // Tap scratch from the depth-indexed float buffer. `multiply_matrix`
+        // overwrites every one of `matrix.rows` elements, so the buffer only
+        // ever needs *growing*: keep the largest length seen and never clear,
+        // which removes the per-tap zero-fill entirely (a no-op once warm).
+        let product = scratch.floats(depth);
         for frame in 0..output.frames {
             if frame % CANCEL_POLL_STEPS == 0 && cancel.is_cancelled() {
                 return Err(cancelled());
@@ -1635,6 +1906,7 @@ fn run_layer(
             // [first, first+rows) slice of the output, so a temporary buffer
             // per tap is accumulated and added back in order, mirroring the C++
             // 2-frame unrolling (which keeps independent accumulators per frame).
+            let mut wrote = false;
             for (kernel, matrix) in layer.matrices.iter().enumerate() {
                 // Tensor dimensions are bounded by the memory limit, so the
                 // signed tap arithmetic cannot wrap; the sign carries padding.
@@ -1648,11 +1920,27 @@ fn run_layer(
                     continue;
                 }
                 let source = &input.values[tap as usize * input.channels..];
-                let mut product = vec![0.0_f32; matrix.rows];
-                multiply_matrix(matrix, source, &mut product);
                 let destination = &mut output.values[frame * output.channels..];
-                for channel_out in 0..matrix.rows {
-                    destination[channel_out] += product[channel_out];
+                if wrote {
+                    if product.len() < matrix.rows {
+                        product.resize(matrix.rows, 0.0);
+                    }
+                    multiply_matrix(matrix, source, product);
+                    for (slot, value) in destination.iter_mut().zip(product.iter()) {
+                        *slot += *value;
+                    }
+                } else {
+                    // First in-range tap overwrites: `multiply_matrix` fills
+                    // every row, so this equals the old zero-then-add exactly.
+                    multiply_matrix(matrix, source, &mut destination[..matrix.rows]);
+                    wrote = true;
+                }
+            }
+            if !wrote {
+                // Every tap padding-skipped: the old zeroed state, written
+                // explicitly so later passes never read a reused buffer.
+                for slot in &mut output.values[frame * output.channels..][..output.channels] {
+                    *slot = 0.0;
                 }
             }
             if !layer.bias.is_empty() {
@@ -1703,6 +1991,17 @@ fn run_layer(
 fn assign_zero(values: &mut Vec<f32>, count: usize) {
     values.clear();
     values.resize(count, 0.0);
+}
+
+/// Copies `source` into `target`, reusing `target`'s allocation instead of
+/// minting a fresh one. Values are identical to `*target = source.clone()`.
+fn assign_tensor(target: &mut Tensor, source: &Tensor) {
+    target.frames = source.frames;
+    target.channels = source.channels;
+    // `extend_from_slice` only allocates when capacity is insufficient, so
+    // steady-state copies are memcpy without malloc.
+    target.values.clear();
+    target.values.extend_from_slice(&source.values);
 }
 
 #[cfg(test)]
@@ -3342,8 +3641,10 @@ mod tests {
 
     #[test]
     fn packed_multiply_matches_scalar_exactly() {
-        // Packed vs scalar-fallback agreement must be bitwise: both sum each
-        // lane's columns in increasing order from a zero accumulator.
+        // Packed vs scalar-fallback agreement must be bitwise: both deal columns
+        // round-robin across ACCUMULATORS partials, fold those in the same
+        // order, and fuse (or not) exactly as this host's kernel does.
+        let fused = fused_kernel_active();
         for (rows, columns) in [(1, 1), (2, 3), (16, 16), (17, 3), (31, 5), (5, 33)] {
             let mut state = 0x1234_5678_9abc_def0_u64 ^ (rows as u64 * 31 + columns as u64);
             let values: Vec<f32> = (0..rows * columns).map(|_| lcg(&mut state)).collect();
@@ -3352,7 +3653,7 @@ mod tests {
             let mut packed = vec![0.0_f32; rows];
             let mut scalar = vec![0.0_f32; rows];
             multiply_matrix(&matrix, &input, &mut packed);
-            multiply_matrix_scalar(&matrix, &input, &mut scalar);
+            multiply_matrix_scalar(&matrix, &input, &mut scalar, fused);
             assert_eq!(packed, scalar, "rows={rows} columns={columns}");
             // Independent row-major reference agrees within float tolerance.
             let mut reference = vec![0.0_f32; rows];
