@@ -1,6 +1,7 @@
 use std::{
     ffi::OsString,
-    fs, io,
+    fs,
+    io::{self, Cursor, Seek, Write},
     path::{Path, PathBuf},
 };
 
@@ -27,8 +28,22 @@ pub enum WavError {
         #[source]
         source: io::Error,
     },
+    #[error("cannot encode WAV: {source}")]
+    Encode {
+        #[source]
+        source: hound::Error,
+    },
     #[error("WAV export was cancelled")]
     Cancelled,
+}
+
+fn spec(sample_rate: u32) -> WavSpec {
+    WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: BITS_PER_SAMPLE,
+        sample_format: SampleFormat::Int,
+    }
 }
 
 /// Writes `audio` as a 24-bit stereo WAV file.
@@ -45,40 +60,64 @@ pub fn write_wav(
     temporary.push(".part");
     let temporary = PathBuf::from(temporary);
 
-    let result = write_samples(&temporary, audio, sample_rate, cancel)
-        .map_err(|source| match source {
-            Some(source) => WavError::Write {
-                path: path.to_owned(),
-                source,
-            },
-            None => WavError::Cancelled,
-        })
-        .and_then(|()| {
-            fs::rename(&temporary, path).map_err(|source| WavError::Replace {
-                path: path.to_owned(),
-                source,
-            })
-        });
+    let result = write_temporary(&temporary, path, audio, sample_rate, cancel);
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
 }
 
-/// Writes the samples; `Err(None)` means cancelled.
-fn write_samples(
+/// Writes the temporary file and replaces `path` with it on success.
+fn write_temporary(
+    temporary: &Path,
     path: &Path,
     audio: &StereoBuffer,
     sample_rate: u32,
     cancel: &CancelToken,
+) -> Result<(), WavError> {
+    let writer = WavWriter::create(temporary, spec(sample_rate)).map_err(|source| WavError::Write {
+        path: path.to_owned(),
+        source,
+    })?;
+    write_samples(writer, audio, cancel).map_err(|source| match source {
+        Some(source) => WavError::Write {
+            path: path.to_owned(),
+            source,
+        },
+        None => WavError::Cancelled,
+    })?;
+    fs::rename(temporary, path).map_err(|source| WavError::Replace {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// Encodes `audio` as a 24-bit stereo WAV in memory.
+///
+/// The CLI uses this to stream a render to stdout, where there is no file
+/// path to replace atomically; everything else should prefer [`write_wav`].
+pub fn encode_wav(
+    audio: &StereoBuffer,
+    sample_rate: u32,
+    cancel: &CancelToken,
+) -> Result<Vec<u8>, WavError> {
+    let mut bytes = Cursor::new(Vec::new());
+    let writer = WavWriter::new(&mut bytes, spec(sample_rate)).map_err(|source| WavError::Encode {
+        source,
+    })?;
+    write_samples(writer, audio, cancel).map_err(|source| match source {
+        Some(source) => WavError::Encode { source },
+        None => WavError::Cancelled,
+    })?;
+    Ok(bytes.into_inner())
+}
+
+/// Writes every sample into `writer` and finalizes it; `Err(None)` means cancelled.
+fn write_samples<W: Write + Seek>(
+    mut writer: WavWriter<W>,
+    audio: &StereoBuffer,
+    cancel: &CancelToken,
 ) -> Result<(), Option<hound::Error>> {
-    let spec = WavSpec {
-        channels: 2,
-        sample_rate,
-        bits_per_sample: BITS_PER_SAMPLE,
-        sample_format: SampleFormat::Int,
-    };
-    let mut writer = WavWriter::create(path, spec).map_err(Some)?;
     let frames = audio
         .left
         .chunks(CHUNK_FRAMES)
@@ -127,6 +166,24 @@ mod tests {
         let samples: Vec<i32> = reader.samples::<i32>().map(Result::unwrap).collect();
         assert_eq!(samples, [4_194_304, 8_388_607, -8_388_607, 0]);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn encodes_a_wav_in_memory() {
+        let audio = StereoBuffer {
+            left: vec![0.5, -1.0],
+            right: vec![0.0, 1.0],
+        };
+        let bytes = encode_wav(&audio, 44_100, &CancelToken::new()).unwrap();
+
+        let mut reader = hound::WavReader::new(Cursor::new(bytes)).unwrap();
+        let spec = reader.spec();
+        assert_eq!(
+            (spec.channels, spec.sample_rate, spec.bits_per_sample),
+            (2, 44_100, 24)
+        );
+        let samples: Vec<i32> = reader.samples::<i32>().map(Result::unwrap).collect();
+        assert_eq!(samples, [4_194_304, 0, -8_388_607, 8_388_607]);
     }
 
     #[test]
