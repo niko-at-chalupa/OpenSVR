@@ -704,38 +704,80 @@ fn read_i32(payload: &[u8], offset: usize) -> i32 {
 /// floating-point additions relative to the scalar reference.
 ///
 /// Deliberately outlined (`#[inline(never)]`): in the final linked release
-/// binary the standalone body lowers the 16-lane accumulator to four packed
-/// `mulps`/`addps` pairs with a broadcasted input lane (verified with
-/// `objdump -d` on the release test harness; note `cargo rustc -- --emit=asm`
-/// is misleading here because workspace ThinLTO defers codegen to link time).
-/// A body inlined into the GRU/dense caller control flow scalarizes instead.
-/// Call overhead is negligible next to `columns × 16` fused multiplies per
-/// invocation.
+/// binary the standalone body lowers the 16-lane accumulator to packed
+/// `mulps`/`addps` with a broadcasted input lane — four 128-bit pairs on the
+/// generic x86-64 baseline, two 256-bit pairs where AVX2 is present — without
+/// changing the per-element column order. A body inlined into the GRU/dense
+/// caller control flow scalarizes instead. Call overhead is negligible next to
+/// `columns × 16` fused multiplies per invocation.
+///
+/// On x86-64 the kernel is chosen at runtime so the shipped binary stays
+/// portable: AVX2 where the CPU reports it, the SSE2 baseline otherwise. Both
+/// kernels come from one shared body macro, so they differ only in SIMD
+/// register width and produce bitwise-identical results.
 #[inline(never)]
+#[allow(unsafe_code)] // one guarded AVX2 call; the kernels themselves stay safe.
 pub fn multiply_matrix(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
-    debug_assert!(output.len() >= matrix.rows);
-    let block_count = matrix.values.len() / matrix.columns.max(1);
-    for (block_index, first_channel) in (0..block_count).map(|b| (b, b * BLOCK)) {
-        let row_count = (matrix.rows - first_channel).min(BLOCK);
-        // One flat 16-lane accumulator per block, column-inner: LLVM lowers
-        // this to packed `mulps`/`addps` with a broadcasted input lane (16-wide
-        // on AVX2, paired SSE ops otherwise) without changing the per-element
-        // column order. `VECTORS_PER_BLOCK` documents the C++ `WeightBlock`
-        // correspondence: lanes `[4k, 4k+4)` are the k-th SIMD register.
-        debug_assert_eq!(BLOCK, 4 * VECTORS_PER_BLOCK);
-        let mut acc = [0.0_f32; BLOCK];
-        // Bounds checks are hoisted to one per block; the column loop runs
-        // over iterators with no per-lane checks, which is what lets LLVM
-        // SLP-vectorize the 16-lane body into packed arithmetic.
-        let block_weights = &matrix.values[block_index * matrix.columns..][..matrix.columns];
-        for (value, weights) in input.iter().zip(block_weights.iter()) {
-            let value = *value;
-            for lane in 0..BLOCK {
-                acc[lane] += weights[lane] * value;
-            }
-        }
-        output[first_channel..first_channel + row_count].copy_from_slice(&acc[..row_count]);
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the branch is guarded by the AVX2 runtime feature check
+        // directly above, and the callee enables no feature beyond `avx2`.
+        unsafe { multiply_matrix_avx2(matrix, input, output) };
+        return;
     }
+    multiply_matrix_baseline(matrix, input, output);
+}
+
+/// Shared body of both `multiply_matrix` kernels.
+///
+/// Emitted into each kernel so the two differ only in the target features their
+/// enclosing function declares — never in the arithmetic, and so never in the
+/// floating-point result.
+macro_rules! multiply_matrix_body {
+    ($matrix:ident, $input:ident, $output:ident) => {
+        debug_assert!($output.len() >= $matrix.rows);
+        let block_count = $matrix.values.len() / $matrix.columns.max(1);
+        for (block_index, first_channel) in (0..block_count).map(|b| (b, b * BLOCK)) {
+            let row_count = ($matrix.rows - first_channel).min(BLOCK);
+            // One flat 16-lane accumulator per block, column-inner: LLVM lowers
+            // this to packed `mulps`/`addps` with a broadcasted input lane
+            // (16-wide on AVX2, paired SSE ops otherwise) without changing the
+            // per-element column order. `VECTORS_PER_BLOCK` documents the C++
+            // `WeightBlock` correspondence: lanes `[4k, 4k+4)` are the k-th
+            // SIMD register.
+            debug_assert_eq!(BLOCK, 4 * VECTORS_PER_BLOCK);
+            let mut acc = [0.0_f32; BLOCK];
+            // Bounds checks are hoisted to one per block; the column loop runs
+            // over iterators with no per-lane checks, which is what lets LLVM
+            // SLP-vectorize the 16-lane body into packed arithmetic.
+            let block_weights = &$matrix.values[block_index * $matrix.columns..][..$matrix.columns];
+            for (value, weights) in $input.iter().zip(block_weights.iter()) {
+                let value = *value;
+                for lane in 0..BLOCK {
+                    acc[lane] += weights[lane] * value;
+                }
+            }
+            $output[first_channel..first_channel + row_count].copy_from_slice(&acc[..row_count]);
+        }
+    };
+}
+
+/// Baseline `multiply_matrix` kernel, used wherever AVX2 is unavailable.
+#[inline(never)]
+fn multiply_matrix_baseline(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+    multiply_matrix_body!(matrix, input, output);
+}
+
+/// AVX2 `multiply_matrix` kernel, selected by runtime feature detection.
+///
+/// # Safety
+///
+/// The caller must have confirmed AVX2 support, as `multiply_matrix` does.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)] // `#[target_feature]` requires an `unsafe fn`.
+#[target_feature(enable = "avx2")]
+unsafe fn multiply_matrix_avx2(matrix: &DenseMatrix, input: &[f32], output: &mut [f32]) {
+    multiply_matrix_body!(matrix, input, output);
 }
 
 /// Scalar reference for [`multiply_matrix`], gated to test builds.
