@@ -12,11 +12,14 @@ engine — no JUCE dependency, typed errors, tested and deterministic output.
 It is mostly a library with a thin CLI harness: it has no GUI and will not
 gain one. It is not a successor to or competitor with standard SV (SV1 still
 ships and works); it is a headless engine for offline rendering and
-embedding. Parity with OpenSV comes first; speed comes from clean structure
-(packed weight layouts, batch-level parallelism, no JUCE overhead) and from
-kernel arithmetic that is at least as accurate as OpenSV's. What the engine
-trades for speed is bit-for-bit reproducibility with the C++, never accuracy —
-see the determinism principle below.
+embedding. Reproducing OpenSV's *engine output* comes first; speed comes from
+clean structure (packed weight layouts, batch-level parallelism, no JUCE
+overhead) and from kernel arithmetic that is at least as accurate as
+OpenSV's. The command-line interface is deliberately outside that target: it
+is designed on its own terms rather than cloned from `opensv-cli`, so it can
+grow the ergonomics its users need without carrying a legacy grammar. What
+the engine trades for speed is bit-for-bit reproducibility with the C++,
+never accuracy — see the determinism principle below.
 
 ## Where things stand
 
@@ -28,7 +31,7 @@ see the determinism principle below.
 | MIDI export | `core/MidiFile.cpp` (export half) | `opensvr-midi` | done |
 | Mixer, pan law, solo/mute | `ProjectRenderer::mixPhrase` | `opensvr-audio::render` | done |
 | WAV output | `audio/WaveFile.cpp` | `opensvr-audio::wav` | done |
-| CLI | `cli/Main.cpp` | `opensvr-cli` | done, with subcommands instead of flat flags |
+| CLI | `cli/Main.cpp` | `opensvr-cli` | done, redesigned on its own terms (subcommands, global flags, default outputs, `-` for stdout) |
 | Voice synthesis | `synthesis/*` (10.4k lines) | `opensvr-voice` (timing, pitch, acoustic, vocoder, `VoiceSynthesizer`), `opensvr-nofs`, `opensvr-dnni` | done (neural `NeuralBackend` sings voiced tracks; `ToneBackend` stays as the voiceless fallback) |
 | Flat voicebank (document NOFS) | — (post-OpenSV format, not in the commit above) | `opensvr-nofs` + `opensvr-voice` | done (Phase 8) |
 | Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done (dictionary + resolution + `info --phonemes`; timing types live here, the duration model in `opensvr-voice`) |
@@ -55,7 +58,7 @@ each gated on golden files from the previous stage's output, and Phase 6
 replaced the sine placeholder with `NeuralBackend` (phrase splitting, pitch
 and vibrato building, resampling with latency compensation, group-edge
 cropping, caches, track parallelism, progress). Phase 7 finished the CLI
-surface (compat shim, exit-code contract, completions/man, env defaults,
+surface (subcommands, exit-code contract, completions/man, env defaults,
 release automation) with hygiene (workspace clippy denial, `cargo fmt`).
 
 ## Remaining gaps
@@ -266,19 +269,26 @@ Replace `ToneBackend` with `NeuralBackend` and widen the seam as needed. Work in
 - **Parallelism.** Tracks are independent: render them with `rayon` or scoped threads, then sum in a fixed order.
 - **Progress.** Add a `ProgressSink` trait (phrases done / total) and hook up `indicatif` in the CLI behind `-q`.
 
-## Phase 7: CLI polish
+## Phase 7: CLI
 
-Done: the exit-code table is tested and rides in `--help` and `opensvr.1`,
-`complete`/`man` ship completions and the man page (a sync test guards the
-checked-in page byte for byte), `OPENSVR_VOICE` / `OPENSVR_DICTIONARY` default
-`--voice` / `--dictionary`, and CI builds, lints and uploads per-OS artifacts
-on tags.
+Done: `opensvr-cli` is a single clap grammar, designed for its own users
+rather than cloned from `cli/Main.cpp`. It has subcommands (`info`, `render`,
+`midi`, `convert`, `complete`, `man`), global `-q/--quiet` and `-v/--verbose`,
+and per-track `--voice` / `--dictionary` / `--models-dir` / `--language`
+overrides whose language choices are listed in `--help`. `-o` defaults to the
+input path with the target extension and `-` streams to stdout; the
+`OPENSVR_VOICE` / `OPENSVR_DICTIONARY` / `OPENSVR_MODELS_DIR` variables
+default the paths (`--dict` and `OPENSVR_DICT` survive as legacy aliases).
+The exit-code table (0/1/2/3/130) is tested and rides in `--help` and
+`opensvr.1`; `complete`/`man` ship completions and the man page (a sync test
+guards the checked-in page byte for byte); and CI builds, lints and uploads
+per-OS artifacts on tags. There is no flat-form compatibility shim.
 
 Original list, kept for reference:
 
 - **Exit-code table** in the README, kept in sync by the existing integration test.
 - **Shell completions and man page** via `clap_complete` and `clap_mangen`.
-- **Config.** `OPENSVR_VOICE` and `OPENSVR_DICT` environment variables as defaults for `--voice` and `--dict`.
+- **Config.** `OPENSVR_VOICE` and `OPENSVR_DICTIONARY` environment variables as defaults for `--voice` and `--dictionary`.
 - **Release engineering.** `cargo dist` or a plain CI matrix for Linux, macOS and Windows; cache `target/` and run `cargo clippy -D warnings`.
 
 ## Phase 8: Flat voicebanks (done)
