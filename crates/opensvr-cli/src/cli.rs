@@ -15,8 +15,21 @@ Exit codes: 0 ok, 1 usage error, 2 load error, 3 render/write error, 130 cancell
 #[derive(Debug, Parser)]
 #[command(name = "opensvr", version, about, after_help = AFTER_HELP)]
 pub struct Cli {
+    #[command(flatten)]
+    pub global: GlobalArgs,
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Flags every subcommand accepts, before or after its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Args)]
+pub struct GlobalArgs {
+    /// Suppress progress and non-error messages
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    pub quiet: bool,
+    /// Print extra detail about what each command is doing
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
@@ -85,9 +98,6 @@ pub struct RenderArgs {
         value_parser = clap::value_parser!(u32).range(i64::from(MIN_SAMPLE_RATE)..=192_000),
     )]
     pub rate: u32,
-    /// Suppress progress messages
-    #[arg(short, long)]
-    pub quiet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -173,8 +183,21 @@ mod tests {
         let Command::Render(args) = cli.command else {
             panic!("expected render")
         };
-        assert_eq!((args.rate, args.quiet), (44_100, true));
+        assert_eq!(args.rate, 44_100);
+        assert!(cli.global.quiet, "global flags work after the subcommand");
         assert_eq!(args.overrides.language, Some(Language::English));
+    }
+
+    #[test]
+    fn global_flags_work_before_the_subcommand() {
+        let cli = Cli::try_parse_from(["opensvr", "-v", "info", "song.svp"]).unwrap();
+        assert!(cli.global.verbose && !cli.global.quiet);
+        assert!(matches!(cli.command, Command::Info(_)));
+    }
+
+    #[test]
+    fn quiet_conflicts_with_verbose() {
+        assert!(Cli::try_parse_from(["opensvr", "-q", "-v", "man"]).is_err());
     }
 
     #[test]

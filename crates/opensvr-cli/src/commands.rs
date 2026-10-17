@@ -15,7 +15,9 @@ use opensvr_midi::MidiError;
 use opensvr_svp::SvpError;
 use thiserror::Error;
 
-use crate::cli::{Command, CompleteArgs, ConvertArgs, InfoArgs, MidiArgs, Overrides, RenderArgs};
+use crate::cli::{
+    Command, CompleteArgs, ConvertArgs, GlobalArgs, InfoArgs, MidiArgs, Overrides, RenderArgs,
+};
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -58,10 +60,10 @@ impl CliError {
     }
 }
 
-pub fn run(command: Command, cancel: &CancelToken) -> Result<(), CliError> {
+pub fn run(global: GlobalArgs, command: Command, cancel: &CancelToken) -> Result<(), CliError> {
     match command {
         Command::Info(args) => info(&args),
-        Command::Render(args) => render(&args, cancel),
+        Command::Render(args) => render(global, &args, cancel),
         Command::Midi(args) => midi(&args),
         Command::Convert(args) => convert(&args),
         Command::Complete(args) => complete(args),
@@ -94,9 +96,9 @@ impl ProgressSink for BarProgress {
     }
 }
 
-fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
+fn render(global: GlobalArgs, args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
     let project = load(&args.project, &args.overrides)?;
-    if !args.quiet {
+    if !global.quiet {
         eprintln!(
             "Rendering {} ({} tracks) at {} Hz...",
             args.project.display(),
@@ -117,11 +119,21 @@ fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
         .tracks
         .iter()
         .any(|track| track.voice.database.as_deref().is_some_and(Path::is_file));
+    if global.verbose {
+        eprintln!(
+            "opensvr: backend: {}",
+            if voiced {
+                "neural voice"
+            } else {
+                "placeholder tones"
+            }
+        );
+    }
     // Phrase progress goes to an `indicatif` bar on stderr unless `--quiet`.
     // The total is only known inside the renderer, so the bar starts without
     // a length and learns it from the first report; quiet renders pass the
     // no-op sink, keeping their output byte-identical.
-    let bar = if args.quiet {
+    let bar = if global.quiet {
         None
     } else {
         Some(indicatif::ProgressBar::new(0))
@@ -159,7 +171,7 @@ fn render(args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
         }
     };
     write_wav(&args.output, &audio, args.rate, cancel)?;
-    if !args.quiet {
+    if !global.quiet {
         let seconds = audio.frames() as f64 / f64::from(args.rate);
         eprintln!("Wrote {} ({seconds:.2} s)", args.output.display());
     }

@@ -25,18 +25,18 @@ fn main() -> ExitCode {
         }
     };
 
-    run(cli.command)
+    run(cli.global, cli.command)
 }
 
 /// Runs one subcommand with Ctrl-C cancellation.
-fn run(command: crate::cli::Command) -> ExitCode {
+fn run(global: crate::cli::GlobalArgs, command: crate::cli::Command) -> ExitCode {
     let cancel = CancelToken::new();
     let handler_token = cancel.clone();
     if let Err(error) = ctrlc::set_handler(move || handler_token.cancel()) {
         eprintln!("opensvr: warning: Ctrl-C will not cancel cleanly: {error}");
     }
 
-    match commands::run(command, &cancel) {
+    match commands::run(global, command, &cancel) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("opensvr: {error}");
