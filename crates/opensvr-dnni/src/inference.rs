@@ -1748,14 +1748,11 @@ fn run_layer(
         // state), and every element below is either tap-written or
         // explicitly zeroed before the bias pass reads it.
         output.values.resize(output.frames * output.channels, 0.0);
-        // Tap scratch from the depth-indexed float buffer: capacity persists
-        // across calls, and `multiply_matrix` overwrites every element, so
-        // no clearing is ever needed. The first in-range tap overwrites its
-        // frame slice directly (identical to zero-then-add); later taps add
-        // through this scratch; a fully padding-skipped frame is zeroed
-        // explicitly. Bias still adds after the taps, in the same order.
+        // Tap scratch from the depth-indexed float buffer. `multiply_matrix`
+        // overwrites every one of `matrix.rows` elements, so the buffer only
+        // ever needs *growing*: keep the largest length seen and never clear,
+        // which removes the per-tap zero-fill entirely (a no-op once warm).
         let product = scratch.floats(depth);
-        product.clear();
         for frame in 0..output.frames {
             if frame % CANCEL_POLL_STEPS == 0 && cancel.is_cancelled() {
                 return Err(cancelled());
@@ -1782,8 +1779,9 @@ fn run_layer(
                 let source = &input.values[tap as usize * input.channels..];
                 let destination = &mut output.values[frame * output.channels..];
                 if wrote {
-                    product.clear();
-                    product.resize(matrix.rows, 0.0);
+                    if product.len() < matrix.rows {
+                        product.resize(matrix.rows, 0.0);
+                    }
                     multiply_matrix(matrix, source, product);
                     for (slot, value) in destination.iter_mut().zip(product.iter()) {
                         *slot += *value;
