@@ -13,8 +13,10 @@ It is mostly a library with a thin CLI harness: it has no GUI and will not
 gain one. It is not a successor to or competitor with standard SV (SV1 still
 ships and works); it is a headless engine for offline rendering and
 embedding. Parity with OpenSV comes first; speed comes from clean structure
-(packed weight layouts, batch-level parallelism, no JUCE overhead), never
-from relaxed numerics.
+(packed weight layouts, batch-level parallelism, no JUCE overhead) and from
+kernel arithmetic that is at least as accurate as OpenSV's. What the engine
+trades for speed is bit-for-bit reproducibility with the C++, never accuracy —
+see the determinism principle below.
 
 ## Where things stand
 
@@ -44,7 +46,8 @@ listed order, one PR-sized branch per
 stage. Phase 2 (NOFS + voice config) lets `opensvr info` show singer metadata.
 The `opensvr-dnni` reader parses all real model entries, scalar inference
 matches per-op golden tensors, and blocked-`[f32; 16]` weights plus the
-incremental dirty-range `Cache` keep those goldens green. The dictionary +
+incremental dirty-range `Cache` keep those goldens green, with the packed
+kernel dispatching to fused AVX2 or SSE2 at runtime. The dictionary +
 `resolvePhonemes` half of Phase 3 became `opensvr-g2p`, and
 `opensvr info --phonemes` prints resolved phonemes per note. Phase 5 landed
 stage by stage (timing → pitch → acoustic → vocoder) behind `VoiceSynthesizer`,
@@ -229,9 +232,10 @@ Notes on exactness:
 - **Random numbers.** Both models use `std::mt19937` with the default seed 5489, fed into a hand-written Box-Muller
   (not `std::normal_distribution`), so the stream is portable. Use `rand_mt::Mt19937GenRand32` or a 30-line port,
   and copy the Box-Muller rejection loop exactly. Do not substitute `rand_distr`.
-- **Float behavior.** Use `f32` where C++ does, convert at the same points, and keep the same summation order in reductions.
-  Expect small differences from FMA and different `exp`/`tanh` implementations; set tolerances per stage (start near `1e-5` relative)
-  rather than demanding bit-identical output.
+- **Float behavior.** Use `f32` where C++ does and convert at the same points. Reductions need not
+  reproduce the C++ summation order — see the determinism principle — but document the order they
+  do use. Expect small differences from FMA and different `exp`/`tanh` implementations; set
+  tolerances per stage (start near `1e-5` relative) rather than demanding bit-identical output.
 - **State.** `VoiceSynthesizer::State` holds per-phrase caches. In Rust make it an owned struct passed as `Option<&mut State>`.
 
 ## Phase 6: renderer parity (about 1,500 lines)
