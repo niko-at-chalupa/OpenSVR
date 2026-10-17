@@ -85,9 +85,9 @@ pub struct InfoArgs {
 pub struct RenderArgs {
     /// The .svp project to render
     pub project: PathBuf,
-    /// Output WAV path
+    /// Output WAV path, or `-` for stdout (default: the project path with `.wav`)
     #[arg(short, long, value_name = "FILE")]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
     #[command(flatten)]
     pub overrides: Overrides,
     /// Output sample rate in Hz
@@ -104,17 +104,18 @@ pub struct RenderArgs {
 pub struct MidiArgs {
     /// The .svp project to read
     pub project: PathBuf,
-    /// Output MIDI path
+    /// Output MIDI path, or `-` for stdout (default: the project path with `.mid`)
     #[arg(short, long, value_name = "FILE")]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ConvertArgs {
     /// Input project (.svp or .mid)
     pub input: PathBuf,
-    /// Output project (.svp or .mid)
-    pub output: PathBuf,
+    /// Output path, or `-` to stream the other format to stdout (default: the input path with the other extension)
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
 }
 
 /// Target shell for `complete` (one of bash, elvish, fish, powershell, zsh).
@@ -204,25 +205,47 @@ mod tests {
     fn rejects_bad_usage() {
         for arguments in [
             &["opensvr"][..],
-            &["opensvr", "render", "song.svp"],
+            &["opensvr", "render"],
             &[
                 "opensvr", "render", "song.svp", "-o", "out.wav", "--rate", "100",
             ],
             &["opensvr", "info", "song.svp", "--language", "klingon"],
-            &["opensvr", "convert", "song.svp"],
+            &["opensvr", "convert"],
         ] {
             assert!(Cli::try_parse_from(arguments).is_err(), "{arguments:?}");
         }
     }
 
     #[test]
+    fn output_flags_are_optional() {
+        let cli = Cli::try_parse_from(["opensvr", "render", "song.svp"]).unwrap();
+        let Command::Render(args) = cli.command else {
+            panic!("expected render")
+        };
+        assert_eq!(args.output, None, "no -o defaults beside the project");
+
+        let cli = Cli::try_parse_from(["opensvr", "midi", "song.svp", "-o", "-"]).unwrap();
+        let Command::Midi(args) = cli.command else {
+            panic!("expected midi")
+        };
+        assert_eq!(args.output, Some(PathBuf::from("-")));
+    }
+
+    #[test]
     fn parses_convert_options() {
-        let cli = Cli::try_parse_from(["opensvr", "convert", "song.svp", "song.mid"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["opensvr", "convert", "song.svp", "-o", "song.mid"]).unwrap();
         let Command::Convert(args) = cli.command else {
             panic!("expected convert")
         };
         assert_eq!(args.input, PathBuf::from("song.svp"));
-        assert_eq!(args.output, PathBuf::from("song.mid"));
+        assert_eq!(args.output, Some(PathBuf::from("song.mid")));
+
+        let cli = Cli::try_parse_from(["opensvr", "convert", "song.svp"]).unwrap();
+        let Command::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        assert_eq!(args.output, None);
     }
 
     #[test]

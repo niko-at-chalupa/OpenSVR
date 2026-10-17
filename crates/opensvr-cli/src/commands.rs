@@ -1,14 +1,15 @@
-//! The three subcommands.
+//! The subcommands.
 
 use std::io::Write as _;
 use std::{
-    fs, io,
+    ffi::OsStr,
+    fmt, fs, io,
     path::{self, Path, PathBuf},
 };
 
 use opensvr_audio::{
     CancelToken, NeuralBackend, NoProgress, ProgressSink, RenderError, Renderer, ToneBackend,
-    WavError, write_wav,
+    WavError, encode_wav, write_wav,
 };
 use opensvr_core::Project;
 use opensvr_midi::MidiError;
@@ -31,6 +32,8 @@ pub enum CliError {
     Midi(#[from] MidiError),
     #[error("MIDI import failed: {0}")]
     MidiLoad(MidiError),
+    #[error("cannot serialize the project: {0}")]
+    Serialize(SvpError),
     #[error("cannot write {}: {0}", .path.display())]
     ConvertWrite {
         path: PathBuf,
@@ -56,6 +59,51 @@ impl CliError {
             Self::Load(_) | Self::MidiLoad(_) => 2,
             Self::Render(RenderError::Cancelled) | Self::Wav(WavError::Cancelled) => 130,
             _ => 3,
+        }
+    }
+}
+
+/// Where a command writes its output: a file path, or standard output when
+/// the caller passes `-`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Destination {
+    File(PathBuf),
+    Stdout,
+}
+
+impl fmt::Display for Destination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::Stdout => f.write_str("standard output"),
+        }
+    }
+}
+
+/// Resolves `-o` against the default path derived from the input.
+fn destination(output: Option<&Path>, default: PathBuf) -> Destination {
+    match output {
+        Some(path) if is_stdout(path) => Destination::Stdout,
+        Some(path) => Destination::File(path.to_owned()),
+        None => Destination::File(default),
+    }
+}
+
+/// Whether `-o` asked for stdout rather than a file named `-`.
+fn is_stdout(path: &Path) -> bool {
+    path.as_os_str() == OsStr::new("-")
+}
+
+/// Writes `bytes` to a file, or streams them to stdout for [`Destination::Stdout`].
+fn write_bytes(destination: &Destination, bytes: &[u8]) -> Result<(), CliError> {
+    match destination {
+        Destination::File(path) => fs::write(path, bytes).map_err(|source| CliError::Write {
+            path: path.clone(),
+            source,
+        }),
+        Destination::Stdout => {
+            io::stdout().lock().write_all(bytes)?;
+            Ok(())
         }
     }
 }
@@ -98,6 +146,7 @@ impl ProgressSink for BarProgress {
 
 fn render(global: GlobalArgs, args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
     let project = load(&args.project, &args.overrides)?;
+    let output = destination(args.output.as_deref(), args.project.with_extension("wav"));
     if !global.quiet {
         eprintln!(
             "Rendering {} ({} tracks) at {} Hz...",
@@ -128,6 +177,7 @@ fn render(global: GlobalArgs, args: &RenderArgs, cancel: &CancelToken) -> Result
                 "placeholder tones"
             }
         );
+        eprintln!("opensvr: output: {output}");
     }
     // Phrase progress goes to an `indicatif` bar on stderr unless `--quiet`.
     // The total is only known inside the renderer, so the bar starts without
@@ -170,10 +220,30 @@ fn render(global: GlobalArgs, args: &RenderArgs, cancel: &CancelToken) -> Result
             return Err(error.into());
         }
     };
-    write_wav(&args.output, &audio, args.rate, cancel)?;
+    write_output(&output, &audio, args.rate, cancel)?;
     if !global.quiet {
         let seconds = audio.frames() as f64 / f64::from(args.rate);
-        eprintln!("Wrote {} ({seconds:.2} s)", args.output.display());
+        eprintln!("Wrote {output} ({seconds:.2} s)");
+    }
+    Ok(())
+}
+
+/// Writes the rendered audio to a file (atomically) or to stdout.
+fn write_output(
+    destination: &Destination,
+    audio: &opensvr_audio::StereoBuffer,
+    sample_rate: u32,
+    cancel: &CancelToken,
+) -> Result<(), CliError> {
+    match destination {
+        Destination::File(path) => {
+            write_wav(path, audio, sample_rate, cancel)?;
+        }
+        Destination::Stdout => {
+            io::stdout()
+                .lock()
+                .write_all(&encode_wav(audio, sample_rate, cancel)?)?;
+        }
     }
     Ok(())
 }
@@ -198,41 +268,53 @@ fn man() -> Result<(), CliError> {
 fn midi(args: &MidiArgs) -> Result<(), CliError> {
     let project = opensvr_svp::load(&args.project)?;
     let bytes = opensvr_midi::export(&project)?;
-    fs::write(&args.output, bytes).map_err(|source| CliError::Write {
-        path: args.output.clone(),
-        source,
-    })
+    write_bytes(
+        &destination(args.output.as_deref(), args.project.with_extension("mid")),
+        &bytes,
+    )
 }
 
 /// Converts between `.svp` and `.mid` in any direction: same-extension pairs
-/// are load-then-save round trips, not byte copies.
+/// are load-then-save round trips, not byte copies. Omitting `-o` writes the
+/// other format beside the input; `-o -` streams to stdout.
 fn convert(args: &ConvertArgs) -> Result<(), CliError> {
     let input = format_of(&args.input).ok_or_else(|| CliError::UnsupportedExtension {
         path: args.input.clone(),
     })?;
-    let output = format_of(&args.output).ok_or_else(|| CliError::UnsupportedExtension {
-        path: args.output.clone(),
-    })?;
+    let destination = destination(
+        args.output.as_deref(),
+        args.input.with_extension(input.other().extension()),
+    );
+    let output = match &args.output {
+        // `-` has no extension to read a format from, so target the other one.
+        Some(path) if is_stdout(path) => input.other(),
+        Some(path) => {
+            format_of(path).ok_or_else(|| CliError::UnsupportedExtension { path: path.clone() })?
+        }
+        None => input.other(),
+    };
     let project = match input {
         Format::Svp => opensvr_svp::load(&args.input)?,
         Format::Midi => opensvr_midi::load(&args.input).map_err(CliError::MidiLoad)?,
     };
     match output {
-        Format::Svp => {
-            opensvr_svp::save(&args.output, &project).map_err(|source| CliError::ConvertWrite {
-                path: args.output.clone(),
-                source,
-            })?;
-        }
-        Format::Midi => {
-            let bytes = opensvr_midi::export(&project)?;
-            fs::write(&args.output, bytes).map_err(|source| CliError::Write {
-                path: args.output.clone(),
-                source,
-            })?;
-        }
+        Format::Midi => write_bytes(&destination, &opensvr_midi::export(&project)?),
+        Format::Svp => match &destination {
+            Destination::File(path) => {
+                opensvr_svp::save(path, &project).map_err(|source| CliError::ConvertWrite {
+                    path: path.clone(),
+                    source,
+                })
+            }
+            Destination::Stdout => {
+                // No output directory exists on stdout: keep relative paths
+                // anchored where the input project's own were.
+                let base_dir = args.input.parent().unwrap_or_else(|| Path::new(""));
+                let bytes = opensvr_svp::encode(&project, base_dir).map_err(CliError::Serialize)?;
+                write_bytes(&destination, &bytes)
+            }
+        },
     }
-    Ok(())
 }
 
 /// A project file format, picked by file extension (case-insensitively, so
@@ -241,6 +323,23 @@ fn convert(args: &ConvertArgs) -> Result<(), CliError> {
 enum Format {
     Svp,
     Midi,
+}
+
+impl Format {
+    /// The other format, picked when `-o` is omitted.
+    const fn other(self) -> Self {
+        match self {
+            Self::Svp => Self::Midi,
+            Self::Midi => Self::Svp,
+        }
+    }
+
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Svp => "svp",
+            Self::Midi => "mid",
+        }
+    }
 }
 
 fn format_of(path: &Path) -> Option<Format> {
@@ -636,6 +735,36 @@ mod tests {
         assert_eq!(format_of(Path::new("song.MID")), Some(Format::Midi));
         assert_eq!(format_of(Path::new("song.txt")), None);
         assert_eq!(format_of(Path::new("song")), None);
+    }
+
+    #[test]
+    fn output_paths_default_from_the_input() {
+        assert_eq!(
+            destination(None, PathBuf::from("song.wav")),
+            Destination::File(PathBuf::from("song.wav"))
+        );
+        assert_eq!(
+            destination(Some(Path::new("out.wav")), PathBuf::from("song.wav")),
+            Destination::File(PathBuf::from("out.wav")),
+            "an explicit -o wins over the default"
+        );
+        assert_eq!(
+            destination(Some(Path::new("-")), PathBuf::from("song.wav")),
+            Destination::Stdout
+        );
+        assert!(is_stdout(Path::new("-")));
+        assert!(
+            !is_stdout(Path::new("./-")),
+            "only a bare dash means stdout"
+        );
+    }
+
+    #[test]
+    fn formats_swap_and_name_their_extension() {
+        assert_eq!(Format::Svp.other(), Format::Midi);
+        assert_eq!(Format::Midi.other(), Format::Svp);
+        assert_eq!(Format::Svp.extension(), "svp");
+        assert_eq!(Format::Midi.extension(), "mid");
     }
 
     #[test]

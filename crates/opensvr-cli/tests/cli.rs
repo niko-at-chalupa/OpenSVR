@@ -191,7 +191,7 @@ fn midi_export_writes_a_standard_midi_file() {
 #[test]
 fn convert_svp_to_mid_writes_a_standard_midi_file() {
     let path = scratch("convert.mid");
-    let output = opensvr(&["convert", EXAMPLE, path.to_str().unwrap()]);
+    let output = opensvr(&["convert", EXAMPLE, "-o", path.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(0));
     let bytes = fs::read(&path).unwrap();
     assert_eq!(&bytes[..4], b"MThd");
@@ -220,15 +220,20 @@ fn convert_mid_to_svp_keeps_the_notes() {
     let (mid_b, svp_b) = (there.join("song.mid"), there.join("song.svp"));
 
     assert_eq!(
-        opensvr(&["convert", EXAMPLE, mid_a.to_str().unwrap()])
+        opensvr(&["convert", EXAMPLE, "-o", mid_a.to_str().unwrap()])
             .status
             .code(),
         Some(0)
     );
     assert_eq!(
-        opensvr(&["convert", mid_a.to_str().unwrap(), svp_a.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            mid_a.to_str().unwrap(),
+            "-o",
+            svp_a.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     // The sung notes survive the MIDI leg: Lead keeps its 4 lyric-bearing
@@ -247,15 +252,25 @@ fn convert_mid_to_svp_keeps_the_notes() {
     assert_eq!(after.matches("Tracks: 2").count(), 1);
     // And `.mid` -> `.svp` is a fixed point from here on.
     assert_eq!(
-        opensvr(&["convert", svp_a.to_str().unwrap(), mid_b.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            svp_a.to_str().unwrap(),
+            "-o",
+            mid_b.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     assert_eq!(
-        opensvr(&["convert", mid_b.to_str().unwrap(), svp_b.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            mid_b.to_str().unwrap(),
+            "-o",
+            svp_b.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     let again = opensvr(&["info", svp_b.to_str().unwrap()]);
@@ -275,21 +290,31 @@ fn convert_svp_to_svp_converges_to_a_fixed_point() {
     let twice = scratch("fixed-twice.svp");
     let thrice = scratch("fixed-thrice.svp");
     assert_eq!(
-        opensvr(&["convert", EXAMPLE, once.to_str().unwrap()])
+        opensvr(&["convert", EXAMPLE, "-o", once.to_str().unwrap()])
             .status
             .code(),
         Some(0)
     );
     assert_eq!(
-        opensvr(&["convert", once.to_str().unwrap(), twice.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            once.to_str().unwrap(),
+            "-o",
+            twice.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     assert_eq!(
-        opensvr(&["convert", twice.to_str().unwrap(), thrice.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            twice.to_str().unwrap(),
+            "-o",
+            thrice.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(0)
     );
     assert_eq!(fs::read(&twice).unwrap(), fs::read(&thrice).unwrap());
@@ -317,22 +342,28 @@ fn convert_svp_to_svp_converges_to_a_fixed_point() {
 fn convert_uses_the_documented_exit_codes() {
     let mid = scratch("exit-codes.mid");
     assert_eq!(
-        opensvr(&["convert", EXAMPLE, mid.to_str().unwrap()])
+        opensvr(&["convert", EXAMPLE, "-o", mid.to_str().unwrap()])
             .status
             .code(),
         Some(0)
     );
     // Unknown extensions are refused, not misread.
     assert_eq!(
-        opensvr(&["convert", EXAMPLE, scratch("out.txt").to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            EXAMPLE,
+            "-o",
+            scratch("out.txt").to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(3)
     );
     assert_eq!(
         opensvr(&[
             "convert",
             scratch("in.txt").to_str().unwrap(),
+            "-o",
             mid.to_str().unwrap()
         ])
         .status
@@ -341,18 +372,114 @@ fn convert_uses_the_documented_exit_codes() {
     );
     // Missing inputs are load errors.
     assert_eq!(
-        opensvr(&["convert", "/no/such/project.svp", mid.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            "/no/such/project.svp",
+            "-o",
+            mid.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(2)
     );
     assert_eq!(
-        opensvr(&["convert", "/no/such/project.mid", mid.to_str().unwrap()])
-            .status
-            .code(),
+        opensvr(&[
+            "convert",
+            "/no/such/project.mid",
+            "-o",
+            mid.to_str().unwrap()
+        ])
+        .status
+        .code(),
         Some(2)
     );
     fs::remove_file(mid).unwrap();
+}
+
+#[test]
+fn missing_outputs_pair_with_the_input() {
+    // A copied project keeps its default output out of the repository.
+    let dir = scratch("defaults");
+    fs::create_dir_all(&dir).unwrap();
+    let project = dir.join("two-tracks.svp");
+    fs::copy(EXAMPLE, &project).unwrap();
+
+    let wav = project.with_extension("wav");
+    let render = opensvr(&["render", project.to_str().unwrap(), "-q"]);
+    assert_eq!(render.status.code(), Some(0));
+    assert_eq!(&fs::read(&wav).unwrap()[..4], b"RIFF");
+
+    let mid = project.with_extension("mid");
+    let midi = opensvr(&["midi", project.to_str().unwrap()]);
+    assert_eq!(midi.status.code(), Some(0));
+    assert_eq!(&fs::read(&mid).unwrap()[..4], b"MThd");
+
+    // `convert` picks the other format beside the input.
+    let converted = dir.join("converted.mid");
+    let convert = opensvr(&[
+        "convert",
+        project.to_str().unwrap(),
+        "-o",
+        converted.to_str().unwrap(),
+    ]);
+    assert_eq!(convert.status.code(), Some(0));
+    assert_eq!(fs::read(&mid).unwrap(), fs::read(&converted).unwrap());
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn output_dash_streams_to_stdout() {
+    let rendered = opensvr(&["render", EXAMPLE, "-o", "-", "--rate", "8000", "-q"]);
+    assert_eq!(rendered.status.code(), Some(0));
+    assert_eq!(&rendered.stdout[..4], b"RIFF");
+    assert_eq!(&rendered.stdout[8..12], b"WAVE");
+
+    let midi = opensvr(&["midi", EXAMPLE, "-o", "-"]);
+    assert_eq!(midi.status.code(), Some(0));
+    assert_eq!(&midi.stdout[..4], b"MThd");
+
+    // `-` has no extension, so it streams the other format: `.svp` -> MIDI
+    // bytes. That matches omitting `-o` entirely.
+    let svp_to_midi = opensvr(&["convert", EXAMPLE, "-o", "-"]);
+    assert_eq!(svp_to_midi.status.code(), Some(0));
+    assert_eq!(&svp_to_midi.stdout[..4], b"MThd");
+
+    // A `.mid` input streams `.svp`, byte-identical to what `save` writes:
+    // relative paths anchor on the input's directory in both cases.
+    let dir = scratch("stdout-svp");
+    fs::create_dir_all(&dir).unwrap();
+    let project = dir.join("two-tracks.svp");
+    fs::copy(EXAMPLE, &project).unwrap();
+    let mid = dir.join("song.mid");
+    assert_eq!(
+        opensvr(&[
+            "convert",
+            project.to_str().unwrap(),
+            "-o",
+            mid.to_str().unwrap()
+        ])
+        .status
+        .code(),
+        Some(0)
+    );
+    let file = dir.join("out.svp");
+    assert_eq!(
+        opensvr(&[
+            "convert",
+            mid.to_str().unwrap(),
+            "-o",
+            file.to_str().unwrap()
+        ])
+        .status
+        .code(),
+        Some(0)
+    );
+    let svp = opensvr(&["convert", mid.to_str().unwrap(), "-o", "-"]);
+    assert_eq!(svp.status.code(), Some(0));
+    assert_eq!(svp.stdout, fs::read(&file).unwrap());
+    assert_eq!(svp.stdout.last(), Some(&0));
+    fs::remove_dir_all(dir).unwrap();
 }
 
 /// Renders an override path exactly as the binary prints it: overrides go
@@ -444,9 +571,9 @@ fn render_help_documents_the_models_dir_override() {
 fn failures_use_the_documented_exit_codes() {
     assert_eq!(opensvr(&[]).status.code(), Some(1), "usage error");
     assert_eq!(
-        opensvr(&["render", EXAMPLE]).status.code(),
+        opensvr(&["render"]).status.code(),
         Some(1),
-        "missing --output"
+        "missing project"
     );
     assert_eq!(
         opensvr(&["info", "/no/such/project.svp"]).status.code(),
