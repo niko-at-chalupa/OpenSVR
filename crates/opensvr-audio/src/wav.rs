@@ -75,10 +75,11 @@ fn write_temporary(
     sample_rate: u32,
     cancel: &CancelToken,
 ) -> Result<(), WavError> {
-    let writer = WavWriter::create(temporary, spec(sample_rate)).map_err(|source| WavError::Write {
-        path: path.to_owned(),
-        source,
-    })?;
+    let writer =
+        WavWriter::create(temporary, spec(sample_rate)).map_err(|source| WavError::Write {
+            path: path.to_owned(),
+            source,
+        })?;
     write_samples(writer, audio, cancel).map_err(|source| match source {
         Some(source) => WavError::Write {
             path: path.to_owned(),
@@ -102,9 +103,8 @@ pub fn encode_wav(
     cancel: &CancelToken,
 ) -> Result<Vec<u8>, WavError> {
     let mut bytes = Cursor::new(Vec::new());
-    let writer = WavWriter::new(&mut bytes, spec(sample_rate)).map_err(|source| WavError::Encode {
-        source,
-    })?;
+    let writer = WavWriter::new(&mut bytes, spec(sample_rate))
+        .map_err(|source| WavError::Encode { source })?;
     write_samples(writer, audio, cancel).map_err(|source| match source {
         Some(source) => WavError::Encode { source },
         None => WavError::Cancelled,
