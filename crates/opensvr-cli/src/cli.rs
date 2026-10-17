@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use opensvr_audio::{MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use opensvr_core::Language;
 
@@ -66,9 +66,34 @@ pub struct Overrides {
     /// document's sibling `models` directory (default: OPENSVR_MODELS_DIR)
     #[arg(long, value_name = "DIR")]
     pub models_dir: Option<PathBuf>,
-    /// Override the singing language on every track (japanese, mandarin, english, cantonese, spanish)
+    /// Override the singing language on every track
     #[arg(long, value_name = "NAME")]
-    pub language: Option<Language>,
+    pub language: Option<LanguageArg>,
+}
+
+/// Singing language, listed in `--help` and offered by shell completions.
+///
+/// `opensvr-core`'s [`Language`] stays free of clap; this mirror is the only
+/// place the CLI spells the names for a user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LanguageArg {
+    Japanese,
+    Mandarin,
+    English,
+    Cantonese,
+    Spanish,
+}
+
+impl From<LanguageArg> for Language {
+    fn from(value: LanguageArg) -> Self {
+        match value {
+            LanguageArg::Japanese => Self::Japanese,
+            LanguageArg::Mandarin => Self::Mandarin,
+            LanguageArg::English => Self::English,
+            LanguageArg::Cantonese => Self::Cantonese,
+            LanguageArg::Spanish => Self::Spanish,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -187,7 +212,19 @@ mod tests {
         };
         assert_eq!(args.rate, 44_100);
         assert!(cli.global.quiet, "global flags work after the subcommand");
-        assert_eq!(args.overrides.language, Some(Language::English));
+        assert_eq!(args.overrides.language, Some(LanguageArg::English));
+    }
+
+    #[test]
+    fn language_choices_are_listed() {
+        let help = Cli::command()
+            .find_subcommand_mut("render")
+            .expect("render exists")
+            .render_long_help()
+            .to_string();
+        for name in ["japanese", "mandarin", "english", "cantonese", "spanish"] {
+            assert!(help.contains(name), "render help misses {name}: {help}");
+        }
     }
 
     #[test]

@@ -374,7 +374,7 @@ fn load(path: &Path, overrides: &Overrides) -> Result<Project, CliError> {
             track.voice.dictionary = Some(absolute(dictionary)?);
         }
         if let Some(language) = overrides.language {
-            track.voice.language = language;
+            track.voice.language = language.into();
         }
     }
     Ok(project)
