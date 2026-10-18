@@ -708,23 +708,19 @@ mod tests {
         assert_eq!(config.acoustic_model().key, b"acoustic-hash");
         assert_eq!(config.vocoder_model().key, b"vocoder-hash");
         assert_eq!(config.duration_model().name, "duration-hash");
-        // References match the document-mode entries by raw key bytes.
-        for reference in [
-            config.duration_model(),
-            config.acoustic_model(),
-            config.vocoder_model(),
+        // References match the document-mode entries by raw key bytes, and
+        // each one resolves to the model bytes named in the document.
+        for (reference, expected) in [
+            (config.duration_model(), b"duration-bytes".as_slice()),
+            (config.acoustic_model(), b"acoustic-bytes".as_slice()),
+            (config.vocoder_model(), b"vocoder-bytes".as_slice()),
         ] {
-            assert!(db.entries().iter().any(|entry| entry.key == reference.key));
-            assert!(
-                !db.read_entry(
-                    db.entries()
-                        .iter()
-                        .find(|entry| entry.key == reference.key)
-                        .unwrap()
-                )
-                .unwrap()
-                .is_empty()
-            );
+            let entry = db
+                .entries()
+                .iter()
+                .find(|entry| entry.key == reference.key)
+                .expect("reference key resolves to a document entry");
+            assert_eq!(db.read_entry(entry).unwrap(), expected);
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
