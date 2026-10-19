@@ -125,20 +125,27 @@ completeness.
   `opensvr-audio` consults it, so a project that sets it times its syllables
   the same as one that does not, where Studio re-distributes them.
 
-- **The engine cannot read the dictionaries Studio installs.** Loading wants
-  the plain-text CLF set (`english-arpabet-phones.txt`, `cmudict-07b.txt`,
-  `japanese-hira2romaji-dict.txt`, ...), but Studio's own `clf-data` ships
-  compiled inventories, so `--dictionary` pointed at Studio's directory fails
-  before a single note resolves. Read the installed form too (or auto-detect
-  it) instead of making the user hunt for text copies.
+- **A first-party dictionary format.** The engine reads the third-party CLF
+  text set (`english-arpabet-phones.txt`, `cmudict-07b.txt`,
+  `japanese-hira2romaji-dict.txt`, ...). Those files are not ours to
+  redistribute, and Studio no longer ships them in that form anyway: its
+  installed `clf-data` holds compiled inventories, so `--dictionary` pointed
+  at Studio's directory fails before a note resolves. Define a dictionary
+  format OpenSVR owns — a per-language file carrying the symbol inventory, the
+  lookup entries and the front-end rules — so the engine ships usable defaults
+  and stops depending on files the user has to supply. Two constraints: it
+  must pronounce a word the same as the current tables wherever they agree,
+  and it is where the per-language G2P work above lands (multi-mora Japanese,
+  multi-character Mandarin, English reduced vowels).
 
-- **Phrase caps abort long passages.** The engine inherits OpenSV's
-  `maximumPhraseSeconds` (30 s) and `maximumPhrasePhonemes` (4096): a phrase
-  (a run of notes with no rest of at least 0.2 s) that exceeds either is
-  refused, so a real project with a 33 s legato passage fails to render.
-  Studio has no user-visible cap of that kind. Window such phrases internally
-  instead of erroring; the exact Studio windowing is not observable, so pick a
-  documented, deterministic cut.
+- **Phrase splitting and its caps are engine bookkeeping, not Studio
+  behaviour.** The engine inherits OpenSV's rest-based splitting (a phrase is
+  a run of notes with no rest of at least 0.2 s) plus two hard caps,
+  `maximumPhraseSeconds` (30 s) and `maximumPhrasePhonemes` (4096); a phrase
+  over either is refused, so a real project with a 33 s legato passage fails
+  to render. Studio never cuts a connected passage at rests, so a passage
+  longer than either cap must render, the caps must go, and any splitting kept
+  for incremental synthesis must stay invisible in the output.
 
 The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
 
