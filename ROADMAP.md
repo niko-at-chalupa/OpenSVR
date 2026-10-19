@@ -69,29 +69,49 @@ Synthesizer V Studio. They were found by rendering real projects through the
 engine and comparing the notes against what Studio displays for the same
 notes. OpenSV behaves the same way, so no C++ golden covers them: fixing them
 is a deliberate divergence from OpenSV output, recorded here rather than
-silently taken.
+silently taken. The list is what has been checked so far, not a claim of
+completeness.
 
 - **No note IDs.** Only needed for editing and incremental caches; add
   `NoteId(u64)` when an editor-side consumer needs it.
 
-- **English phonemization (G2P) differs from Studio.** Studio's English front
-  end is not CMUDict. It writes `iy` for a final `-y` (`happy` -> `hh ae p iy`,
-  `evry` -> `eh v r iy`), a reduced `ax` where CMUDict has `ah` (`and` ->
-  `ax n d`, `hello` -> `hh ax l ow`), `ey` for `ay` (`day` -> `d ey`), and so
-  on. `opensvr-g2p` is dictionary-first and, for a word CMUDict does not list,
-  falls back to a per-letter heuristic that reads a final `y` as a consonant,
-  so `evry` resolves to one syllable (`eh v r y`) where Studio resolves two
-  (`eh v r iy`). The wrong syllable count is what then makes a following `+`
-  fail, since the continuation has no syllable left to advance to. Closing
-  this needs Studio's actual rules, not just a `y` patch: the reduced-vowel
-  and `-y` cases above are the ones observed so far.
+- **Grapheme-to-phoneme parity, in every language.** Studio phonemizes
+  whatever text sits on a note; the engine is dictionary-first, and its East
+  Asian front ends take one dictionary unit per note, so text the shipped
+  tables do not list is either invented as if it were English or aborts the
+  render. What has been checked so far already spans more than one language:
+
+  - *English.* Studio's front end is not CMUDict: it writes `iy` for a final
+    `-y` (`happy` -> `hh ae p iy`, `evry` -> `eh v r iy`), a reduced `ax`
+    where CMUDict has `ah` (`and` -> `ax n d`, `hello` -> `hh ax l ow`) and
+    `ey` for `ay` (`day` -> `d ey`). Past CMUDict the engine uses 14 hardcoded
+    words, then 11 digraph patterns (`sh ch th ph ng qu ee ea oo ow ai`), then
+    a per-letter guess in which a final `y` is a consonant, so `evry` resolves
+    to one syllable (`eh v r y`) where Studio resolves two. The hardcoded
+    words disagree with Studio as well (`hello` is stored as `hh ah l ow`).
+    The wrong syllable count is what then makes a following `+` fail.
+  - *Japanese.* `lookup` romanizes the lyric character by character and then
+    looks the concatenation up as one key, while the kana tables hold one mora
+    per entry. A multi-mora lyric such as `あん` (`a N` in Studio) is not a
+    key, and the long-vowel mark and kanji are not kana at all. The fallback
+    is the Latin letter guess, which for Japanese either names phones the
+    inventory lacks, aborting the render, or invents Latin phones for kana.
+  - *Mandarin.* A note takes exactly one listed syllable; a multi-character
+    lyric is rejected with "Split multi-character lyrics across notes".
+  - *Cantonese, Spanish.* Same CLF tables as upstream, not yet compared with
+    Studio at all.
+
+  This is not one patch. It is a per-language front end that accepts the text
+  Studio accepts, emits Studio's symbol inventory, and never turns an unknown
+  input into either an abort or a wrong guess.
 
 - **A `+` or `-` with no syllable left should be silence, not an error.** When
   a continuation cannot advance because the previous word's syllables are
   used up, Studio still renders the note as `sil`; the engine aborts the whole
   render with "'+' advances to the next syllable, but no remaining syllable is
-  available". Even after G2P parity this must degrade to a silent note rather
-  than a hard failure.
+  available". The same class covers a `-` with nothing before it ("A legato
+  lyric (-) must immediately follow a note with a resolved syllable"). Even
+  after G2P parity these must degrade to a silent note, never a hard failure.
 
 - **Explicit phonemes should drive the syllable split.** When a note's
   `phonemes` string is set (hand-edited in Studio), it must take priority over
@@ -100,17 +120,25 @@ silently taken.
   explicit string as the source of truth; the engine currently re-derives from
   the lyric in at least some of those cases.
 
-- **Multi-mora Japanese notes.** Studio phonemizes a single note whose lyric is
-  a multi-mora kana sequence (for example `あん` -> `a N`); the engine does
-  not, so the note comes out unphonemized. The Japanese kana lookup maps one
-  mora per note and needs to accept multi-mora lyrics.
+- **`evenSyllableDuration` is parsed but never read.** `opensvr-svp`
+  round-trips the per-note attribute; nothing in `opensvr-voice` or
+  `opensvr-audio` consults it, so a project that sets it times its syllables
+  the same as one that does not, where Studio re-distributes them.
 
-- **Connected phrases longer than 30 seconds abort.** The engine inherits
-  OpenSV's `maximumPhraseSeconds` cap and refuses a phrase (a run of notes
-  with no rest of at least 0.2 s) longer than 30 s, so a real project with a
-  33 s legato passage fails to render. Studio has no user-visible cap of that
-  kind. Window such phrases internally instead of erroring; the exact Studio
-  windowing is not observable, so pick a documented, deterministic cut.
+- **The engine cannot read the dictionaries Studio installs.** Loading wants
+  the plain-text CLF set (`english-arpabet-phones.txt`, `cmudict-07b.txt`,
+  `japanese-hira2romaji-dict.txt`, ...), but Studio's own `clf-data` ships
+  compiled inventories, so `--dictionary` pointed at Studio's directory fails
+  before a single note resolves. Read the installed form too (or auto-detect
+  it) instead of making the user hunt for text copies.
+
+- **Phrase caps abort long passages.** The engine inherits OpenSV's
+  `maximumPhraseSeconds` (30 s) and `maximumPhrasePhonemes` (4096): a phrase
+  (a run of notes with no rest of at least 0.2 s) that exceeds either is
+  refused, so a real project with a 33 s legato passage fails to render.
+  Studio has no user-visible cap of that kind. Window such phrases internally
+  instead of erroring; the exact Studio windowing is not observable, so pick a
+  documented, deterministic cut.
 
 The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
 
