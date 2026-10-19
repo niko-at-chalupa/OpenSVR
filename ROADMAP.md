@@ -179,6 +179,69 @@ has been checked so far, not a claim of completeness.
   and it is where the per-language G2P work above lands (multi-mora Japanese,
   multi-character Mandarin, English reduced vowels).
 
+  Plan for the English half, in order:
+
+  1. *Build the data from public sources.* Generate the English entries from
+     upstream CMUdict (permissive license; keep its copyright notice with the
+     generated file) instead of from any vendor's copy, so the shipped
+     dictionary has no proprietary provenance.
+  2. *Normalize with a small, documented rule set.* The CLF-style text set is
+     CMUdict after light normalization: lowercase keys, stress digits
+     stripped, apostrophes dropped from keys, lowercase space-separated
+     ARPAbet, one entry per line, alternate pronunciations (`word(2)`)
+     handled explicitly. Write these as a spec and implement them once, in a
+     converter that both builds the first-party file and ingests other
+     CMUdict-shaped sources.
+  3. *Diff against the current tables.* Any entry that differs from the
+     generated file is either a normalization rule not yet captured or an
+     addition made by the table's author. Only the former is ours to adopt;
+     record the diff result in the converter's tests, never the foreign
+     entries themselves.
+  4. *Fill out-of-vocabulary words with a permissively licensed G2P model*
+     (check the model's license before bundling), normalized by the same
+     converter, ahead of the hardcoded words and digraph rules described
+     above.
+  5. *Ship the converter, not converted vendor data.* Users convert
+     dictionaries they legally hold on their own machines; the repository
+     ships only data it has the right to distribute.
+
+  **The same process, for any language.** English is the first instance, not a
+  special case. Every language the engine reads (English, Japanese,
+  Mandarin, Cantonese, Spanish, and any added later) gets its dictionary
+  through these steps, so a new language never starts from someone's
+  shipped file:
+
+  1. *Pick a public source and record its license.* Write down the source,
+     its version and its license before writing any code, and treat
+     share-alike licenses as a constraint on what the generated file may be
+     released under. As a starting point to verify, not a conclusion: English
+     has CMUdict; Mandarin and Cantonese have CC-CEDICT and Jyutping
+     resources; Japanese kana-to-romaji is a small published mapping, with
+     word lists from open dictionaries; Spanish orthography is regular enough
+     that rules may replace a word list entirely. Prefer rules over word
+     lists wherever the language allows it, because rules carry no data
+     license.
+  2. *Define the target inventory.* State each language's phone inventory
+     (the symbol set the engine and voice expect) as a first-party file, so
+     the converter has a fixed target and the engine can validate against it.
+  3. *Write the mapping from source symbols to inventory symbols* as a
+     table, with one test per row, rather than as inline code.
+  4. *Convert, then diff against the engine's current tables.* A difference is
+     either a missing mapping rule (fix the converter) or a foreign addition
+     (leave it out). Keep the diff gated behind an environment variable that
+     points at the user's own copy, so no foreign data enters the repository
+     or its tests.
+  5. *Specify the front-end rules separately from the word list.* Rules
+     (multi-mora Japanese, multi-character Mandarin, English reduced vowels)
+     live in the first-party format alongside the lookup entries, and are
+     tested against hand-written cases, not against a vendor's output.
+  6. *Document the language* in one short page: source and license, inventory,
+     normalization rules, known gaps, and how to regenerate the file.
+     Regeneration must be a single command so a new contributor can add a
+     language without reading the engine.
+  7. *Ship the converter and the generated first-party file together* where
+     the source license allows, and the converter alone where it does not.
+
 - **Phrase splitting and its caps are engine bookkeeping, not Studio
   behaviour.** The engine inherits OpenSV's rest-based splitting (a phrase is
   a run of notes with no rest of at least 0.2 s) plus two hard caps,
