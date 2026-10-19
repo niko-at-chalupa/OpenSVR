@@ -155,6 +155,32 @@ completeness.
   and it is where the per-language G2P work above lands (multi-mora Japanese,
   multi-character Mandarin, English reduced vowels).
 
+  Plan for the English half, in order:
+
+  1. *Build the data from public sources.* Generate the English entries from
+     upstream CMUdict (permissive license; keep its copyright notice with the
+     generated file) instead of from any vendor's copy, so the shipped
+     dictionary has no proprietary provenance.
+  2. *Normalize with a small, documented rule set.* The CLF-style text set is
+     CMUdict after light normalization: lowercase keys, stress digits
+     stripped, apostrophes dropped from keys, lowercase space-separated
+     ARPAbet, one entry per line, alternate pronunciations (`word(2)`)
+     handled explicitly. Write these as a spec and implement them once, in a
+     converter that both builds the first-party file and ingests other
+     CMUdict-shaped sources.
+  3. *Diff against the current tables.* Any entry that differs from the
+     generated file is either a normalization rule not yet captured or an
+     addition made by the table's author. Only the former is ours to adopt;
+     record the diff result in the converter's tests, never the foreign
+     entries themselves.
+  4. *Fill out-of-vocabulary words with a permissively licensed G2P model*
+     (check the model's license before bundling), normalized by the same
+     converter, ahead of the hardcoded words and digraph rules described
+     above.
+  5. *Ship the converter, not converted vendor data.* Users convert
+     dictionaries they legally hold on their own machines; the repository
+     ships only data it has the right to distribute.
+
 - **Phrase splitting and its caps are engine bookkeeping, not Studio
   behaviour.** The engine inherits OpenSV's rest-based splitting (a phrase is
   a run of notes with no rest of at least 0.2 s) plus two hard caps,
