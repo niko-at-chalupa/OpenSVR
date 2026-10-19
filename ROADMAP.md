@@ -34,13 +34,13 @@ never accuracy — see the determinism principle below.
 | CLI | `cli/Main.cpp` | `opensvr-cli` | done, redesigned on its own terms (subcommands, global flags, default outputs, `-` for stdout) |
 | Voice synthesis | `synthesis/*` (10.4k lines) | `opensvr-voice` (timing, pitch, acoustic, vocoder, `VoiceSynthesizer`), `opensvr-nofs`, `opensvr-dnni` | done (neural `NeuralBackend` sings voiced tracks; `ToneBackend` stays as the voiceless fallback) |
 | Flat voicebank (document NOFS) | — (post-OpenSV format, not in the commit above) | `opensvr-nofs` + `opensvr-voice` | done (Phase 8) |
-| Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done (dictionary + resolution + `info --phonemes`; timing types live here, the duration model in `opensvr-voice`) |
+| Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done, OpenSV parity (dictionary + resolution + `info --phonemes`; timing types live here, the duration model in `opensvr-voice`; Studio parity gaps under "Remaining gaps") |
 | Phrase building, pitch/vibrato, caching | `ProjectRenderer.cpp` (1.6k lines) | `opensvr-audio` (phrase splitting, `buildPitch`/vibrato/vocal-mode weights, voice/dictionary/phrase caches) | done |
 | Editor GUI | `ui/*`, `app/*`, `audio/PreviewEngine.*` (5.6k lines) | none | out of scope |
 
 `opensvr render` sings through the neural voice when a voice database resolves,
-and falls back to sine tones otherwise. All eight phases are ported; the only
-known gap left is one small item (see "Remaining gaps").
+and falls back to sine tones otherwise. All eight phases are ported; the gaps
+that remain are the Synthesizer V parity items listed under "Remaining gaps".
 
 ## What was done
 
@@ -63,8 +63,54 @@ release automation) with hygiene (workspace clippy denial, `cargo fmt`).
 
 ## Remaining gaps
 
+The port is complete, so what is left is not "something OpenSV has and
+OpenSVR lacks" but the places where the engine still diverges from
+Synthesizer V Studio. They were found by rendering real projects through the
+engine and comparing the notes against what Studio displays for the same
+notes. OpenSV behaves the same way, so no C++ golden covers them: fixing them
+is a deliberate divergence from OpenSV output, recorded here rather than
+silently taken.
+
 - **No note IDs.** Only needed for editing and incremental caches; add
   `NoteId(u64)` when an editor-side consumer needs it.
+
+- **English phonemization (G2P) differs from Studio.** Studio's English front
+  end is not CMUDict. It writes `iy` for a final `-y` (`happy` -> `hh ae p iy`,
+  `evry` -> `eh v r iy`), a reduced `ax` where CMUDict has `ah` (`and` ->
+  `ax n d`, `hello` -> `hh ax l ow`), `ey` for `ay` (`day` -> `d ey`), and so
+  on. `opensvr-g2p` is dictionary-first and, for a word CMUDict does not list,
+  falls back to a per-letter heuristic that reads a final `y` as a consonant,
+  so `evry` resolves to one syllable (`eh v r y`) where Studio resolves two
+  (`eh v r iy`). The wrong syllable count is what then makes a following `+`
+  fail, since the continuation has no syllable left to advance to. Closing
+  this needs Studio's actual rules, not just a `y` patch: the reduced-vowel
+  and `-y` cases above are the ones observed so far.
+
+- **A `+` or `-` with no syllable left should be silence, not an error.** When
+  a continuation cannot advance because the previous word's syllables are
+  used up, Studio still renders the note as `sil`; the engine aborts the whole
+  render with "'+' advances to the next syllable, but no remaining syllable is
+  available". Even after G2P parity this must degrade to a silent note rather
+  than a hard failure.
+
+- **Explicit phonemes should drive the syllable split.** When a note's
+  `phonemes` string is set (hand-edited in Studio), it must take priority over
+  the lyric and dictionary reading, both for what that note sings and for how
+  its syllables are handed to following `+` / `-` notes. Studio treats the
+  explicit string as the source of truth; the engine currently re-derives from
+  the lyric in at least some of those cases.
+
+- **Multi-mora Japanese notes.** Studio phonemizes a single note whose lyric is
+  a multi-mora kana sequence (for example `あん` -> `a N`); the engine does
+  not, so the note comes out unphonemized. The Japanese kana lookup maps one
+  mora per note and needs to accept multi-mora lyrics.
+
+- **Connected phrases longer than 30 seconds abort.** The engine inherits
+  OpenSV's `maximumPhraseSeconds` cap and refuses a phrase (a run of notes
+  with no rest of at least 0.2 s) longer than 30 s, so a real project with a
+  33 s legato passage fails to render. Studio has no user-visible cap of that
+  kind. Window such phrases internally instead of erroring; the exact Studio
+  windowing is not observable, so pick a documented, deterministic cut.
 
 The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
 
