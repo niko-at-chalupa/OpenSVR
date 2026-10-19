@@ -12,6 +12,9 @@
 //! exactly like `opensvr render`; pass [`Backend::Neural`] to make a missing
 //! voice an error instead.
 //!
+//! For diagnostics, [`PhonemeResolver`] answers "what will this note sing?"
+//! without rendering, which is what `opensvr info --phonemes` reports.
+//!
 //! ```
 //! use opensvr::{CancelToken, Options, encode_wav, render_svp};
 //!
@@ -34,6 +37,7 @@
 //! ```
 
 mod options;
+mod phonemes;
 
 use std::io;
 use std::path::{Path, PathBuf, absolute};
@@ -42,9 +46,11 @@ pub use opensvr_audio::{
     MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, NeuralBackend, NoProgress, ProgressSink, RenderError,
     Renderer, StereoBuffer, ToneBackend, VoiceBackend, WavError,
 };
-pub use opensvr_core::{CancelToken, Language, Project, VoiceSettings};
+pub use opensvr_core::{CancelToken, Language, Note, NoteGroup, Project, Track, VoiceSettings};
+pub use opensvr_g2p::{G2pError, Resolved};
 pub use opensvr_svp::SvpError;
 pub use options::{Backend, DEFAULT_SAMPLE_RATE, Options};
+pub use phonemes::{NotePhonemes, PhonemeError, PhonemeResolver};
 
 use thiserror::Error;
 

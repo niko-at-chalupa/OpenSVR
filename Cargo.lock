@@ -422,6 +422,7 @@ dependencies = [
  "hound",
  "opensvr-audio",
  "opensvr-core",
+ "opensvr-g2p",
  "opensvr-svp",
  "thiserror",
 ]
