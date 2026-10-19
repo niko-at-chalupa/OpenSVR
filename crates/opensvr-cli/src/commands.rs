@@ -384,9 +384,9 @@ fn print_info(project: &Project, out: &mut impl io::Write, show_phonemes: bool) 
     // Voice databases are opened lazily and cached per path: several tracks
     // often share one singer, and a 40 MiB voice should not be re-read.
     let mut voices: Vec<(PathBuf, Option<String>)> = Vec::new();
-    // Dictionaries are likewise cached per directory and language.
-    let mut dictionaries: Vec<(PathBuf, opensvr_core::Language, opensvr_g2p::DictionarySet)> =
-        Vec::new();
+    // Dictionaries are likewise cached per directory and language: one
+    // resolver per `info` run shares them across tracks.
+    let mut resolver = opensvr::PhonemeResolver::new();
     for (index, track) in project.tracks.iter().enumerate() {
         let voice = &track.voice;
         writeln!(
@@ -424,7 +424,7 @@ fn print_info(project: &Project, out: &mut impl io::Write, show_phonemes: bool) 
             }
         }
         if show_phonemes {
-            print_phonemes(track, out, &mut dictionaries)?;
+            print_phonemes(track, out, &mut resolver)?;
         }
     }
     Ok(())
@@ -437,48 +437,35 @@ fn print_info(project: &Project, out: &mut impl io::Write, show_phonemes: bool) 
 fn print_phonemes(
     track: &opensvr_core::Track,
     out: &mut impl io::Write,
-    dictionaries: &mut Vec<(PathBuf, opensvr_core::Language, opensvr_g2p::DictionarySet)>,
+    resolver: &mut opensvr::PhonemeResolver,
 ) -> io::Result<()> {
-    let notes = &track.main_group.notes;
-    if notes.is_empty() {
+    // An empty track prints no header, so the check stays here rather than
+    // in the resolver, which simply returns no entries.
+    if track.main_group.notes.is_empty() {
         return Ok(());
     }
-    let Some(dir) = track.voice.dictionary.clone() else {
-        writeln!(out, "      phonemes: [no dictionary directory]")?;
-        return Ok(());
-    };
-    let language = track.voice.language;
-    let cached = dictionaries
-        .iter()
-        .find(|(known_dir, known_language, _)| known_dir == &dir && *known_language == language)
-        .map(|(_, _, set)| set.clone());
-    let set = match cached {
-        Some(set) => set,
-        None => match opensvr_g2p::load_dictionaries(&dir, language) {
-            Ok(set) => {
-                dictionaries.push((dir.clone(), language, set.clone()));
-                set
+    match resolver.resolve_track(track) {
+        Ok(entries) => {
+            writeln!(out, "      phonemes:")?;
+            for entry in entries {
+                match &entry.result {
+                    Ok(outcome) => writeln!(
+                        out,
+                        "        {:?} -> {} ({})",
+                        entry.note.lyrics,
+                        outcome.phonemes.join(" "),
+                        outcome.language
+                    )?,
+                    Err(error) => {
+                        writeln!(out, "        {:?} -> [ERROR] {error}", entry.note.lyrics)?;
+                    }
+                }
             }
-            Err(error) => {
-                writeln!(out, "      phonemes: [UNREADABLE: {error}]")?;
-                return Ok(());
-            }
-        },
-    };
-    let mut resolver = opensvr_g2p::NoteResolver::new(language);
-    writeln!(out, "      phonemes:")?;
-    for (index, note) in notes.iter().enumerate() {
-        let next_is_legato = notes.get(index + 1).is_some_and(|next| next.lyrics == "-");
-        match resolver.push(&note.lyrics, &note.phonemes, &set, next_is_legato) {
-            Ok(outcome) => writeln!(
-                out,
-                "        {:?} -> {} ({})",
-                note.lyrics,
-                outcome.phonemes.join(" "),
-                outcome.language
-            )?,
-            Err(error) => writeln!(out, "        {:?} -> [ERROR] {error}", note.lyrics)?,
         }
+        Err(opensvr::PhonemeError::NoDictionary) => {
+            writeln!(out, "      phonemes: [no dictionary directory]")?;
+        }
+        Err(error) => writeln!(out, "      phonemes: [UNREADABLE: {error}]")?,
     }
     Ok(())
 }

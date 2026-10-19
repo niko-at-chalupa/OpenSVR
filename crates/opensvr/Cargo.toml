@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 opensvr-core.workspace = true
 opensvr-svp.workspace = true
+opensvr-g2p.workspace = true
 opensvr-audio.workspace = true
 thiserror.workspace = true
 
