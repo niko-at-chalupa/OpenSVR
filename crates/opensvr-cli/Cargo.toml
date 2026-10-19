@@ -17,7 +17,6 @@ opensvr-svp.workspace = true
 opensvr-midi.workspace = true
 opensvr-audio.workspace = true
 opensvr-nofs.workspace = true
-opensvr-g2p.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
