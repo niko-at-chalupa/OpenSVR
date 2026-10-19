@@ -809,7 +809,7 @@ mod tests {
             &embeddings.pitch_speaker,
             &embeddings.duration_voice,
         ] {
-            assert!(!vector.is_empty());
+            assert_ne!(vector.len(), 0);
             assert!(vector.iter().all(|value| value.is_finite()));
         }
         assert_eq!(embeddings.acoustic_speaker.len(), 32);
@@ -819,7 +819,7 @@ mod tests {
         assert!(!embeddings.vocal_modes.is_empty());
         // No `rap_languages` field: the support list gates rap notes.
         assert_eq!(rap_languages(&database), database.metadata().languages,);
-        assert!(!rap_languages(&database).is_empty());
+        assert_ne!(rap_languages(&database).len(), 0);
     }
 
     // --- Minimal v2 blob builders for the interval-scan error paths ---

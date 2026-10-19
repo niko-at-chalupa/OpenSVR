@@ -143,8 +143,8 @@ fn decode(
     for channel in 0..channels {
         let mut word = 0u32;
         for byte in 0..4 {
-            let high = nibble(bytes[channel * 8 + byte * 2]).ok_or_else(&fail)?;
-            let low = nibble(bytes[channel * 8 + byte * 2 + 1]).ok_or_else(&fail)?;
+            let high = nibble(bytes[channel * 8 + byte * 2]).ok_or_else(fail)?;
+            let low = nibble(bytes[channel * 8 + byte * 2 + 1]).ok_or_else(fail)?;
             word |= (high << 4 | low) << (byte * 8);
         }
         let value = f32::from_bits(word);
@@ -249,8 +249,8 @@ mod tests {
         assert_eq!(embeddings.acoustic_style, vec![1.0; 32]);
         assert_eq!(embeddings.vocal_modes.len(), 1);
         assert_eq!(embeddings.vocal_modes["Joyful"], vec![1.0; 32]);
-        assert!(embeddings.pitch_speaker.is_empty());
-        assert!(embeddings.duration_voice.is_empty());
+        assert_eq!(embeddings.pitch_speaker.len(), 0);
+        assert_eq!(embeddings.duration_voice.len(), 0);
 
         // Empty names and `(...)` names are skipped; `extra` is ignored.
         let document = json!({

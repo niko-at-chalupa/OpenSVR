@@ -856,10 +856,11 @@ mod tests {
             absolute_document_styles(&[10.0, 20.0], &modes).unwrap(),
             vec![vec![10.0, 22.0], vec![11.0, 20.0]]
         );
-        assert!(
+        assert_eq!(
             absolute_document_styles(&[10.0, 20.0], &BTreeMap::new())
                 .unwrap()
-                .is_empty()
+                .len(),
+            0
         );
         // Wrong-dimension offsets are errors, never panics.
         let bad: BTreeMap<String, Vec<f32>> =
