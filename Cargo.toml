@@ -10,6 +10,7 @@ description = "A minimal Rust port of the OpenSV singing-voice synthesis tools"
 publish = false
 
 [workspace.dependencies]
+opensvr = { path = "crates/opensvr" }
 opensvr-core = { path = "crates/opensvr-core" }
 opensvr-svp = { path = "crates/opensvr-svp" }
 opensvr-midi = { path = "crates/opensvr-midi" }
