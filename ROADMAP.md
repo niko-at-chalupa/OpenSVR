@@ -89,7 +89,10 @@ completeness.
     a per-letter guess in which a final `y` is a consonant, so `evry` resolves
     to one syllable (`eh v r y`) where Studio resolves two. The hardcoded
     words disagree with Studio as well (`hello` is stored as `hh ah l ow`).
-    The wrong syllable count is what then makes a following `+` fail.
+    For a word the tables do know the damage is the symbol alone: `hello`
+    splits `hh ah` + `l ow` where Studio splits `hh ax` + `l ow`, so a
+    following `+` still lands on the right syllable. The wrong syllable count
+    is what then makes a following `+` fail.
   - *Japanese.* `lookup` romanizes the lyric character by character and then
     looks the concatenation up as one key, while the kana tables hold one mora
     per entry. A multi-mora lyric such as `あん` (`a N` in Studio) is not a
@@ -103,22 +106,36 @@ completeness.
 
   This is not one patch. It is a per-language front end that accepts the text
   Studio accepts, emits Studio's symbol inventory, and never turns an unknown
-  input into either an abort or a wrong guess.
+  input into either an abort or a wrong guess. The continuation bookkeeping is
+  part of the same work: the resolver only fills its pending-syllable list
+  when the previous note resolved to English, so a multi-syllable lyric in any
+  other language could not be handed to a following `+` even once the front
+  end can read it.
 
-- **A `+` or `-` with no syllable left should be silence, not an error.** When
-  a continuation cannot advance because the previous word's syllables are
-  used up, Studio still renders the note as `sil`; the engine aborts the whole
-  render with "'+' advances to the next syllable, but no remaining syllable is
-  available". The same class covers a `-` with nothing before it ("A legato
-  lyric (-) must immediately follow a note with a resolved syllable"). Even
-  after G2P parity these must degrade to a silent note, never a hard failure.
+- **A `+` or `-` that cannot advance is silence, not an error.** Studio
+  renders the continuation as silence and leaves the previous note's phonemes
+  where they are; the engine aborts the whole render with "'+' advances to the
+  next syllable, but no remaining syllable is available" (or, for `-`, "A
+  legato lyric (-) must immediately follow a note with a resolved syllable").
+  Measured on a probe project that follows every word with a `+` or `-`,
+  Studio sings `cat` then `+` as `k ae t` and silence, `cat` with explicit
+  `k ae t s` then `+` as `k ae t s` and silence, `smile` then `-` as `s m ay l`
+  and silence, and `cat` with explicit `k ae t p` then `-` as `k ae t p` and
+  silence; a leading `+` and `-` with nothing before them sing nothing at all.
+  Even after G2P parity these must degrade to a silent note, never a hard
+  failure.
 
-- **Explicit phonemes should drive the syllable split.** When a note's
-  `phonemes` string is set (hand-edited in Studio), it must take priority over
-  the lyric and dictionary reading, both for what that note sings and for how
-  its syllables are handed to following `+` / `-` notes. Studio treats the
-  explicit string as the source of truth; the engine currently re-derives from
-  the lyric in at least some of those cases.
+- **`-` must only stretch the previous note's last phoneme.** The same probe
+  exposes the other half of the `-` divergence: Studio never gives a `-` a
+  phoneme of its own, it lets the previous syllable ring into the note. The
+  engine instead re-sings the previous note's last vowel, and moves the
+  previous note's trailing coda onto the `-` (`smile` resolves to `s m ay` and
+  its `-` to `ay l`, so the stream gains a repeated vowel; a `cat` with
+  explicit `k ae t p` resolves its `-` to `ae`). Explicit `phonemes` are not
+  affected: they already take priority on their own note and are not re-split,
+  which is what Studio does — a `hello` whose `phonemes` are `hh eh l ow`
+  followed by `+` sings `hh eh l ow` and then the lyric's next syllable
+  `l ow` in both.
 
 - **`evenSyllableDuration` is parsed but never read.** `opensvr-svp`
   round-trips the per-note attribute; nothing in `opensvr-voice` or
