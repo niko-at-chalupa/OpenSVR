@@ -86,6 +86,41 @@ fn render_writes_a_wav_file() {
 }
 
 #[test]
+fn the_cli_and_the_library_render_the_same_samples() {
+    // The CLI is now a shell around `opensvr`, so the two entry points must
+    // agree byte for byte. The example has no voice on disk, which keeps this
+    // runnable without proprietary data.
+    let path = scratch("facade.wav");
+    let output = opensvr(&[
+        "render",
+        EXAMPLE,
+        "-o",
+        path.to_str().unwrap(),
+        "--rate",
+        "22050",
+        "-q",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let from_cli = fs::read(&path).unwrap();
+    fs::remove_file(path).unwrap();
+
+    let svp = fs::read_to_string(EXAMPLE).unwrap();
+    let options = opensvr::Options {
+        sample_rate: 22_050,
+        ..opensvr::Options::default()
+    };
+    let cancel = opensvr::CancelToken::new();
+    let audio = opensvr::render_svp(&svp, &options, &cancel).unwrap();
+    let from_library = opensvr::encode_wav(&audio, options.sample_rate, &cancel).unwrap();
+    assert_eq!(from_cli, from_library);
+}
+
+#[test]
 fn render_sings_when_a_voice_is_configured() {
     let Some(voice) = std::env::var("OPENSVR_TEST_VOICE").ok() else {
         return;
