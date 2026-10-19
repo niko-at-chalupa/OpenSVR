@@ -2,3 +2,6 @@
 # Agent-directed working files (next-steps generations, local voices/goldens/dump tools): gitignored, not project docs.
 do-not-distribute/
 AGENTS.local.md
+
+# macOS
+.DS_Store
