@@ -44,6 +44,7 @@ determinism principle below.
 | Mixer, pan law, solo/mute | `ProjectRenderer::mixPhrase` | `opensvr-audio::render` | done |
 | WAV output | `audio/WaveFile.cpp` | `opensvr-audio::wav` | done |
 | CLI | `cli/Main.cpp` | `opensvr-cli` | done, redesigned on its own terms (subcommands, global flags, default outputs, `-` for stdout) |
+| Library facade | — | `opensvr` | done (one-call render from a file or string, unified errors, auto backend) |
 | Voice synthesis | `synthesis/*` | `opensvr-voice` (timing, pitch, acoustic, vocoder, `VoiceSynthesizer`), `opensvr-nofs`, `opensvr-dnni` | done (neural `NeuralBackend` sings voiced tracks; `ToneBackend` stays as the voiceless fallback) |
 | Flat voicebank (JSON voice document) | — (a format the engine reads, not a ported one) | `opensvr-nofs` + `opensvr-voice` | done |
 | Pronunciation (G2P) | `PhoneSet.*`, `PhonemeDictionary.*`, `resolvePhonemes` | `opensvr-g2p` | done, ported parity (dictionary + resolution + `info --phonemes`; timing types live here, the duration model in `opensvr-voice`; Studio parity gaps under "Remaining gaps") |
@@ -292,6 +293,12 @@ pieces still unported; they land whenever a caller wants the numbers. An
 editor built on these crates would be a different project, not this one.
 
 ## What comes next
+
+The `opensvr` facade is not one of these gaps: it is the embedding seam the
+goals call for, and it landed first so each gap below is exercised through the
+public path rather than only through the CLI. It deliberately models nothing
+the gaps will change — a dictionary is still just a directory path, and notes
+still have no IDs.
 
 The remaining gaps, in the order to take them, one branch each:
 
