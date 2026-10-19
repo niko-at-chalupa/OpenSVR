@@ -132,13 +132,14 @@ completeness.
   before a single note resolves. Read the installed form too (or auto-detect
   it) instead of making the user hunt for text copies.
 
-- **Phrase caps abort long passages.** The engine inherits OpenSV's
-  `maximumPhraseSeconds` (30 s) and `maximumPhrasePhonemes` (4096): a phrase
-  (a run of notes with no rest of at least 0.2 s) that exceeds either is
-  refused, so a real project with a 33 s legato passage fails to render.
-  Studio has no user-visible cap of that kind. Window such phrases internally
-  instead of erroring; the exact Studio windowing is not observable, so pick a
-  documented, deterministic cut.
+- **Phrase splitting and its caps are engine bookkeeping, not Studio
+  behaviour.** The engine inherits OpenSV's rest-based splitting (a phrase is
+  a run of notes with no rest of at least 0.2 s) plus two hard caps,
+  `maximumPhraseSeconds` (30 s) and `maximumPhrasePhonemes` (4096); a phrase
+  over either is refused, so a real project with a 33 s legato passage fails
+  to render. Studio never cuts a connected passage at rests, so a passage
+  longer than either cap must render, the caps must go, and any splitting kept
+  for incremental synthesis must stay invisible in the output.
 
 The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
 
