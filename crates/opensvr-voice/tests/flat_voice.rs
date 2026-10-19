@@ -30,7 +30,7 @@ fn render_with_mode(synthesizer: &VoiceSynthesizer, mode: Option<usize>) -> Vec<
     synthesizer
         .predict(std::slice::from_ref(&syllable), &mut durations)
         .expect("timing must predict");
-    assert!(!durations.is_empty());
+    assert_ne!(durations.len(), 0);
 
     let note = PitchNote {
         syllable,
@@ -78,7 +78,7 @@ fn render_with_mode(synthesizer: &VoiceSynthesizer, mode: Option<usize>) -> Vec<
             &weights,
         )
         .expect("render must run");
-    assert!(!output.samples.is_empty());
+    assert_ne!(output.samples.len(), 0);
     assert!(output.samples.iter().all(|value| value.is_finite()));
     output.samples
 }
@@ -92,7 +92,7 @@ fn flat_voice_sings_with_and_without_vocal_modes() {
     synthesizer
         .load(Path::new(&path))
         .expect("Flat voice must load");
-    assert!(!synthesizer.vocal_mode_names().is_empty());
+    assert_ne!(synthesizer.vocal_mode_names().len(), 0);
     assert_eq!(synthesizer.default_style().len(), 32);
 
     let plain = render_with_mode(&synthesizer, None);
