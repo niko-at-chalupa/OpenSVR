@@ -11,6 +11,7 @@ name = "opensvr"
 path = "src/main.rs"
 
 [dependencies]
+opensvr.workspace = true
 opensvr-core.workspace = true
 opensvr-svp.workspace = true
 opensvr-midi.workspace = true

@@ -6,7 +6,7 @@ mod commands;
 use std::process::ExitCode;
 
 use clap::Parser;
-use opensvr_audio::CancelToken;
+use opensvr::CancelToken;
 
 use crate::cli::Cli;
 

@@ -4,12 +4,12 @@ use std::io::Write as _;
 use std::{
     ffi::OsStr,
     fmt, fs, io,
-    path::{self, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
-use opensvr_audio::{
-    CancelToken, NeuralBackend, NoProgress, ProgressSink, RenderError, Renderer, ToneBackend,
-    WavError, encode_wav, write_wav,
+use opensvr::{
+    Backend, CancelToken, Error as EngineError, NoProgress, Options, ProgressSink, RenderError,
+    StereoBuffer, WavError,
 };
 use opensvr_core::Project;
 use opensvr_midi::MidiError;
@@ -23,11 +23,9 @@ use crate::cli::{
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error(transparent)]
+    Engine(#[from] EngineError),
+    #[error(transparent)]
     Load(#[from] SvpError),
-    #[error(transparent)]
-    Render(#[from] RenderError),
-    #[error(transparent)]
-    Wav(#[from] WavError),
     #[error("MIDI export failed: {0}")]
     Midi(#[from] MidiError),
     #[error("MIDI import failed: {0}")]
@@ -56,8 +54,10 @@ impl CliError {
     /// Process exit status: 2 for load errors, 130 for cancellation, 3 for everything else.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Load(_) | Self::MidiLoad(_) => 2,
-            Self::Render(RenderError::Cancelled) | Self::Wav(WavError::Cancelled) => 130,
+            Self::Load(_) | Self::MidiLoad(_) | Self::Engine(EngineError::Load(_)) => 2,
+            Self::Engine(
+                EngineError::Render(RenderError::Cancelled) | EngineError::Wav(WavError::Cancelled),
+            ) => 130,
             _ => 3,
         }
     }
@@ -120,7 +120,8 @@ pub fn run(global: GlobalArgs, command: Command, cancel: &CancelToken) -> Result
 }
 
 fn info(args: &InfoArgs) -> Result<(), CliError> {
-    let project = load(&args.project, &args.overrides)?;
+    let settings = options(&args.overrides);
+    let project = opensvr::load(&args.project, &settings)?;
     print_info(&project, &mut io::stdout().lock(), args.phonemes)?;
     Ok(())
 }
@@ -145,7 +146,9 @@ impl ProgressSink for BarProgress {
 }
 
 fn render(global: GlobalArgs, args: &RenderArgs, cancel: &CancelToken) -> Result<(), CliError> {
-    let project = load(&args.project, &args.overrides)?;
+    let mut options = options(&args.overrides);
+    options.sample_rate = args.rate;
+    let project = opensvr::load(&args.project, &options)?;
     let output = destination(args.output.as_deref(), args.project.with_extension("wav"));
     if !global.quiet {
         eprintln!(
@@ -155,23 +158,19 @@ fn render(global: GlobalArgs, args: &RenderArgs, cancel: &CancelToken) -> Result
             args.rate
         );
     }
-    // Backend selection: any voice database that resolves to a real file
-    // renders the whole project through the neural voice, matching C++
+    // Backend selection lives in the library (`Backend::Auto`), so an embed
+    // and the CLI cannot disagree: any voice database that resolves to a real
+    // file renders the whole project through the neural voice, matching C++
     // `ProjectRenderer`, which fails audible tracks without one ("Select a
-    // voice.nofs database before playing singing notes."). Tracks without
-    // notes render silence under either backend, so mixed projects only fail
-    // when a voiceless track actually has notes to sing. A configured but
+    // voice.nofs database before playing singing notes."). A configured but
     // missing database counts as voiceless: the placeholder keeps those
     // renders (and CI without proprietary data) working, warning included,
     // while `info` flags the path as [MISSING] for diagnosis.
-    let voiced = project
-        .tracks
-        .iter()
-        .any(|track| track.voice.database.as_deref().is_some_and(Path::is_file));
+    let backend = options.backend.resolve(&project);
     if global.verbose {
         eprintln!(
             "opensvr: backend: {}",
-            if voiced {
+            if backend == Backend::Neural {
                 "neural voice"
             } else {
                 "placeholder tones"
@@ -190,22 +189,13 @@ fn render(global: GlobalArgs, args: &RenderArgs, cancel: &CancelToken) -> Result
     };
     let sink = bar.clone().map(|bar| BarProgress { bar });
     let progress: &dyn ProgressSink = sink.as_ref().map_or(&NoProgress, |sink| sink);
-    let result = if voiced {
-        let models = args
-            .overrides
-            .models_dir
-            .clone()
-            .or_else(|| env_path("OPENSVR_MODELS_DIR"));
-        Renderer::new(NeuralBackend::with_models_dir(models))
-            .render_with_progress(&project, args.rate, cancel, progress)
-    } else {
+    if backend == Backend::Tones {
         // Not progress output, so `--quiet` does not hide it: the result is not singing.
         eprintln!(
             "opensvr: note: no voice database found; notes are rendered as placeholder tones"
         );
-        Renderer::new(ToneBackend::default())
-            .render_with_progress(&project, args.rate, cancel, progress)
-    };
+    }
+    let result = opensvr::render_project_with_progress(&project, &options, cancel, progress);
     let audio = match result {
         Ok(audio) => {
             if let Some(bar) = &bar {
@@ -231,18 +221,18 @@ fn render(global: GlobalArgs, args: &RenderArgs, cancel: &CancelToken) -> Result
 /// Writes the rendered audio to a file (atomically) or to stdout.
 fn write_output(
     destination: &Destination,
-    audio: &opensvr_audio::StereoBuffer,
+    audio: &StereoBuffer,
     sample_rate: u32,
     cancel: &CancelToken,
 ) -> Result<(), CliError> {
     match destination {
         Destination::File(path) => {
-            write_wav(path, audio, sample_rate, cancel)?;
+            opensvr::write_wav(path, audio, sample_rate, cancel)?;
         }
         Destination::Stdout => {
             io::stdout()
                 .lock()
-                .write_all(&encode_wav(audio, sample_rate, cancel)?)?;
+                .write_all(&opensvr::encode_wav(audio, sample_rate, cancel)?)?;
         }
     }
     Ok(())
@@ -350,34 +340,30 @@ fn format_of(path: &Path) -> Option<Format> {
     }
 }
 
-/// Loads a project and applies the command-line overrides to every track.
+/// Turns flags and environment into the facade's render settings.
 ///
 /// Unset `--voice`/`--dictionary` flags fall back to their environment
 /// variables (non-empty only), so flag-beats-env-beats-file precedence holds
-/// everywhere. `OPENSVR_DICT` is kept as a legacy alias.
-fn load(path: &Path, overrides: &Overrides) -> Result<Project, CliError> {
-    let mut project = opensvr_svp::load(path)?;
-    let voice = overrides
-        .voice
-        .clone()
-        .or_else(|| env_path("OPENSVR_VOICE"));
-    let dictionary = overrides
-        .dictionary
-        .clone()
-        .or_else(|| env_path("OPENSVR_DICTIONARY").or_else(|| env_path("OPENSVR_DICT")));
-    let absolute = |path: &Path| path::absolute(path);
-    for track in &mut project.tracks {
-        if let Some(voice) = &voice {
-            track.voice.database = Some(absolute(voice)?);
-        }
-        if let Some(dictionary) = &dictionary {
-            track.voice.dictionary = Some(absolute(dictionary)?);
-        }
-        if let Some(language) = overrides.language {
-            track.voice.language = language.into();
-        }
+/// everywhere. `OPENSVR_DICT` is kept as a legacy alias. Everything after
+/// this point — absolutizing paths, applying them to every track, choosing a
+/// backend — is the library's job.
+fn options(overrides: &Overrides) -> Options {
+    Options {
+        voice: overrides
+            .voice
+            .clone()
+            .or_else(|| env_path("OPENSVR_VOICE")),
+        dictionary: overrides
+            .dictionary
+            .clone()
+            .or_else(|| env_path("OPENSVR_DICTIONARY").or_else(|| env_path("OPENSVR_DICT"))),
+        models_dir: overrides
+            .models_dir
+            .clone()
+            .or_else(|| env_path("OPENSVR_MODELS_DIR")),
+        language: overrides.language.map(Into::into),
+        ..Options::default()
     }
-    Ok(project)
 }
 
 /// Reads an optional path override from the environment: unset or empty
@@ -697,9 +683,22 @@ mod tests {
 
     #[test]
     fn exit_codes_follow_the_documented_contract() {
-        assert_eq!(CliError::Render(RenderError::Cancelled).exit_code(), 130);
-        assert_eq!(CliError::Wav(WavError::Cancelled).exit_code(), 130);
-        assert_eq!(CliError::Render(RenderError::TooLong).exit_code(), 3);
+        assert_eq!(
+            CliError::Engine(EngineError::Render(RenderError::Cancelled)).exit_code(),
+            130
+        );
+        assert_eq!(
+            CliError::Engine(EngineError::Wav(WavError::Cancelled)).exit_code(),
+            130
+        );
+        assert_eq!(
+            CliError::Engine(EngineError::Render(RenderError::TooLong)).exit_code(),
+            3
+        );
+        assert_eq!(
+            CliError::Engine(EngineError::Load(SvpError::UnsupportedVersion(1))).exit_code(),
+            2
+        );
         assert_eq!(
             CliError::Load(SvpError::UnsupportedVersion(1)).exit_code(),
             2

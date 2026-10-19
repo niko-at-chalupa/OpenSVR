@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use opensvr_audio::{MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
+use opensvr::{MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use opensvr_core::Language;
 
 const AFTER_HELP: &str = "\

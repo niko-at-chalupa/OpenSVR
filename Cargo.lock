@@ -449,6 +449,7 @@ dependencies = [
  "ctrlc",
  "hound",
  "indicatif",
+ "opensvr",
  "opensvr-audio",
  "opensvr-core",
  "opensvr-g2p",
