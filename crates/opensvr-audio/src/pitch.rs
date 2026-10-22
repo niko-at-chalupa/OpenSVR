@@ -299,6 +299,10 @@ pub fn build_vocal_mode_weights(
             if !settings.vocal_mode_preset.is_empty()
                 && settings.vocal_mode_preset != "Default"
                 && settings.vocal_mode_preset != "default"
+                // Studio's sentinel for "the sliders were edited": the preset
+                // names no style, and the amounts live in `vocalModeParams`,
+                // which apply below. Any other unknown name is still an error.
+                && settings.vocal_mode_preset != "Customized"
             {
                 let Some(index) = mode_index(&settings.vocal_mode_preset) else {
                     return Err(BackendError(format!(
@@ -892,6 +896,46 @@ mod tests {
         for frame in weights.chunks_exact(2) {
             assert_eq!(frame, [0.25, 1.0]);
         }
+    }
+
+    #[test]
+    fn customized_preset_uses_the_params_alone() {
+        // Studio writes `Customized` when the vocal-mode sliders were edited;
+        // it names no style, and the amounts live in `vocalModeParams`.
+        let reference = GroupReference {
+            vocal_mode_inherited: false,
+            vocal_mode_preset: "Customized".to_owned(),
+            vocal_mode_params: [("Cute".to_owned(), 0.5)].into_iter().collect(),
+            ..GroupReference::default()
+        };
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &GROUP, &reference, &REFERENCE, &TEMPO,
+        )];
+        let weights = build_vocal_mode_weights(
+            &notes,
+            0.0,
+            0.005,
+            10,
+            &["Cute".to_owned(), "Soft".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(weights.len(), 20);
+        for frame in weights.chunks_exact(2) {
+            assert_eq!(frame, [0.5, 0.0]);
+        }
+        // With no params it is simply "no named preset": no lookup, no error.
+        let reference = GroupReference {
+            vocal_mode_inherited: false,
+            vocal_mode_preset: "Customized".to_owned(),
+            ..GroupReference::default()
+        };
+        let notes = [timed_note(
+            0.0, 0.5, 60, &SCORE, &GROUP, &reference, &REFERENCE, &TEMPO,
+        )];
+        assert_eq!(
+            build_vocal_mode_weights(&notes, 0.0, 0.005, 4, &["Cute".to_owned()]).unwrap(),
+            vec![0.0; 4]
+        );
     }
 
     #[test]
