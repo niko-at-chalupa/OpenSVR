@@ -288,6 +288,49 @@ mod tests {
     }
 
     #[test]
+    fn language_override_wins_over_a_project_that_names_a_language() {
+        // The project itself says English through its main reference's
+        // `database` block (Studio's form: no `svVoice`).
+        let svp = r#"{
+            "version": 153,
+            "time": {
+                "tempo": [{ "position": 0, "bpm": 120.0 }],
+                "meter": [{ "index": 0, "numerator": 4, "denominator": 4 }]
+            },
+            "library": [],
+            "tracks": [{
+                "name": "Lead",
+                "mainGroup": { "uuid": "main", "name": "main", "notes": [] },
+                "mainRef": {
+                    "groupID": "main",
+                    "blickOffset": 0,
+                    "pitchOffset": 0,
+                    "database": {
+                        "name": "voice",
+                        "language": "english",
+                        "phoneset": "arpabet",
+                        "languageOverride": "",
+                        "phonesetOverride": "",
+                        "backendType": "",
+                        "version": "-2"
+                    }
+                },
+                "groups": [],
+                "mixer": { "gainDecibel": 0.0, "pan": 0.0 }
+            }]
+        }"#;
+        let mut project = parse(svp, "song", None).unwrap();
+        assert_eq!(project.tracks[0].voice.language, Language::English);
+
+        let options = Options {
+            language: Some(Language::Japanese),
+            ..Options::default()
+        };
+        prepare(&mut project, &options).unwrap();
+        assert_eq!(project.tracks[0].voice.language, Language::Japanese);
+    }
+
+    #[test]
     fn auto_backend_follows_the_command_lines_rule() {
         let mut project = project_with_two_tracks();
         assert_eq!(Backend::Auto.resolve(&project), Backend::Tones);
