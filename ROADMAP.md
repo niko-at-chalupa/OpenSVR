@@ -257,14 +257,47 @@ has been checked so far, not a claim of completeness.
   7. *Ship the converter and the generated first-party file together* where
      the source license allows, and the converter alone where it does not.
 
+- **The track's language and phoneset come from the wrong place.** Studio
+  records them in each track reference's `database` block (`language`,
+  `phoneset`, and `languageOverride`/`phonesetOverride` when the track deviates
+  from the voice), and that block is what the track's Voice panel shows. The
+  engine builds `VoiceSettings` from `svVoice` alone and keeps `mainRef.database`
+  as untyped `Extra`, and Studio's own saved projects mostly have no `svVoice`,
+  so the track falls back to Japanese regardless of what the panel said. A
+  Japanese voice on an English track then aborts on the notes that carry
+  explicit arpabet ("unknown phoneme 'l' for japanese-romaji-phones"), and the
+  same project renders when `--language english` is passed instead. Read the
+  override when it is non-empty, else the database's language and phoneset,
+  else the voice's own language. This is a loader gap, distinct from the G2P
+  parity work above: the text is already resolving to the right phonemes, and
+  only the phone inventory used to validate them is wrong.
+
+- **Studio's `Customized` vocal-mode preset is treated as a style name.**
+  When the user edits a voice's mode sliders, Studio writes
+  `vocalModePreset: "Customized"` and the amounts in `vocalModeParams`, naming
+  the voice's own modes (`Cute: 150`, `Ballade: 95, Soft: 90, ...`). No voice
+  database exposes a style called `Customized`, so the engine's style-vector
+  lookup aborts with "Vocal-mode preset 'Customized' is not a style exposed by
+  the selected voice", and a project whose sliders were touched cannot render
+  at all. Treat `Customized` as "no named preset, apply `vocalModeParams`" and
+  keep the error for a genuinely unknown named preset. The amount scale is a
+  second question in the same field: Studio's files carry values up to at
+  least 150 and the ported code clamps to `0..1`, so if 100 is the nominal
+  amount and 150 a boost, the weights themselves need their own observation
+  before the mode fidelity can be called equal.
+
 - **Phrase splitting and its caps are engine bookkeeping, not Studio
   behaviour.** The engine inherits OpenSV's rest-based splitting (a phrase is
   a run of notes with no rest of at least 0.2 s) plus two hard caps,
   `maximumPhraseSeconds` (30 s) and `maximumPhrasePhonemes` (4096); a phrase
-  over either is refused, so a real project with a 33 s legato passage fails
-  to render. Studio never cuts a connected passage at rests, so a passage
-  longer than either cap must render, the caps must go, and any splitting kept
-  for incremental synthesis must stay invisible in the output.
+  over either is refused, so a real project with a 33 s legato passage or a
+  36.6 s unbroken rap run fails to render. Studio never cuts a connected
+  passage at rests, so a passage longer than either cap must render, the caps
+  must go, and any splitting kept for incremental synthesis must stay
+  invisible in the output. One wrinkle for the workaround the error suggests:
+  a rest of exactly 0.2 s does not reliably split, because the comparison is
+  made on blick-converted seconds and can land just under the threshold, so
+  the advice needs a margin rather than the exact figure.
 
 The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
 
