@@ -19,8 +19,8 @@ use std::{
 
 use opensvr_core::{
     AutomationPoint, Blick, Curve, Extra, GroupReference, Interpolation, Language, MAX_FILE_BLICK,
-    Mixer, Note, NoteGroup, PitchAttribute, PitchAttributes, Project, TempoChange, TempoMap,
-    TimeSignature, Track, VocalModeSetting, VoiceSettings,
+    Mixer, Note, NoteGroup, PitchAttribute, PitchAttributes, Project, ReferenceDatabase,
+    TempoChange, TempoMap, TimeSignature, Track, VocalModeSetting, VoiceSettings,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -289,6 +289,12 @@ struct RawReference {
     /// error like the C++ block; absent/null means defaults.
     #[serde(default)]
     voice: Option<Value>,
+    /// The Voice-panel block (`database`: voice name, language and phone set).
+    /// Kept as [`Value`] so a non-object or non-string field is the single
+    /// `Invalid` error [`read_database`] reports, rather than a JSON error;
+    /// absent/null means defaults.
+    #[serde(default)]
+    database: Option<Value>,
 }
 
 /// Mirrors OpenSV's `readInteger` in `src/core/ProjectFile.cpp`: integer or
@@ -649,6 +655,76 @@ fn read_voice_overrides(raw: Option<&Value>) -> Result<(bool, String, BTreeMap<S
     Ok((inherited, preset, params))
 }
 
+/// Resolves the track's language from its main reference's `database` block:
+/// a non-empty `languageOverride` wins over `language`, both empty fall back
+/// to [`Language::default`]. Empty values mean "unset" — that is what Studio
+/// writes for references that do not override the voice. A non-empty value
+/// that does not name a language is `Invalid`, naming the field like the
+/// `svVoice` path does.
+fn database_language(database: &ReferenceDatabase) -> Result<Language> {
+    let (field, name) = if !database.language_override.is_empty() {
+        ("languageOverride", &database.language_override)
+    } else if !database.language.is_empty() {
+        ("language", &database.language)
+    } else {
+        return Ok(Language::default());
+    };
+    name.parse()
+        .or_else(|error| invalid(format!("mainRef.database.{field}: {error}")))
+}
+
+/// Reads the `database` block of a group reference: the six strings Studio
+/// fills from the track's Voice panel, plus every unknown key for the round
+/// trip. The whole block absent (or JSON null, which JUCE parses to void)
+/// means defaults; otherwise it must be an object and each present string
+/// field must be a string, else one `Invalid` error naming the field — never a
+/// JSON error. `version` is not interpreted but stays in `extra`, so it is
+/// written back exactly as read and defaults to `"-2"` only when absent.
+fn read_database(raw: Option<&Value>) -> Result<ReferenceDatabase> {
+    let Some(raw) = raw else {
+        return Ok(ReferenceDatabase::default());
+    };
+    if raw.is_null() {
+        return Ok(ReferenceDatabase::default());
+    }
+    let Value::Object(database) = raw else {
+        return invalid("a group reference's database settings must be an object.");
+    };
+    let field = |name: &str| -> Result<String> {
+        match database.get(name) {
+            None => Ok(String::new()),
+            Some(Value::String(text)) => Ok(text.clone()),
+            Some(_) => invalid(format!("database.{name} must be a string.")),
+        }
+    };
+    let name = field("name")?;
+    let language = field("language")?;
+    let phoneset = field("phoneset")?;
+    let language_override = field("languageOverride")?;
+    let phoneset_override = field("phonesetOverride")?;
+    let backend_type = field("backendType")?;
+    let extra = preserve(
+        database,
+        &[
+            "name",
+            "language",
+            "phoneset",
+            "languageOverride",
+            "phonesetOverride",
+            "backendType",
+        ],
+    )?;
+    Ok(ReferenceDatabase {
+        name,
+        language,
+        phoneset,
+        language_override,
+        phoneset_override,
+        backend_type,
+        extra,
+    })
+}
+
 /// Reads the `audio` backing-track metadata of a group reference exactly like
 /// the `audio` block of OpenSV's `readReference` (`src/core/ProjectFile.cpp`):
 /// absent (or JSON null, which JUCE parses to void) keeps the defaults
@@ -859,6 +935,9 @@ impl RawReference {
         // Reference pitch attributes come from the SAME `voice` object, which
         // doubles as the `voicePitch` container in the C++ `readReference`.
         let voice_pitch = read_pitch_attributes(raw.voice.as_ref(), "reference voice")?;
+        // The Voice-panel block is typed now; `database` leaves `extra` so the
+        // writer can rebuild it from the domain values plus its unknown keys.
+        let database = read_database(raw.database.as_ref())?;
         // Backing-track metadata is read regardless of the instrumental flag,
         // as in the C++: the `audio` block sits outside any such check.
         let (audio_file, audio_duration_seconds) = read_audio(raw.audio.as_ref(), base_dir)?;
@@ -882,6 +961,7 @@ impl RawReference {
                 "blickAbsoluteEnd",
                 "isInstrumental",
                 "voice",
+                "database",
                 "systemPitchDelta",
             ],
         )?;
@@ -898,6 +978,7 @@ impl RawReference {
             vocal_mode_preset,
             vocal_mode_params,
             voice_pitch,
+            database,
             system_pitch_delta,
             extra,
         })
@@ -907,8 +988,20 @@ impl RawReference {
 impl RawTrack {
     fn into_track(value: &Value, base_dir: &Path) -> Result<Track> {
         let raw: RawTrack = serde_json::from_value(value.clone())?;
+        let main_group = RawGroup::into_group(&raw.main_group)?;
+        let main_ref = RawReference::into_reference(&raw.main_ref, base_dir)?;
+        if main_ref.group_id != main_group.id {
+            return invalid("a track's mainRef does not refer to its mainGroup");
+        }
+
+        // `svVoice` wins when Studio wrote it (older projects and the port's
+        // own saves); Studio's current files have no `svVoice` at all and keep
+        // the choice in the main reference's `database` block instead.
         let voice = match raw.sv_voice {
-            None => VoiceSettings::default(),
+            None => VoiceSettings {
+                language: database_language(&main_ref.database)?,
+                ..VoiceSettings::default()
+            },
             Some(voice) => VoiceSettings {
                 database: resolve(base_dir, &voice.database_path),
                 language: voice
@@ -918,12 +1011,6 @@ impl RawTrack {
                 dictionary: resolve(base_dir, &voice.dictionary_directory),
             },
         };
-
-        let main_group = RawGroup::into_group(&raw.main_group)?;
-        let main_ref = RawReference::into_reference(&raw.main_ref, base_dir)?;
-        if main_ref.group_id != main_group.id {
-            return invalid("a track's mainRef does not refer to its mainGroup");
-        }
 
         let mixer = raw.mixer;
         let gain = 10.0_f64.powf(mixer.gain_decibel / 20.0);
@@ -1134,6 +1221,25 @@ fn write_group(group: &NoteGroup) -> Value {
     Value::Object(value)
 }
 
+fn write_database(database: &ReferenceDatabase) -> Value {
+    // Unknown keys (including `version`, which is recorded but not
+    // interpreted) start from the retained blob; the six handled strings are
+    // set over it and a missing `version` defaults to `"-2"`, as in the C++.
+    let mut value = retained_object(&database.extra);
+    for (name, text) in [
+        ("name", &database.name),
+        ("language", &database.language),
+        ("phoneset", &database.phoneset),
+        ("languageOverride", &database.language_override),
+        ("phonesetOverride", &database.phoneset_override),
+        ("backendType", &database.backend_type),
+    ] {
+        value.insert(name.to_owned(), Value::String(text.clone()));
+    }
+    set_default(&mut value, "version", Value::String("-2".into()));
+    Value::Object(value)
+}
+
 fn write_reference(reference: &GroupReference, base_dir: &Path) -> Value {
     let mut value = retained_object(&reference.extra);
     value.insert(
@@ -1157,19 +1263,7 @@ fn write_reference(reference: &GroupReference, base_dir: &Path) -> Value {
         "isInstrumental".to_owned(),
         Value::Bool(reference.instrumental),
     );
-    let mut database = object_property(&value, "database");
-    for name in [
-        "name",
-        "language",
-        "phoneset",
-        "languageOverride",
-        "phonesetOverride",
-        "backendType",
-    ] {
-        set_default(&mut database, name, Value::String(String::new()));
-    }
-    set_default(&mut database, "version", Value::String("-2".into()));
-    value.insert("database".to_owned(), Value::Object(database));
+    value.insert("database".to_owned(), write_database(&reference.database));
     set_default(&mut value, "dictionary", Value::String(String::new()));
     let mut voice = write_pitch_attributes(&reference.voice_pitch);
     voice.insert(
@@ -1473,6 +1567,134 @@ mod tests {
             Some(Path::new("/proj/voices/a.nofs"))
         );
         assert_eq!(track.voice.dictionary, None);
+    }
+
+    #[test]
+    fn track_language_prefers_svvoice_then_the_database_override() {
+        let language = |value: &Value| parse_value(value).unwrap().tracks[0].voice.language;
+        // A block on its own: `languageOverride` wins over `language`.
+        let mut value = sample();
+        value["tracks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("svVoice");
+        value["tracks"][0]["mainRef"]["database"] = json!({
+            "language": "japanese",
+            "languageOverride": "english",
+        });
+        assert_eq!(language(&value), Language::English);
+        // An empty override falls through to `language`.
+        value["tracks"][0]["mainRef"]["database"] = json!({
+            "language": "english",
+            "languageOverride": "",
+        });
+        assert_eq!(language(&value), Language::English);
+        // An all-empty block (Studio's own default for a take reference)
+        // leaves the language unset, i.e. the default.
+        value["tracks"][0]["mainRef"]["database"] = json!({
+            "name": "",
+            "language": "",
+            "phoneset": "",
+            "languageOverride": "",
+            "phonesetOverride": "",
+            "backendType": "",
+            "version": "-2",
+        });
+        assert_eq!(language(&value), Language::default());
+        // So does no block at all.
+        value["tracks"][0]["mainRef"]
+            .as_object_mut()
+            .unwrap()
+            .remove("database");
+        assert_eq!(language(&value), Language::default());
+        // `svVoice` wins over the block when both are present.
+        let mut value = sample();
+        value["tracks"][0]["mainRef"]["database"] = json!({ "language": "japanese" });
+        assert_eq!(language(&value), Language::English);
+        // A non-empty value that is not a language is `Invalid`, naming the
+        // field that was chosen.
+        let mut value = sample();
+        value["tracks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("svVoice");
+        value["tracks"][0]["mainRef"]["database"] = json!({ "language": "klingon" });
+        assert!(matches!(parse_value(&value), Err(SvpError::Invalid(_))));
+        value["tracks"][0]["mainRef"]["database"] = json!({
+            "language": "english",
+            "languageOverride": "klingon",
+        });
+        assert!(matches!(parse_value(&value), Err(SvpError::Invalid(_))));
+    }
+
+    #[test]
+    fn studio_database_block_round_trips_unchanged() {
+        let mut value = sample();
+        value["tracks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("svVoice");
+        let main_ref_database = json!({
+            "name": "GUMI_AI_101",
+            "language": "japanese",
+            "phoneset": "romaji",
+            "languageOverride": "english",
+            "phonesetOverride": "arpabet",
+            "backendType": "ai",
+            "version": "104",
+        });
+        value["tracks"][0]["mainRef"]["database"] = main_ref_database.clone();
+        // What Studio writes on a take reference that inherits everything.
+        let take_database = json!({
+            "name": "",
+            "language": "",
+            "phoneset": "",
+            "languageOverride": "",
+            "phonesetOverride": "",
+            "backendType": "",
+            "version": "-2",
+        });
+        value["tracks"][0]["groups"][0]["database"] = take_database.clone();
+
+        let first = parse_value(&value).unwrap();
+        assert_eq!(first.tracks[0].voice.language, Language::English);
+        assert_eq!(
+            first.tracks[0].main_ref.database.phoneset_override,
+            "arpabet"
+        );
+
+        let saved_once = reserialize(&first);
+        let root: Value = serde_json::from_str(&saved_once).unwrap();
+        assert_eq!(root["tracks"][0]["mainRef"]["database"], main_ref_database);
+        assert_eq!(root["tracks"][0]["groups"][0]["database"], take_database);
+        // `load -> save -> load` is a fixed point from the second save on
+        // (the first save appends the C++ defaults, as everywhere else).
+        let second = reparse(&saved_once);
+        let saved_twice = reserialize(&second);
+        let third = reparse(&saved_twice);
+        assert_eq!(third.tracks, second.tracks);
+        assert_eq!(reserialize(&third), saved_twice);
+    }
+
+    #[test]
+    fn rejects_malformed_database_blocks() {
+        let cases: [(&str, Value); 4] = [
+            ("/tracks/0/mainRef/database", json!(5.0)),
+            ("/tracks/0/mainRef/database/language", json!(3)),
+            ("/tracks/0/mainRef/database/languageOverride", json!(null)),
+            ("/tracks/0/mainRef/database/phoneset", json!(["romaji"])),
+        ];
+        for (pointer, replacement) in cases {
+            let mut value = sample();
+            // The sample has no block; create an empty one so the pointer
+            // leaves exist, then probe the leaf (or the block for case one).
+            value["tracks"][0]["mainRef"]["database"] = json!({});
+            set_pointer(&mut value, pointer, replacement);
+            assert!(
+                matches!(parse_value(&value), Err(SvpError::Invalid(_))),
+                "{pointer} should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2449,8 +2671,12 @@ mod tests {
         }
 
         let reference = &track["groups"][0];
-        assert_eq!(reference["database"]["version"], json!("-2"));
-        assert_eq!(reference["database"]["name"], json!(""));
+        // A block-less reference still gains exactly the C++ defaults, in the
+        // same key order, so the writer is byte-identical to the pre-typed one.
+        assert_eq!(
+            reference["database"].to_string(),
+            r#"{"name":"","language":"","phoneset":"","languageOverride":"","phonesetOverride":"","backendType":"","version":"-2"}"#
+        );
         assert_eq!(reference["dictionary"], json!(""));
         assert_eq!(reference["voice"]["vocalModeInherited"], json!(true));
         assert_eq!(reference["voice"]["vocalModeParams"], json!({}));

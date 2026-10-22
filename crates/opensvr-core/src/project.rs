@@ -314,6 +314,38 @@ pub struct NoteGroup {
     pub extra: Extra,
 }
 
+/// The `database` block Studio writes on every group reference: the Voice
+/// panel's choice for the track (voice, language and phone set).
+///
+/// Only the language fields are interpreted today — a track with no `svVoice`
+/// takes its language from its main reference's block. The rest is typed so a
+/// Studio project round-trips with the keys it was written with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReferenceDatabase {
+    /// The voice the reference names (`database.name`), recorded, not
+    /// interpreted.
+    pub name: String,
+    /// The track's language (`database.language`).
+    pub language: String,
+    /// The phone set for [`language`](Self::language)
+    /// (`database.phoneset`). Read and round-tripped but not yet consumed:
+    /// the timing and pitch front ends pick a phone set from the language
+    /// name, and no observation needs the field to disagree with it.
+    pub phoneset: String,
+    /// The language picked in the Voice panel when it differs from the
+    /// voice's own (`database.languageOverride`).
+    pub language_override: String,
+    /// The matching override for [`phoneset`](Self::phoneset); the same
+    /// "read and round-tripped, not yet consumed" applies, for the same
+    /// reason. Do not delete it as dead code.
+    pub phoneset_override: String,
+    /// The voice's backend (`database.backendType`), recorded, not
+    /// interpreted.
+    pub backend_type: String,
+    /// Unknown SVP JSON fields kept for a lossless round trip.
+    pub extra: Extra,
+}
+
 /// Placement of a [`NoteGroup`] on a track timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupReference {
@@ -342,6 +374,9 @@ pub struct GroupReference {
     pub vocal_mode_params: BTreeMap<String, f64>,
     /// Track/reference-level default pitch attributes (`voicePitch`).
     pub voice_pitch: PitchAttributes,
+    /// The block Studio fills from the Voice panel (`database`). The track's
+    /// language falls back to it when there is no `svVoice`.
+    pub database: ReferenceDatabase,
     /// Engine-generated pitch deviation curve in cents, sampled at the
     /// group-local position like `pitch_delta` (`systemPitchDelta` in
     /// `src/core/ProjectFile.cpp`, consumed in `ProjectRenderer::buildPitch`).
@@ -366,6 +401,7 @@ impl Default for GroupReference {
             vocal_mode_preset: String::new(),
             vocal_mode_params: BTreeMap::new(),
             voice_pitch: PitchAttributes::default(),
+            database: ReferenceDatabase::default(),
             system_pitch_delta: Curve::default(),
             extra: Extra::default(),
         }

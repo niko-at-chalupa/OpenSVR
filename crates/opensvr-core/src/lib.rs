@@ -17,7 +17,8 @@ pub use extra::Extra;
 
 pub use project::{
     GroupReference, Language, Mixer, Note, NoteGroup, ParseLanguageError, PitchAttribute,
-    PitchAttributes, PlacedNote, Project, ProjectError, Track, VocalModeSetting, VoiceSettings,
+    PitchAttributes, PlacedNote, Project, ProjectError, ReferenceDatabase, Track, VocalModeSetting,
+    VoiceSettings,
 };
 pub use tempo::{TempoChange, TempoMap, TimeSignature};
 
