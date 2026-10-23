@@ -79,7 +79,9 @@ pub fn load(path: &Path) -> Result<Project> {
     parse(&bytes, name, path.parent().unwrap_or(Path::new("")))
 }
 
-/// Parses project JSON. Trailing NUL bytes, which Synthesizer V appends, are ignored.
+/// Parses project JSON. Trailing NUL bytes, which Synthesizer V appends, are
+/// ignored. So is anything after the first complete project document: Studio
+/// reads the first one when a file holds several concatenated saves.
 pub fn parse(bytes: &[u8], name: impl Into<String>, base_dir: &Path) -> Result<Project> {
     let end = bytes
         .iter()
@@ -90,12 +92,16 @@ pub fn parse(bytes: &[u8], name: impl Into<String>, base_dir: &Path) -> Result<P
         return invalid("the file is empty");
     }
 
-    let header: Header = serde_json::from_slice(bytes)?;
+    // Read one value from the start of the buffer without `end()`, which
+    // would reject the trailing documents.
+    let mut header_de = serde_json::Deserializer::from_slice(bytes);
+    let header = Header::deserialize(&mut header_de)?;
     if header.version != FORMAT_VERSION {
         return Err(SvpError::UnsupportedVersion(header.version));
     }
 
-    let raw: RawProject = serde_json::from_slice(bytes)?;
+    let mut raw_de = serde_json::Deserializer::from_slice(bytes);
+    let raw = RawProject::deserialize(&mut raw_de)?;
     let library = raw
         .library
         .into_iter()
@@ -110,7 +116,8 @@ pub fn parse(bytes: &[u8], name: impl Into<String>, base_dir: &Path) -> Result<P
     // unknown fields are preserved like every other level. C++ strips only
     // `tracks`/`library` here (`ProjectFile.cpp:814`), keeping `version`,
     // `time` and vendor keys.
-    let doc: Value = serde_json::from_slice(bytes)?;
+    let mut doc_de = serde_json::Deserializer::from_slice(bytes);
+    let doc = Value::deserialize(&mut doc_de)?;
     let Some(root) = doc.as_object() else {
         return invalid("the project root must be an object");
     };
@@ -1706,6 +1713,18 @@ mod tests {
             parse(&[0, 0], "song", Path::new("")),
             Err(SvpError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn reads_the_first_of_concatenated_documents() {
+        let mut second = sample();
+        second["tracks"][0]["name"] = json!("Second");
+        let mut bytes = sample().to_string().into_bytes();
+        bytes.extend(second.to_string().as_bytes());
+        bytes.push(0);
+        let project = parse(&bytes, "song", Path::new("")).unwrap();
+        assert_eq!(project.tracks[0].name, "Lead");
+        assert_eq!(project.tracks.len(), 1);
     }
 
     #[test]
