@@ -329,7 +329,8 @@ pub fn resolve(
 /// same way the renderer does. Multi-syllable English words split across
 /// following `+` notes; `-` repeats the continuation carrier; a trailing
 /// English coda is deferred onto the final legato when the caller reports it
-/// via `next_is_legato`.
+/// via `next_is_legato`. A `+` or `-` with nothing to advance to resolves to
+/// `sil` (Studio's silent note), not an error.
 #[derive(Debug, Clone)]
 pub struct NoteResolver {
     language: Language,
@@ -459,9 +460,14 @@ impl NoteResolver {
         prefer_english: bool,
     ) -> Result<Resolved> {
         if self.continuation.is_empty() && explicit.is_empty() {
-            return Err(invalid(
-                "A legato lyric (-) must immediately follow a note with a resolved syllable.",
-            ));
+            // Studio renders a `-` with nothing to stretch as silence, not an
+            // error. Measured on a leading `-` in the probe recorded in
+            // ROADMAP.md ("A `+` or `-` that cannot advance is silence").
+            return Ok(Resolved {
+                phonemes: vec!["sil".to_owned()],
+                continuation: String::new(),
+                language: self.language,
+            });
         }
         if !explicit.is_empty() {
             let mut resolved = resolve("-", explicit, self.language, prefer_english, dictionaries)?;
@@ -504,9 +510,13 @@ impl NoteResolver {
             return Ok(resolved);
         }
         if self.next_syllable >= self.pending_syllables.len() {
-            return Err(invalid(
-                "'+' advances to the next syllable, but no remaining syllable is available; enter its phonemes explicitly if needed.",
-            ));
+            // Studio renders an extra or leading `+` as silence and leaves the
+            // word's resolved phonemes on their notes. Same probe as above.
+            return Ok(Resolved {
+                phonemes: vec!["sil".to_owned()],
+                continuation: String::new(),
+                language: self.language,
+            });
         }
         let phonemes = self.pending_syllables[self.next_syllable].clone();
         self.next_syllable += 1;
@@ -842,19 +852,14 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
     }
 
     #[test]
-    fn legato_without_a_syllable_is_rejected() {
+    fn legato_without_a_syllable_is_silent() {
         let dictionaries = DictionarySet {
             local: parse_generic(ROMAJI_PHONES, "ka k a\n"),
             english: None,
         };
         let mut resolver = NoteResolver::new(Language::Japanese);
-        assert_eq!(
-            resolver
-                .push("-", "", &dictionaries, false)
-                .unwrap_err()
-                .to_string(),
-            "A legato lyric (-) must immediately follow a note with a resolved syllable."
-        );
+        let silence = resolver.push("-", "", &dictionaries, false).unwrap();
+        assert_eq!(silence.phonemes, ["sil"]);
     }
 
     #[test]
@@ -887,20 +892,15 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
     }
 
     #[test]
-    fn plus_without_pending_syllables_is_rejected() {
+    fn plus_without_pending_syllables_is_silent() {
         let dictionaries = DictionarySet {
             local: parse_generic(ROMAJI_PHONES, "ka k a\n"),
             english: None,
         };
         let mut resolver = NoteResolver::new(Language::Japanese);
         resolver.push("ka", "", &dictionaries, false).unwrap();
-        assert_eq!(
-            resolver
-                .push("+", "", &dictionaries, false)
-                .unwrap_err()
-                .to_string(),
-            "'+' advances to the next syllable, but no remaining syllable is available; enter its phonemes explicitly if needed."
-        );
+        let silence = resolver.push("+", "", &dictionaries, false).unwrap();
+        assert_eq!(silence.phonemes, ["sil"]);
     }
 
     #[test]
@@ -927,12 +927,7 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
         resolver.push("ka", "", &dictionaries, false).unwrap();
         let rest = resolver.push("rest", "", &dictionaries, false).unwrap();
         assert_eq!(rest.phonemes, ["sil"]);
-        assert!(
-            resolver
-                .push("-", "", &dictionaries, false)
-                .unwrap_err()
-                .to_string()
-                .contains("legato")
-        );
+        let legato = resolver.push("-", "", &dictionaries, false).unwrap();
+        assert_eq!(legato.phonemes, ["sil"]);
     }
 }
