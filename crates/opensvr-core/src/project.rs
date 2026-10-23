@@ -409,11 +409,16 @@ impl Default for GroupReference {
 }
 
 /// Singing language used for grapheme-to-phoneme conversion.
+///
+/// The default is the unset language: a project that names none is sung in
+/// English by Studio, so a [`VoiceSettings`]/[`Track`] built without a
+/// language, and an SVP reference whose `database` block is all empty, both
+/// mean English.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Language {
-    #[default]
     Japanese,
     Mandarin,
+    #[default]
     English,
     Cantonese,
     Spanish,

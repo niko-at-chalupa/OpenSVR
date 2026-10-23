@@ -276,13 +276,15 @@ fn convert_mid_to_svp_keeps_the_notes() {
     // notes. (Harmony flattens from 0 to 2 notes because MIDI has no library
     // groups: the exporter writes its placed library notes into the track,
     // and the importer cannot tell them apart. The timeline is unchanged.)
+    // MIDI carries no language, so the reimported project takes the unset
+    // default, which is English.
     let original = opensvr(&["info", EXAMPLE]);
     let after = opensvr(&["info", svp_a.to_str().unwrap()]);
     assert_eq!(original.status.code(), Some(0));
     assert_eq!(after.status.code(), Some(0));
     let after = String::from_utf8(after.stdout).unwrap();
     assert!(
-        after.contains("[0] Lead  notes=4  language=japanese"),
+        after.contains("[0] Lead  notes=4  language=english"),
         "{after}"
     );
     assert_eq!(after.matches("Tracks: 2").count(), 1);

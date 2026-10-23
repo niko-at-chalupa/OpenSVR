@@ -664,9 +664,11 @@ fn read_voice_overrides(raw: Option<&Value>) -> Result<(bool, String, BTreeMap<S
 
 /// Resolves the track's language from its main reference's `database` block:
 /// a non-empty `languageOverride` wins over `language`, both empty fall back
-/// to [`Language::default`]. Empty values mean "unset" — that is what Studio
-/// writes for references that do not override the voice. A non-empty value
-/// that does not name a language is `Invalid`, naming the field like the
+/// to [`Language::default`], which is English. Empty values mean "unset" —
+/// that is what Studio writes for references that do not override the voice,
+/// and a project that names no voice and no language is sung in English by
+/// Studio (observed on real songs saved with an all-empty block). A non-empty
+/// value that does not name a language is `Invalid`, naming the field like the
 /// `svVoice` path does.
 fn database_language(database: &ReferenceDatabase) -> Result<Language> {
     let (field, name) = if !database.language_override.is_empty() {
@@ -1326,7 +1328,7 @@ fn write_track(track: &Track, index: usize, base_dir: &Path) -> Value {
     );
     if track.voice.database.is_some()
         || track.voice.dictionary.is_some()
-        || track.voice.language != Language::Japanese
+        || track.voice.language != Language::default()
     {
         let mut voice = Map::new();
         voice.insert(
@@ -1596,8 +1598,9 @@ mod tests {
             "languageOverride": "",
         });
         assert_eq!(language(&value), Language::English);
-        // An all-empty block (Studio's own default for a take reference)
-        // leaves the language unset, i.e. the default.
+        // An all-empty block (Studio's own default for a reference whose
+        // Voice panel was never set) means English: Studio sings such a
+        // project in English, and English is the unset-language default.
         value["tracks"][0]["mainRef"]["database"] = json!({
             "name": "",
             "language": "",
@@ -1607,13 +1610,13 @@ mod tests {
             "backendType": "",
             "version": "-2",
         });
-        assert_eq!(language(&value), Language::default());
+        assert_eq!(language(&value), Language::English);
         // So does no block at all.
         value["tracks"][0]["mainRef"]
             .as_object_mut()
             .unwrap()
             .remove("database");
-        assert_eq!(language(&value), Language::default());
+        assert_eq!(language(&value), Language::English);
         // `svVoice` wins over the block when both are present.
         let mut value = sample();
         value["tracks"][0]["mainRef"]["database"] = json!({ "language": "japanese" });
