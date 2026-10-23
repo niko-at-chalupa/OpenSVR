@@ -39,8 +39,6 @@ use crate::pitch::{
 use crate::resample::resample_mono;
 use crate::{BackendError, Phrase, PhraseAudio, REST_CONTEXT_SECONDS, VoiceBackend};
 
-/// Largest synthesis unit: matches `maximumPhraseSeconds` in `ProjectRenderer.cpp`.
-const MAXIMUM_PHRASE_SECONDS: f64 = 30.0;
 /// Largest phoneme count per phrase: `maximumPhrasePhonemes`.
 const MAXIMUM_PHRASE_PHONEMES: usize = 4096;
 /// Legato lookahead tolerance in seconds, exactly as in C++.
@@ -334,7 +332,7 @@ impl VoiceBackend for NeuralBackend {
         sample_rate: u32,
         cancel: &CancelToken,
     ) -> Result<PhraseAudio, BackendError> {
-        let (Some(first), Some(last)) = (phrase.notes.first(), phrase.notes.last()) else {
+        let Some(first) = phrase.notes.first() else {
             return Ok(PhraseAudio {
                 start: 0.0,
                 samples: Vec::new(),
@@ -344,12 +342,6 @@ impl VoiceBackend for NeuralBackend {
         // The duration model places onset consonants in the preceding rest;
         // only the mixed output is cropped, never the model input.
         let start_seconds = first.start - REST_CONTEXT_SECONDS;
-        let release_end = last.end + REST_CONTEXT_SECONDS;
-        if release_end - start_seconds > MAXIMUM_PHRASE_SECONDS {
-            return Err(backend_error(
-                "the connected phrase exceeds 30 seconds; add a rest of at least 0.2 seconds to separate phrases.",
-            ));
-        }
         let dictionaries = self.dictionaries_for(voice, phrase.notes)?;
         let inputs = build_phrase_inputs(phrase.notes, voice.language, &dictionaries)?;
 
@@ -450,13 +442,6 @@ fn predict_phrase(
         .map_err(|error| backend_error(error.to_string()))?;
     let timed = merge_continuation_phones(&durations, &inputs.syllables, &timed);
     let frame_count: usize = timed.iter().map(|phoneme| phoneme.frame_count).sum();
-    if frame_count as f64 * f64::from(frame_interval)
-        > MAXIMUM_PHRASE_SECONDS + f64::from(frame_interval)
-    {
-        return Err(backend_error(
-            "The predicted phrase exceeds the 30-second inference limit.",
-        ));
-    }
 
     // The pitch model hears the same `vibratoEnv` envelope the F0 assembly
     // uses, sampled onto its own grid (all ones when the phrase has no
@@ -798,21 +783,6 @@ mod tests {
         assert_eq!(first, fresh);
         assert_eq!(stub.cache.hits(), 1);
         assert_eq!(stub.cache.misses(), 1);
-    }
-
-    #[test]
-    fn thirty_second_phrases_are_rejected() {
-        let notes = [note(0.0, 31.0, 60, "ka")];
-        let backend = NeuralBackend::new();
-        let error = backend
-            .render_phrase(
-                &VoiceSettings::default(),
-                &Phrase { notes: &notes },
-                48_000,
-                &CancelToken::new(),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("exceeds 30 seconds"), "{error}");
     }
 
     #[test]
