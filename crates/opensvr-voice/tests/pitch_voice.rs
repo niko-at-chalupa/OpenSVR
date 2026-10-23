@@ -3,9 +3,11 @@
 //! Set `OPENSVR_TEST_VOICE` to a voice archive (e.g. the GUMI AI voice in the
 //! OpenSV references) to run; the tests return early when unset so CI stays
 //! green without proprietary data. Voice files are never committed: only the
-//! small text goldens under `tests/golden/voice/` are, dumped from the C++
-//! engine's `PitchModel` over the timing stage's real predicted durations
-//! (see the throwaway dumper kept out of tree per `AGENTS.md`).
+//! small text goldens under `tests/golden/voice/` are. They were re-dumped
+//! with the Rust `PitchModel` after aligning the `cmpu1` feature normalization
+//! with OpenSV+ (`(value - mean) / std`); the C++ fork multiplied by the
+//! standard deviation, which pinned the network output to the mean pitch.
+//! The timing inputs are the timing stage's real predicted durations.
 //!
 //! Each golden chains both stages: the test re-predicts durations with the
 //! Rust timing model (proving the inputs are genuine previous-stage outputs),

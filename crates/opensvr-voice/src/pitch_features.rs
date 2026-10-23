@@ -4,7 +4,10 @@
 //! `sv::synthesis`): projects discrete notes and phoneme durations onto the
 //! acoustic frame grid (typically 5 ms), extracts the 10-channel continuous
 //! pitch/timing context, z-score normalizes it, and denormalizes predicted
-//! pitch back to absolute MIDI semitones.
+//! pitch back to absolute MIDI semitones. The z-score divides by the stored
+//! per-channel standard deviation, matching OpenSV+ `PitchFeatures.cpp`; the
+//! fork multiplied by it, which pushed every feature far outside the trained
+//! range and pinned the network output to the mean pitch.
 //!
 //! Score feature layout (`featureChannels = 10`):
 //! `[0]` rest/breath flag, `[1]` continuation (slur) flag, `[2]` MIDI pitch,
@@ -382,7 +385,11 @@ impl PitchFeatures {
                 .push(u8::from(category == "vowel" || category == "diphthong"));
         }
 
-        // 3. Z-score normalization: `(feature - mean) * scale`.
+        // 3. Z-score normalization: `(feature - mean) / scale`, with the
+        //    training standard deviation floored at 1e-5 (OpenSV+
+        //    `PitchFeatures.cpp`). The fork multiplies by the deviation
+        //    instead, which pushes every feature far outside the trained
+        //    range and pins the network output to the mean pitch.
         for index in 0..notes.len() {
             let (row, (means, scales)) = (
                 &mut candidate.note_features.values
@@ -390,14 +397,14 @@ impl PitchFeatures {
                 (&self.means, &self.scales),
             );
             for ((slot, mean), scale) in row.iter_mut().zip(means).zip(scales) {
-                *slot = (*slot - *mean) * *scale;
+                *slot = (*slot - *mean) / scale.max(0.000_01);
             }
         }
         *output = candidate;
         Ok(())
     }
 
-    /// Converts normalized pitch predictions to MIDI semitones (`norm / scale + mean`).
+    /// Converts normalized pitch predictions to MIDI semitones (`norm * scale + mean`).
     pub fn denormalize_pitch(
         &self,
         normalized_pitch: &[f32],
@@ -413,7 +420,7 @@ impl PitchFeatures {
         let pitch_scale = self.scales[2];
         let pitch_mean = self.means[2];
         for (frame, value) in normalized_pitch.iter().enumerate() {
-            midi_pitch[frame] = value / pitch_scale + pitch_mean;
+            midi_pitch[frame] = value * pitch_scale + pitch_mean;
         }
         Ok(())
     }

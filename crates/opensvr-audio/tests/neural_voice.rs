@@ -3,8 +3,9 @@
 //!
 //! Set `OPENSVR_TEST_VOICE` to a voice archive (e.g. the GUMI AI voice) to
 //! run; the test returns early when unset so CI stays green without
-//! proprietary data. The SVP input and the C++ reference excerpts are
-//! committed under `tests/golden/audio/`; the voice blob itself never is.
+//! proprietary data. The SVP input and the reference excerpts are committed
+//! under `tests/golden/audio/`; the voice blob itself never is. The excerpts
+//! were re-dumped after correcting the pitch feature normalization.
 //!
 //! Reference provenance: the excerpts are the first 3000 left-channel
 //! samples of `opensv-cli` renders of `neural-basic.svp` from a clean

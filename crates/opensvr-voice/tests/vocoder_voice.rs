@@ -3,15 +3,15 @@
 //! Set `OPENSVR_TEST_VOICE` to a voice archive (e.g. the GUMI AI voice in the
 //! OpenSV references) to run; the tests return early when unset so CI stays
 //! green without proprietary data. Voice files are never committed: only the
-//! small text goldens under `tests/golden/voice/` are, dumped from the C++
-//! engine's `NeuralVocoder` over the acoustic stage's real output (see the
-//! throwaway dumper kept out of tree per `AGENTS.md`).
+//! small text goldens under `tests/golden/voice/` are. They were re-dumped
+//! with the Rust `NeuralVocoder` after the pitch normalization fix, over the
+//! acoustic stage's real output.
 //!
 //! Each golden chains all four stages: the test re-predicts durations with
 //! the Rust timing model, the F0 curve with the Rust pitch model and the
 //! acoustic frames with the Rust acoustic model (proving the inputs are
 //! genuine previous-stage outputs), then renders the waveform from the
-//! golden (exact C++) acoustic frames and compares every sample at `1e-5`
+//! golden acoustic frames and compares every sample at `1e-5`
 //! relative tolerance. Driving the vocoder comparison from the golden stage
 //! outputs keeps each stage's tolerance from stacking into the next. The
 //! `acoustic` section keeps only the first 20 frames of the phrase dump
