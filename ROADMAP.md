@@ -145,11 +145,12 @@ has been checked so far, not a claim of completeness.
     the damage is the symbol alone: `hello` splits `hh ah` + `l ow` where
     Studio splits `hh ax` + `l ow`, so a following `+` still lands on the right
     syllable. The wrong syllable count now makes a following `+` silent where
-    Studio carries the missing syllable. Punctuation is not normalized either:
-    a lyric `score?` or `ces?` misses the dictionary, and a lyric `=` does too
-    (`FLOP ERA Base.svp`). Studio renders that project; its phonemes for those
-    notes have not been read yet, and `=` may be a silence marker rather than a
-    word, so the fix needs that observation before it is written.
+    Studio carries the missing syllable. Punctuation is stripped before the
+    English lookup, so a lyric `score?` or `ces?` resolves as its word, but a
+    lyric `=` strips to nothing and still misses (`FLOP ERA Base.svp`). Studio
+    renders that project; the phonemes for the `=` note have not been read yet,
+    and `=` may be a silence marker rather than a word, so the fix needs that
+    observation before it is written.
   - *Japanese.* `lookup` romanizes the lyric character by character and then
     looks the concatenation up as one key, while the kana tables hold one mora
     per entry. A multi-mora lyric such as `あん` (`a N` in Studio) is not a
@@ -280,17 +281,6 @@ has been checked so far, not a claim of completeness.
   the nominal amount and 150 a boost, the weights themselves need their own
   observation before mode fidelity can be called equal.
 
-- **A vocal mode the selected voice lacks refuses the render.** Group vocal-mode
-  curves and `vocalModeParams` keys are mapped to style columns, and a name the
-  selected voice does not expose is an error (`crates/opensvr-audio/src/pitch.rs`;
-  the reference engine refuses the same way). `rot for clout(1).svp` automates
-  `Mellow` and sets it to 150 on `pre-chorus`, so it renders with its own Teto
-  voice but not with the GUMI AI 101 corpus voice, whose modes are `Ballade Cute
-  Soft Vivid`. Studio renders the project (user observation, 2026-10-23), and
-  the user reports that GUMI exposes `Mellow`; whether their installed GUMI is a
-  newer build or Studio drops an unexposed mode has to be settled on a probe
-  before choosing between ignoring the column and remapping it.
-
 - **Phrase splitting is engine bookkeeping, not Studio behaviour.** The engine
   keeps OpenSV's rest-based splitting (a phrase is a run of notes with no rest
   of at least 0.2 s) as its synthesis, cache and progress boundary. The
@@ -367,10 +357,6 @@ The remaining gaps, in the order to take them, one branch each:
    (done); the remaining half is that `-` stops re-singing its predecessor's
    vowel, and the pending-syllable bookkeeping works in every language rather
    than only English.
-4. **Vocal modes a voice does not expose.** Stop refusing a group curve or
-   `vocalModeParams` key the selected voice lacks, once the probe with GUMI
-   says whether Studio drops the column or maps it. `rot for clout(1).svp` is
-   the case.
-5. **`evenSyllableDuration`.** Read the per-note attribute and redistribute
+4. **`evenSyllableDuration`.** Read the per-note attribute and redistribute
    syllable timing the way Studio does.
-6. **Note IDs.** Only when an editor-side consumer needs incremental caches.
+5. **Note IDs.** Only when an editor-side consumer needs incremental caches.
