@@ -610,6 +610,7 @@ mod tests {
                 ..NoteGroup::default()
             },
         );
+        track.voice.language = Language::Japanese;
         track.voice.dictionary = Some(dir);
         let project = Project {
             name: "song".into(),
