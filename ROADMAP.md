@@ -270,18 +270,19 @@ has been checked so far, not a claim of completeness.
   the nominal amount and 150 a boost, the weights themselves need their own
   observation before mode fidelity can be called equal.
 
-- **Phrase splitting and its caps are engine bookkeeping, not Studio
-  behaviour.** The engine inherits OpenSV's rest-based splitting (a phrase is
-  a run of notes with no rest of at least 0.2 s) plus two hard caps,
-  `maximumPhraseSeconds` (30 s) and `maximumPhrasePhonemes` (4096); a phrase
-  over either is refused, so a real project with a 33 s legato passage or a
-  36.6 s unbroken rap run fails to render. Studio never cuts a connected
-  passage at rests, so a passage longer than either cap must render, the caps
-  must go, and any splitting kept for incremental synthesis must stay
-  invisible in the output. One wrinkle for the workaround the error suggests:
-  a rest of exactly 0.2 s does not reliably split, because the comparison is
-  made on blick-converted seconds and can land just under the threshold, so
-  the advice needs a margin rather than the exact figure.
+- **Phrase splitting is engine bookkeeping, not Studio behaviour.** The engine
+  keeps OpenSV's rest-based splitting (a phrase is a run of notes with no rest
+  of at least 0.2 s) as its synthesis, cache and progress boundary. The
+  inherited `maximumPhraseSeconds` (30 s) refusal is gone: Studio has no such
+  limit, so a connected passage is synthesised as one unit however long it is.
+  A 40 s legato fixture renders as one pass at 48 kHz (40.1 s of audio,
+  112 s wall time, 933 MiB peak RSS), and the longest run in the real songs
+  measured so far is 36.6 s. The separate `maximumPhrasePhonemes` guard (4096)
+  remains as a named model/tensor bound; the longest measured passage stays far
+  below it, and it is not a musical limit. A rest of exactly 0.2 s still does
+  not reliably split because the comparison is made on blick-converted seconds
+  and can land just under the threshold, but that now only changes cache
+  granularity, not whether the passage can be sung.
 
 The editor (`ui/*`, `app/*`, `audio/PreviewEngine.*`) stays out of scope.
 

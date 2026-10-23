@@ -123,4 +123,15 @@ mod tests {
             assert_eq!(phrase.notes[0].start, expected);
         }
     }
+
+    #[test]
+    fn a_long_connected_run_stays_one_phrase() {
+        let notes: Vec<_> = (0..40)
+            .map(|i| note(f64::from(i), f64::from(i) + 1.0))
+            .collect();
+        let phrases = split_phrases(&notes);
+        assert_eq!(phrases.len(), 1);
+        assert_eq!(phrases[0].notes.len(), 40);
+        assert_eq!(phrases[0].notes.last().expect("nonempty").end, 40.0);
+    }
 }

@@ -182,6 +182,58 @@ fn neural_backend_sings_the_basic_phrase_deterministically() {
     assert_eq!(first, second, "re-renders must be bitwise identical");
 }
 
+/// Studio has no 30 s phrase limit, so a connected run must reach synthesis.
+///
+/// The note is 31 s of score at the fixture's 120 BPM; the backend used to
+/// reject it before loading the voice. The same phrase is rendered twice
+/// through one backend (cache hit) and once through a fresh one (cache miss),
+/// so a longer pass cannot introduce nondeterminism.
+#[test]
+fn phrases_longer_than_thirty_seconds_render() {
+    let Some(voice) = voice_path() else {
+        return;
+    };
+    let mut project =
+        opensvr_svp::load(&golden_dir().join("neural-basic.svp")).expect("basic SVP must parse");
+    let duration = project.tempo_map.seconds_to_blick(31.0);
+    let track = &mut project.tracks[0];
+    let mut note = track.main_group.notes[0].clone();
+    note.onset = 0;
+    note.duration = duration;
+    note.pitch = 60;
+    note.phonemes = "k a".to_owned();
+    track.main_group.notes = vec![note];
+    track.groups.clear();
+    track.voice.database = Some(voice);
+
+    let cancel = CancelToken::new();
+    let renderer = Renderer::new(NeuralBackend::new());
+    let first = renderer
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("a 31 s phrase must reach synthesis");
+    let seconds = first.frames() as f64 / f64::from(SAMPLE_RATE);
+    assert!(seconds > 30.0, "rendered {seconds}s");
+    assert!(seconds < 31.5, "rendered {seconds}s");
+    let peak: f32 = first
+        .left
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    assert!(
+        peak > 0.05,
+        "peak {peak}: the long phrase must sing audibly"
+    );
+
+    let cached = renderer
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("the long phrase must re-render");
+    assert_eq!(first, cached, "cache hits stay sample-identical");
+
+    let fresh = Renderer::new(NeuralBackend::new())
+        .render(&project, SAMPLE_RATE, &cancel)
+        .expect("a fresh backend must render the long phrase");
+    assert_eq!(first, fresh, "a fresh render stays sample-identical");
+}
+
 #[test]
 fn neural_backend_matches_the_cpp_reference_excerpts() {
     if voice_path().is_none() {
