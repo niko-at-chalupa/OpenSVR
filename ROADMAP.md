@@ -75,6 +75,13 @@ The decisions in the landed code that still constrain what comes next.
 - The `systemPitchDelta` curve is not only saved and loaded; it gates the
   neural residual in the pitch builder. Unknown JSON survives a round trip
   through the `Extra` capture, and `load -> save -> load` is a fixed point.
+- The pitch frontend's `cmpu1` z-score divides by the stored per-channel
+  standard deviation, matching OpenSV+ `PitchFeatures.cpp`; the fork
+  multiplied by it. The stored vectors are unmistakably deviations (the
+  boolean channels equal `sqrt(p(1-p))`), so the product left every feature
+  far outside the trained range and pinned the predicted curve to the voice's
+  mean pitch. Long notes hid it because the pitch postprocess recentres
+  anything past 0.3 s; fast passages sang a monotone instead of the score.
 - Phrase audio is resampled with `rubato` (sinc, fixed ratio), and the
   interpolator's latency is measured and cancelled.
 - The Flat voice format is a JSON voice document beside sibling `.dnni` model
