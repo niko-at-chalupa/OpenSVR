@@ -1,9 +1,9 @@
 # Pitch-model golden for opensvr-voice (Phase 5, pitch stage).
-# Re-dumped after aligning the pitch feature normalization with the OpenSV+
-# z-score convention: (value - mean) / standard deviation. The fork's
-# multiplication by the deviation left the network input out of range.
 # Re-dumped with the Rust PitchModel (a bit-exact port of the C++ f0model-dds
-# path) against the GUMI AI voice. The voice archive itself is proprietary and stays behind
+# path) against the GUMI AI voice. The pitch feature z-score follows OpenSV+
+# ((value - mean) / standard deviation); the C++ fork multiplied by the
+# deviation, which left the network input out of range.
+# The voice archive itself is proprietary and stays behind
 # OPENSVR_TEST_VOICE; only these small text goldens are committed.
 # Input lines start with "in " (<language> <midi> <seconds> <phoneme>...),
 # followed by the timing stage's real predicted durations and the expected

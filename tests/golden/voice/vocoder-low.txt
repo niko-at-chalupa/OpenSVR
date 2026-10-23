@@ -1,10 +1,9 @@
 # Vocoder golden for opensvr-voice (Phase 5, vocoder stage).
-# Re-dumped after aligning the pitch feature normalization with the OpenSV+
-# z-score convention: (value - mean) / standard deviation. The fork's
-# multiplication by the deviation left the network input out of range.
 # Re-dumped with the Rust NeuralVocoder (a bit-exact port of the C++
-# model_vocoder "nhv" path) against the GUMI AI voice. The voice archive itself is proprietary and
-# stays behind OPENSVR_TEST_VOICE; only these small text goldens are committed.
+# model_vocoder "nhv" path) against the GUMI AI voice after correcting
+# the pitch feature z-score to OpenSV+'s (value - mean) / standard deviation.
+# The voice archive itself is proprietary and stays behind
+# OPENSVR_TEST_VOICE; only these small text goldens are committed.
 # The `in`/`durations`/`pitch` sections below are the acoustic golden
 # `acoustic-low.txt` verbatim: the test re-predicts durations (timing), the F0
 # curve (pitch) and the acoustic frames with the Rust stages, then renders

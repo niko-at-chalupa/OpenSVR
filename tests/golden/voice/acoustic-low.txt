@@ -1,10 +1,9 @@
 # Acoustic-model golden for opensvr-voice (Phase 5, acoustic stage).
-# Re-dumped after aligning the pitch feature normalization with the OpenSV+
-# z-score convention: (value - mean) / standard deviation. The fork's
-# multiplication by the deviation left the network input out of range.
 # Re-dumped with the Rust AcousticModel (a bit-exact port of the C++
-# model_timbre_pred "dds" path) against the GUMI AI voice. The voice archive itself is proprietary and
-# stays behind OPENSVR_TEST_VOICE; only these small text goldens are committed.
+# model_timbre_pred "dds" path) against the GUMI AI voice after correcting
+# the pitch feature z-score to OpenSV+'s (value - mean) / standard deviation.
+# The voice archive itself is proprietary and stays behind
+# OPENSVR_TEST_VOICE; only these small text goldens are committed.
 # The `in`/`durations`/`pitch` sections below are the pitch golden
 # `pitch-low.txt` verbatim: the test re-predicts durations (timing) and the
 # F0 curve (pitch) with the Rust stages, quantizes durations onto the 5 ms
