@@ -132,13 +132,14 @@ has been checked so far, not a claim of completeness.
     where CMUDict has `ah` (`and` -> `ax n d`, `hello` -> `hh ax l ow`) and
     `ey` for `ay` (`day` -> `d ey`). Past CMUDict the engine uses 14 hardcoded
     words, then 11 digraph patterns (`sh ch th ph ng qu ee ea oo ow ai`), then
-    a per-letter guess in which a final `y` is a consonant, so `evry` resolves
-    to one syllable (`eh v r y`) where Studio resolves two. The hardcoded
-    words disagree with Studio as well (`hello` is stored as `hh ah l ow`).
-    For a word the tables do know the damage is the symbol alone: `hello`
-    splits `hh ah` + `l ow` where Studio splits `hh ax` + `l ow`, so a
-    following `+` still lands on the right syllable. The wrong syllable count
-    is what then makes a following `+` fail.
+    a per-letter guess. A final `-y` is now the vowel `iy`, so `evry` resolves
+    to two syllables (`eh v r iy`) as Studio does; the rest of the guess still
+    differs from Studio's front end. The hardcoded words disagree with Studio
+    as well (`hello` is stored as `hh ah l ow`). For a word the tables do know
+    the damage is the symbol alone: `hello` splits `hh ah` + `l ow` where
+    Studio splits `hh ax` + `l ow`, so a following `+` still lands on the right
+    syllable. The wrong syllable count now makes a following `+` silent where
+    Studio carries the missing syllable.
   - *Japanese.* `lookup` romanizes the lyric character by character and then
     looks the concatenation up as one key, while the kana tables hold one mora
     per entry. A multi-mora lyric such as `あん` (`a N` in Studio) is not a
@@ -160,16 +161,14 @@ has been checked so far, not a claim of completeness.
 
 - **A `+` or `-` that cannot advance is silence, not an error.** Studio
   renders the continuation as silence and leaves the previous note's phonemes
-  where they are; the engine aborts the whole render with "'+' advances to the
-  next syllable, but no remaining syllable is available" (or, for `-`, "A
-  legato lyric (-) must immediately follow a note with a resolved syllable").
-  Measured on a probe project that follows every word with a `+` or `-`,
-  Studio sings `cat` then `+` as `k ae t` and silence, `cat` with explicit
-  `k ae t s` then `+` as `k ae t s` and silence, `smile` then `-` as `s m ay l`
-  and silence, and `cat` with explicit `k ae t p` then `-` as `k ae t p` and
-  silence; a leading `+` and `-` with nothing before them sing nothing at all.
-  Even after G2P parity these must degrade to a silent note, never a hard
-  failure.
+  where they are. Measured on a probe project that follows every word with a
+  `+` or `-`, Studio sings `cat` then `+` as `k ae t` and silence, `cat` with
+  explicit `k ae t s` then `+` as `k ae t s` and silence, `smile` then `-` as
+  `s m ay l` and silence, and `cat` with explicit `k ae t p` then `-` as
+  `k ae t p` and silence; a leading `+` and `-` with nothing before them sing
+  nothing at all. The engine now resolves these cases to `sil` instead of
+  aborting the render, pinned by `plus_without_pending_syllables_is_silent`
+  and `legato_without_a_syllable_is_silent` (`crates/opensvr-g2p/src/resolve.rs`).
 
 - **`-` must only stretch the previous note's last phoneme.** The same probe
   exposes the other half of the `-` divergence: Studio never gives a `-` a

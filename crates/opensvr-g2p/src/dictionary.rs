@@ -594,6 +594,10 @@ impl PhonemeDictionary {
                     'i' => "ih",
                     'o' => "aa",
                     'u' => "uh",
+                    // Studio's front end writes the vowel `iy` for a final
+                    // `-y` (`evry` -> `eh v r iy`), which also makes the word
+                    // two syllables so a following `+` can carry the second.
+                    'y' if index + 1 == stripped.len() => "iy",
                     'y' => "y",
                     'h' => "hh",
                     't' => "t",
@@ -1048,6 +1052,14 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
         assert_eq!(dictionary.lookup("bat").unwrap(), ["b", "ae", "t"]);
         // Patterns win over letters: sh, ee.
         assert_eq!(dictionary.lookup("sheep").unwrap(), ["sh", "iy", "p"]);
+    }
+
+    #[test]
+    fn final_y_is_the_vowel_iy() {
+        let dictionary = english("hello hh ah l ow\n");
+        // Studio resolves `evry` as two syllables, `eh v r iy`; a consonant
+        // final `y` would leave a following `+` with nothing to advance to.
+        assert_eq!(dictionary.lookup("evry").unwrap(), ["eh", "v", "r", "iy"]);
     }
 
     #[test]
