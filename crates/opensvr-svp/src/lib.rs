@@ -648,11 +648,53 @@ fn read_voice_overrides(raw: Option<&Value>) -> Result<(bool, String, BTreeMap<S
                 return invalid("vocalModeParams must be an object of mode amounts.");
             };
             for (name, amount) in entries {
-                match amount.as_f64() {
-                    Some(value) if value.is_finite() => {
+                let value = match amount {
+                    Value::Number(number) => number.as_f64().filter(|value| value.is_finite()),
+                    // SVR3 stores each amount per axis. The render path has one
+                    // weight per mode, so equal axes collapse faithfully; a
+                    // divergent triple would need a per-axis mode model.
+                    Value::Object(axes) => {
+                        let mut values = [0.0; 3];
+                        for (slot, axis) in
+                            values.iter_mut().zip(["pitch", "timbre", "pronunciation"])
+                        {
+                            let Some(value) = axes.get(axis).and_then(Value::as_f64) else {
+                                return invalid(format!(
+                                    "vocalModeParams.{name} must be a finite number or a \
+                                     {{pitch, timbre, pronunciation}} object."
+                                ));
+                            };
+                            if !value.is_finite() {
+                                return invalid(format!(
+                                    "vocalModeParams.{name}.{axis} must be a finite number."
+                                ));
+                            }
+                            *slot = value;
+                        }
+                        if axes.len() != values.len() {
+                            return invalid(format!(
+                                "vocalModeParams.{name} must have exactly pitch, timbre and \
+                                 pronunciation axes."
+                            ));
+                        }
+                        if values[1..]
+                            .iter()
+                            .any(|value| (*value - values[0]).abs() > 1e-9)
+                        {
+                            return invalid(format!(
+                                "vocalModeParams.{name} has different per-axis amounts; \
+                                 per-axis vocal modes are not supported yet."
+                            ));
+                        }
+                        Some(values[0])
+                    }
+                    _ => None,
+                };
+                match value {
+                    Some(value) => {
                         params.insert(name.clone(), value);
                     }
-                    _ => {
+                    None => {
                         return invalid(format!("vocalModeParams.{name} must be a finite number."));
                     }
                 }
@@ -2113,6 +2155,45 @@ mod tests {
         assert!(!reference.vocal_mode_inherited);
         assert_eq!(reference.vocal_mode_preset, "Chest");
         assert_eq!(reference.vocal_mode_params["Power"], 0.9);
+    }
+
+    #[test]
+    fn svr3_equal_per_axis_vocal_modes_collapse() {
+        let mut value = sample();
+        value["tracks"][0]["groups"][0]["voice"] = json!({
+            "vocalModeParams": {
+                "Power": { "pitch": 60.0, "timbre": 60.0, "pronunciation": 60.0 },
+            },
+        });
+        let project = parse_value(&value).unwrap();
+        assert_eq!(project.tracks[0].groups[0].vocal_mode_params["Power"], 60.0);
+    }
+
+    #[test]
+    fn svr3_divergent_per_axis_vocal_modes_are_rejected() {
+        let mut value = sample();
+        value["tracks"][0]["groups"][0]["voice"] = json!({
+            "vocalModeParams": {
+                "Power": { "pitch": 60.0, "timbre": 40.0, "pronunciation": 60.0 },
+            },
+        });
+        let error = parse_value(&value).unwrap_err().to_string();
+        assert!(
+            error.contains("per-axis vocal modes are not supported yet"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn svr3_per_axis_vocal_modes_need_all_three_axes() {
+        let mut value = sample();
+        value["tracks"][0]["groups"][0]["voice"] = json!({
+            "vocalModeParams": {
+                "Power": { "pitch": 60.0, "timbre": 60.0 },
+            },
+        });
+        let error = parse_value(&value).unwrap_err().to_string();
+        assert!(error.contains("pitch, timbre, pronunciation"), "{error}");
     }
 
     #[test]
