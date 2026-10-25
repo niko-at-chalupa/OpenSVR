@@ -41,8 +41,6 @@ use crate::{BackendError, Phrase, PhraseAudio, REST_CONTEXT_SECONDS, VoiceBacken
 
 /// Largest phoneme count per phrase: `maximumPhrasePhonemes`.
 const MAXIMUM_PHRASE_PHONEMES: usize = 4096;
-/// Legato lookahead tolerance in seconds, exactly as in C++.
-const LEGATO_EPSILON_SECONDS: f64 = 0.000_001;
 
 /// Timing and pitch-model inputs for one phrase.
 #[derive(Debug, Clone)]
@@ -99,11 +97,8 @@ fn build_phrase_inputs(
             phoneme_count += 1;
         }
         let is_legato = note.lyrics == "-";
-        let next_is_legato = index + 1 < notes.len()
-            && notes[index + 1].lyrics == "-"
-            && (notes[index + 1].start - note.end).abs() <= LEGATO_EPSILON_SECONDS;
         let sung = sequencer
-            .push(note.lyrics, note.phonemes, dictionaries, next_is_legato)
+            .push(note.lyrics, note.phonemes, dictionaries)
             .map_err(|error| backend_error(error.to_string()))?;
         let pitch = i32::from(note.pitch);
         let syllable = TimingSyllable {
