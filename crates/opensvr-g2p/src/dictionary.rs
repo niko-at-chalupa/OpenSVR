@@ -570,6 +570,10 @@ impl PhonemeDictionary {
             )));
         }
 
+        if let Some(pronunciation) = self.entries.get(&stripped) {
+            return Ok(pronunciation.clone());
+        }
+
         if let Some((_, phones)) = ENGLISH_FALLBACKS.iter().find(|(word, _)| *word == stripped) {
             return Ok(phones.iter().map(|phone| (*phone).to_owned()).collect());
         }
