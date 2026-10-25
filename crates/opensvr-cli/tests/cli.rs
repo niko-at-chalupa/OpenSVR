@@ -43,7 +43,8 @@ fn info_lists_tracks_and_flags_missing_voices() {
     assert!(text.contains("Project: two-tracks\nTracks: 2\n"));
     assert!(text.contains("[0] Lead  notes=4  language=japanese"));
     assert!(text.contains("voices/example/voice.nofs  [MISSING]"));
-    assert!(text.contains("[1] Harmony  notes=0"));
+    // Harmony's own group is empty, but its library reference places two notes.
+    assert!(text.contains("[1] Harmony  notes=2"));
     assert!(text.contains("voice: (none)"));
 }
 

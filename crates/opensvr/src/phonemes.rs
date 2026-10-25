@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use opensvr_core::{Language, Note, Track};
+use opensvr_core::{Language, Note, Project, ProjectError, Track};
 use opensvr_g2p::{DictionarySet, G2pError, NoteResolver, Resolved, load_dictionaries};
 use thiserror::Error;
 
@@ -27,6 +27,9 @@ pub enum PhonemeError {
     /// The dictionary files exist but could not be read.
     #[error(transparent)]
     Dictionaries(#[from] G2pError),
+    /// The track's references could not be placed on the timeline.
+    #[error(transparent)]
+    Placement(#[from] ProjectError),
 }
 
 /// One note's resolved phonemes, or the reason that note failed.
@@ -63,18 +66,21 @@ impl PhonemeResolver {
         self.loads
     }
 
-    /// Resolves every note of `track.main_group` in order.
+    /// Resolves every placed note of `track` in timeline order.
     ///
-    /// An empty track resolves to no notes without needing a dictionary. A
-    /// track with notes but no dictionary directory returns
-    /// [`PhonemeError::NoDictionary`], even when every note carries explicit
-    /// phonemes, matching what `info --phonemes` reports today.
+    /// This is the same composition the renderer uses: `main_group` plus every
+    /// group referenced by `track.groups`, with each reference's offset, pitch
+    /// shift and crop applied. An empty track resolves to no notes without
+    /// needing a dictionary. A track with notes but no dictionary directory
+    /// returns [`PhonemeError::NoDictionary`], even when every note carries
+    /// explicit phonemes.
     pub fn resolve_track<'a>(
         &mut self,
+        project: &'a Project,
         track: &'a Track,
     ) -> Result<Vec<NotePhonemes<'a>>, PhonemeError> {
-        let notes = &track.main_group.notes;
-        if notes.is_empty() {
+        let placed = project.placed_notes(track)?;
+        if placed.is_empty() {
             return Ok(Vec::new());
         }
         let Some(directory) = track.voice.dictionary.clone() else {
@@ -84,9 +90,12 @@ impl PhonemeResolver {
         let dictionaries = self.dictionaries_for(directory, language)?;
 
         let mut resolver = NoteResolver::new(language);
-        let mut entries = Vec::with_capacity(notes.len());
-        for (index, note) in notes.iter().enumerate() {
-            let next_is_legato = notes.get(index + 1).is_some_and(|next| next.lyrics == "-");
+        let mut entries = Vec::with_capacity(placed.len());
+        for (index, placed_note) in placed.iter().enumerate() {
+            let note = placed_note.note;
+            let next_is_legato = placed
+                .get(index + 1)
+                .is_some_and(|next| next.note.lyrics == "-");
             entries.push(NotePhonemes {
                 note,
                 result: resolver.push(&note.lyrics, &note.phonemes, &dictionaries, next_is_legato),
@@ -121,7 +130,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use opensvr_core::{Extra, NoteGroup, PitchAttributes};
+    use opensvr_core::{Extra, NoteGroup, PitchAttributes, TempoMap};
 
     use super::*;
 
@@ -176,16 +185,28 @@ mod tests {
         track
     }
 
+    fn project(track: Track) -> Project {
+        Project {
+            name: "test".into(),
+            tracks: vec![track],
+            library: Vec::new(),
+            tempo_map: TempoMap::default(),
+            extra: Extra::default(),
+        }
+    }
+
     #[test]
     fn resolves_notes_in_order_with_legato() {
         let directory = scratch("basic");
         write_dictionary(&directory);
-        let track = track(
+        let project = project(track(
             vec![note("か"), note("-"), note("zzz")],
             Some(directory.clone()),
-        );
+        ));
         let mut resolver = PhonemeResolver::new();
-        let entries = resolver.resolve_track(&track).unwrap();
+        let entries = resolver
+            .resolve_track(&project, &project.tracks[0])
+            .unwrap();
 
         let first = entries[0].result.as_ref().unwrap();
         assert_eq!(first.phonemes, ["k", "a"]);
@@ -211,11 +232,11 @@ mod tests {
         write_dictionary(&second);
         let mut resolver = PhonemeResolver::new();
 
-        let a = track(vec![note("か")], Some(first.clone()));
-        let b = track(vec![note("か")], Some(first));
-        let c = track(vec![note("か")], Some(second.clone()));
-        for track in [&a, &b, &c] {
-            resolver.resolve_track(track).unwrap();
+        let a = project(track(vec![note("か")], Some(first.clone())));
+        let b = project(track(vec![note("か")], Some(first)));
+        let c = project(track(vec![note("か")], Some(second.clone())));
+        for project in [&a, &b, &c] {
+            resolver.resolve_track(project, &project.tracks[0]).unwrap();
         }
         assert_eq!(
             resolver.dictionary_loads(),
@@ -228,8 +249,10 @@ mod tests {
     #[test]
     fn an_empty_track_needs_no_dictionary() {
         let mut resolver = PhonemeResolver::new();
-        let empty = track(Vec::new(), None);
-        let entries = resolver.resolve_track(&empty).unwrap();
+        let project = project(track(Vec::new(), None));
+        let entries = resolver
+            .resolve_track(&project, &project.tracks[0])
+            .unwrap();
         assert!(entries.is_empty());
         assert_eq!(resolver.dictionary_loads(), 0);
     }
@@ -237,8 +260,9 @@ mod tests {
     #[test]
     fn reports_a_missing_dictionary_directory() {
         let mut resolver = PhonemeResolver::new();
+        let project = project(track(vec![note("か")], None));
         let error = resolver
-            .resolve_track(&track(vec![note("か")], None))
+            .resolve_track(&project, &project.tracks[0])
             .unwrap_err();
         assert!(matches!(error, PhonemeError::NoDictionary), "{error}");
     }
@@ -248,8 +272,9 @@ mod tests {
         let directory = scratch("empty");
         fs::create_dir_all(&directory).unwrap();
         let mut resolver = PhonemeResolver::new();
+        let project = project(track(vec![note("か")], Some(directory.clone())));
         let error = resolver
-            .resolve_track(&track(vec![note("か")], Some(directory.clone())))
+            .resolve_track(&project, &project.tracks[0])
             .unwrap_err();
         assert!(matches!(error, PhonemeError::Dictionaries(_)), "{error}");
         fs::remove_dir_all(directory).unwrap();
