@@ -186,6 +186,22 @@ has been checked so far, not a claim of completeness.
   is not a documented Studio lyric; this is a deliberate guess pending a finer
   observation.
 
+- **SVR3 projects store vocal modes per axis.** A project saved with
+  `backendType: SVR3` (Kasane Teto 105) writes `vocalModeParams` as
+  `{pitch, timbre, pronunciation}` objects instead of scalars, and leaves
+  `mainGroup.notes` empty with the arrangement in `library` groups referenced
+  from `track.groups`. The loader requires scalar amounts
+  (`crates/opensvr-svp/src/lib.rs:643-657`), so such a project fails at load.
+  The render path already composes the library groups
+  (`Project::placed_notes`, `crates/opensvr-core/src/project.rs:576`); only
+  `info`/`--phonemes` reads `mainGroup.notes` alone
+  (`crates/opensvr/src/phonemes.rs:76`). With the objects flattened, the
+  project reaches the Japanese multi-mora gap, so SVR3 support also needs that
+  front end. Divergent axes need a per-axis mode model; equal axes (as in the
+  observed project) can collapse faithfully. Studio renders the project
+  (observed 2026-10-25); the voice version (105) is newer than the extracted
+  104 as well.
+
 - **`-` must only stretch the previous note's last phoneme.** The same probe
   exposes the other half of the `-` divergence: Studio never gives a `-` a
   phoneme of its own, it lets the previous syllable ring into the note. The
