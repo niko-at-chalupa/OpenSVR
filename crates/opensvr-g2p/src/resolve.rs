@@ -16,7 +16,8 @@
 //! no file-stamp cache here — dictionaries are loaded once per render at the
 //! caller, which is all the one-shot CLI needs (the `CachedDictionary` layer
 //! is Phase 6). [`NoteResolver`] additionally ports the `+`/`-` lyric
-//! sequencing from the phrase loop so per-note callers stay faithful.
+//! sequencing from the phrase loop (treating `=` as a `+` alias — a deliberate
+//! guess) so per-note callers stay faithful.
 
 use std::path::Path;
 
@@ -370,7 +371,10 @@ impl NoteResolver {
         next_is_legato: bool,
     ) -> Result<Resolved> {
         let prefer_english = self.continuation_language == Language::English;
-        let is_break = lyrics == "+";
+        // `=` is treated as an alias for `+`. Studio renders the FLOP
+        // "expectations + = +" slot as if `=` were a syllable break, but `=`
+        // is not a documented Studio lyric, so this is a deliberate guess.
+        let is_break = lyrics == "+" || lyrics == "=";
         let is_legato = lyrics == "-";
         let mut resolved = if is_legato {
             self.legato(explicit, dictionaries, prefer_english)?
@@ -900,6 +904,29 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
         let mut resolver = NoteResolver::new(Language::Japanese);
         resolver.push("ka", "", &dictionaries, false).unwrap();
         let silence = resolver.push("+", "", &dictionaries, false).unwrap();
+        assert_eq!(silence.phonemes, ["sil"]);
+    }
+
+    #[test]
+    fn equals_is_an_alias_for_plus() {
+        let english = DictionarySet {
+            local: english_dict(),
+            english: None,
+        };
+        let mut resolver = NoteResolver::new(Language::English);
+        let first = resolver.push("hello", "", &english, false).unwrap();
+        assert_eq!(first.phonemes, ["hh", "ah"]);
+        let second = resolver.push("=", "", &english, false).unwrap();
+        assert_eq!(second.phonemes, ["l", "ow"]);
+        assert_eq!(second.language, Language::English);
+
+        let japanese = DictionarySet {
+            local: parse_generic(ROMAJI_PHONES, "ka k a\n"),
+            english: None,
+        };
+        let mut resolver = NoteResolver::new(Language::Japanese);
+        resolver.push("ka", "", &japanese, false).unwrap();
+        let silence = resolver.push("=", "", &japanese, false).unwrap();
         assert_eq!(silence.phonemes, ["sil"]);
     }
 
