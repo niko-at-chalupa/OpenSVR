@@ -147,16 +147,19 @@ has been checked so far, not a claim of completeness.
     syllable. The wrong syllable count now makes a following `+` silent where
     Studio carries the missing syllable. Punctuation is stripped before the
     English lookup, so a lyric `score?` or `ces?` resolves as its word, but a
-    lyric `=` strips to nothing and still misses (`FLOP ERA Base.svp`). Studio
-    renders that project; the phonemes for the `=` note have not been read yet,
-    and `=` may be a silence marker rather than a word, so the fix needs that
-    observation before it is written.
-  - *Japanese.* `lookup` romanizes the lyric character by character and then
-    looks the concatenation up as one key, while the kana tables hold one mora
-    per entry. A multi-mora lyric such as `あん` (`a N` in Studio) is not a
-    key, and the long-vowel mark and kanji are not kana at all. The fallback
-    is the Latin letter guess, which for Japanese either names phones the
-    inventory lacks, aborting the render, or invents Latin phones for kana.
+    lyric `=` strips to nothing and still misses. The engine now aliases `=` to
+    `+` as a documented guess (`885e33d`), so `FLOP ERA Base.svp` renders; the
+    phonemes for the `=` note have still not been read, and `=` may be a
+    silence marker rather than a word.
+  - *Japanese.* `lookup` now tries the whole romanization first and then, for
+    an all-kana lyric, resolves one mora at a time (`そん` → `s o n`, `らい` →
+    `r a i`, `にと` → `n i t o`). A small tsu contributes the inventory's `cl`
+    closure (`たっ` → `t a cl`). That mapping is inferred from the inventory
+    and Studio's explicit English codas (`it` → `ih t cl`), not read from a
+    Japanese panel; `ん` → `n` and `うぉ` → `u o` are likewise unverified.
+    Long-vowel marks and kanji are still not kana, so they still fall through
+    to the Latin guess or an error. Studio's Japanese panel readings for
+    `そん`, `たっ` and `うぉ` are the next parity step.
   - *Mandarin.* A note takes exactly one listed syllable; a multi-character
     lyric is rejected with "Split multi-character lyrics across notes".
   - *Cantonese, Spanish.* The CLF tables the ported engine uses, not yet
@@ -190,17 +193,16 @@ has been checked so far, not a claim of completeness.
   `backendType: SVR3` (Kasane Teto 105) writes `vocalModeParams` as
   `{pitch, timbre, pronunciation}` objects instead of scalars, and leaves
   `mainGroup.notes` empty with the arrangement in `library` groups referenced
-  from `track.groups`. The loader requires scalar amounts
-  (`crates/opensvr-svp/src/lib.rs:643-657`), so such a project fails at load.
-  The render path already composes the library groups
-  (`Project::placed_notes`, `crates/opensvr-core/src/project.rs:576`); only
-  `info`/`--phonemes` reads `mainGroup.notes` alone
-  (`crates/opensvr/src/phonemes.rs:76`). With the objects flattened, the
-  project reaches the Japanese multi-mora gap, so SVR3 support also needs that
-  front end. Divergent axes need a per-axis mode model; equal axes (as in the
-  observed project) can collapse faithfully. Studio renders the project
-  (observed 2026-10-25); the voice version (105) is newer than the extracted
-  104 as well.
+  from `track.groups`. The render path already composed those groups
+  (`Project::placed_notes`, `crates/opensvr-core/src/project.rs:576`); the
+  loader now accepts the object when all three axes agree (`6c106db`) and
+  rejects a divergent triple rather than averaging it. `info`/`--phonemes` now
+  counts and resolves placed notes like the renderer (`ab44dac`), and Japanese
+  multi-mora resolution (`390225b`) takes `Anoko_Teto_main.svp` end to end:
+  216.10 s, mean −21.5 dBFS, peak −2.6 dBFS with the Teto 104 proxy. Studio
+  renders it (observed 2026-10-25); parity is still open on the 104-vs-105
+  voice and on the inferred Japanese `cl`/`ん`/`うぉ` readings. Divergent axes
+  still need a per-axis mode model.
 
 - **`-` must only stretch the previous note's last phoneme.** The same probe
   exposes the other half of the `-` divergence: Studio never gives a `-` a
