@@ -389,12 +389,13 @@ fn print_info(project: &Project, out: &mut impl io::Write, show_phonemes: bool) 
     let mut resolver = opensvr::PhonemeResolver::new();
     for (index, track) in project.tracks.iter().enumerate() {
         let voice = &track.voice;
+        let note_count = project
+            .placed_notes(track)
+            .map_or_else(|_| "?".to_owned(), |placed| placed.len().to_string());
         writeln!(
             out,
-            "  [{index}] {}  notes={}  language={}",
-            track.name,
-            track.main_group.notes.len(),
-            voice.language
+            "  [{index}] {}  notes={note_count}  language={}",
+            track.name, voice.language
         )?;
         writeln!(
             out,
@@ -424,28 +425,28 @@ fn print_info(project: &Project, out: &mut impl io::Write, show_phonemes: bool) 
             }
         }
         if show_phonemes {
-            print_phonemes(track, out, &mut resolver)?;
+            print_phonemes(project, track, out, &mut resolver)?;
         }
     }
     Ok(())
 }
 
-/// Resolves and prints one line per note of the track's main group.
+/// Resolves and prints one line per placed note of the track.
 ///
 /// Dictionary load failures print once per track; per-note resolution errors
 /// print on their note's line. Neither is fatal: `info` stays diagnostic.
 fn print_phonemes(
+    project: &Project,
     track: &opensvr_core::Track,
     out: &mut impl io::Write,
     resolver: &mut opensvr::PhonemeResolver,
 ) -> io::Result<()> {
-    // An empty track prints no header, so the check stays here rather than
-    // in the resolver, which simply returns no entries.
-    if track.main_group.notes.is_empty() {
-        return Ok(());
-    }
-    match resolver.resolve_track(track) {
+    match resolver.resolve_track(project, track) {
         Ok(entries) => {
+            // An empty track prints no header.
+            if entries.is_empty() {
+                return Ok(());
+            }
             writeln!(out, "      phonemes:")?;
             for entry in entries {
                 match &entry.result {
