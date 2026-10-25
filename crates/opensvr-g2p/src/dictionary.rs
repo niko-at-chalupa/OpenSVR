@@ -578,6 +578,10 @@ impl PhonemeDictionary {
             let mut complete = true;
             for mora in moras {
                 if mora == "cl" {
+                    if !self.symbols.contains("cl") {
+                        complete = false;
+                        break;
+                    }
                     pronunciation.push("cl".to_owned());
                     continue;
                 }
