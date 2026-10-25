@@ -63,7 +63,8 @@ pub struct Overrides {
     #[arg(long, alias = "dict", value_name = "CLF-DATA")]
     pub dictionary: Option<PathBuf>,
     /// Resolve Flat voice models from this directory instead of the voice
-    /// document's sibling `models` directory (default: OPENSVR_MODELS_DIR)
+    /// document's sibling `models` directory (default: OPENSVR_MODELS_DIR).
+    /// Accepts both `<role>/<id>.dnni` and flat `<id>.dnni` files.
     #[arg(long, value_name = "DIR")]
     pub models_dir: Option<PathBuf>,
     /// Override the singing language on every track
