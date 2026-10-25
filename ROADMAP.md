@@ -191,15 +191,18 @@ has been checked so far, not a claim of completeness.
   voice and on the inferred Japanese `cl`/`ん`/`うぉ` readings. Divergent axes
   still need a per-axis mode model.
 
-- **A `-` holds the previous note's last phoneme.** Studio never gives a `-`
-  a phoneme of its own; it lets the previous syllable ring into the note. The
-  engine now returns the previous note's last phoneme for a non-explicit `-`
-  and lets `merge_continuation_phones` extend it; the previous note keeps its
-  coda. `smile` resolves to `s m ay l` and its `-` holds `l`; a `cat` with
-  explicit `k ae t p` holds `p`; `eyes` (`ay z`) holds `z`. Explicit
-  `phonemes` still win on their own note, and a leading `-` is still `sil`.
-  The `i wish` render is 273.10 s, mean −19.7 dBFS, peak −2.0 dBFS; a Studio
-  audio A/B of the held consonant is still not done.
+- **A `-` continues the previous note's last vowel.** Studio's lyric guide
+  says the minus sign continues the last sung vowel into the following note,
+  and never gives the `-` a phoneme of its own. The engine returns the
+  previous note's last vowel for a non-explicit `-` and lets
+  `merge_continuation_phones` extend that vowel in place; the previous note
+  keeps its coda after the held vowel. `smile` resolves to `s m ay l` and its
+  `-` holds `ay`; a `cat` with explicit `k ae t p` holds `ae`; `eyes` (`ay z`)
+  holds `ay`. This also covers mixed syllable breaks and legatos: `amazing`
+  resolves `ah` / `- ah` / `+ m ey` / `+ z ih ng` / `- ih` / `- ih`, with the
+  `ng` staying after the held vowel. Explicit `phonemes` still win on their
+  own note, and a leading `-` is still `sil`. The `i wish` render is
+  273.10 s; a Studio audio A/B is still not done.
 
 - **`evenSyllableDuration` is parsed but never read.** `opensvr-svp`
   round-trips the per-note attribute; nothing in `opensvr-voice` or
@@ -358,8 +361,8 @@ The remaining gaps, in the order to take them, one branch each:
    continuation syllables, multi-mora Japanese, multi-character Mandarin —
    waits on it, so the format and the front ends land together.
 2. **Continuation rules.** A `+` or `-` that cannot advance is silence (done),
-   and a `-` holds the previous note's last phoneme instead of re-singing its
-   vowel (done); the remaining half is pending-syllable bookkeeping in every
+   and a `-` continues the previous note's last vowel instead of re-singing it
+   (done); the remaining half is pending-syllable bookkeeping in every
    language rather than only English.
 3. **`evenSyllableDuration`.** Read the per-note attribute and redistribute
    syllable timing the way Studio does.
