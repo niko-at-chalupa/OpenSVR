@@ -243,15 +243,16 @@ pub fn resolve(
         if phonemes.is_empty() {
             return Err(invalid("The explicit phoneme sequence is empty."));
         }
-        let mut continuation = phonemes.last().cloned().unwrap_or_default();
-        if language == Language::English
-            && let Some(vowel) = phonemes
+        let continuation = if language == Language::English {
+            phonemes
                 .iter()
                 .rev()
                 .find(|symbol| is_english_vowel_phoneme(symbol))
-        {
-            continuation.clone_from(vowel);
-        }
+                .cloned()
+                .unwrap_or_else(|| phonemes.last().cloned().unwrap_or_default())
+        } else {
+            last_vowel_or_tail(&phonemes, &dictionaries.local)
+        };
         return Ok(Resolved {
             phonemes,
             continuation,
@@ -315,9 +316,9 @@ pub fn resolve(
 /// Ports the phrase-loop lyric handling around `resolvePhonemes` so callers
 /// without timing information (such as `info --phonemes`) resolve notes the
 /// same way the renderer does. Multi-syllable English words split across
-/// following `+` notes; a `-` holds the previous note's last phoneme instead of
-/// starting a new syllable. A `+` or `-` with nothing to advance to resolves to
-/// `sil` (Studio's silent note), not an error.
+/// following `+` notes; a `-` continues the previous note's last sung vowel
+/// instead of starting a new syllable. A `+` or `-` with nothing to advance to
+/// resolves to `sil` (Studio's silent note), not an error.
 #[derive(Debug, Clone)]
 pub struct NoteResolver {
     language: Language,
@@ -326,9 +327,6 @@ pub struct NoteResolver {
     word_language: Language,
     pending_syllables: Vec<Vec<String>>,
     next_syllable: usize,
-    /// The last phoneme of the previous resolved note; a `-` repeats this so
-    /// the audio merger extends it rather than re-singing a vowel.
-    last_phoneme: String,
 }
 
 impl NoteResolver {
@@ -340,7 +338,6 @@ impl NoteResolver {
             word_language: language,
             pending_syllables: Vec::new(),
             next_syllable: 0,
-            last_phoneme: String::new(),
         }
     }
 
@@ -422,13 +419,10 @@ impl NoteResolver {
             && (resolved.phonemes[0] == "sil" || resolved.phonemes[0] == "br")
         {
             self.continuation.clear();
-            self.last_phoneme.clear();
             self.continuation_language = self.language;
             self.word_language = self.language;
             self.pending_syllables.clear();
             self.next_syllable = 0;
-        } else {
-            self.last_phoneme = resolved.phonemes.last().cloned().unwrap_or_default();
         }
         Ok(resolved)
     }
@@ -439,7 +433,7 @@ impl NoteResolver {
         dictionaries: &DictionarySet,
         prefer_english: bool,
     ) -> Result<Resolved> {
-        if self.last_phoneme.is_empty() && self.continuation.is_empty() && explicit.is_empty() {
+        if self.continuation.is_empty() && explicit.is_empty() {
             // Studio renders a `-` with nothing to stretch as silence, not an
             // error. Measured on a leading `-` in the probe recorded in
             // ROADMAP.md ("A `+` or `-` that cannot advance is silence").
@@ -468,13 +462,8 @@ impl NoteResolver {
             }
             return Ok(resolved);
         }
-        let held = if self.last_phoneme.is_empty() {
-            self.continuation.clone()
-        } else {
-            self.last_phoneme.clone()
-        };
         Ok(Resolved {
-            phonemes: vec![held],
+            phonemes: vec![self.continuation.clone()],
             continuation: self.continuation.clone(),
             language: self.continuation_language,
         })
@@ -546,7 +535,8 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
     fn english_dict() -> PhonemeDictionary {
         PhonemeDictionary::parse(
             PHONES.as_bytes(),
-            "hello hh ah l ow\ncats k ae t s\ncat k ae t\nsmile s m ay l\n".as_bytes(),
+            "hello hh ah l ow\ncats k ae t s\ncat k ae t\nsmile s m ay l\namazing ah m ey z ih ng\n"
+                .as_bytes(),
             "english-arpabet-phones.txt",
             "english-arpabet-dict.txt",
             "english-arpabet-phones.txt",
@@ -624,6 +614,17 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
         assert_eq!(resolved.phonemes, ["sh", "i"]);
         assert_eq!(resolved.continuation, "i");
         assert_eq!(resolved.language, Language::Japanese);
+    }
+
+    #[test]
+    fn explicit_non_english_continuation_is_the_last_vowel() {
+        let dictionaries = DictionarySet {
+            local: parse_generic(ROMAJI_PHONES, "ka k a\n"),
+            english: None,
+        };
+        let resolved = resolve("ka", "k a s", Language::Japanese, false, &dictionaries).unwrap();
+        assert_eq!(resolved.phonemes, ["k", "a", "s"]);
+        assert_eq!(resolved.continuation, "a");
     }
 
     #[test]
@@ -832,8 +833,8 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
         let first = resolver.push("ka", "", &dictionaries).unwrap();
         assert_eq!(first.phonemes, ["k", "a"]);
         let legato = resolver.push("-", "", &dictionaries).unwrap();
-        // The vowel-final note holds its last phoneme, so the audio merger
-        // extends one `a` rather than starting a new syllable.
+        // A legato continues the last sung vowel, so the audio merger extends
+        // one `a` rather than starting a new syllable.
         assert_eq!(legato.phonemes, ["a"]);
         assert_eq!(legato.language, Language::Japanese);
     }
@@ -859,7 +860,7 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
         resolver.push("ka", "", &dictionaries).unwrap();
         let legato = resolver.push("-", "s u", &dictionaries).unwrap();
         assert_eq!(legato.phonemes, ["s", "u"]);
-        // The next legato holds the override's last phoneme.
+        // The next legato continues the override's last vowel.
         let again = resolver.push("-", "", &dictionaries).unwrap();
         assert_eq!(again.phonemes, ["u"]);
     }
@@ -914,21 +915,21 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
     }
 
     #[test]
-    fn english_legato_holds_the_coda() {
+    fn english_legato_holds_the_vowel_before_a_coda() {
         let dictionaries = DictionarySet {
             local: english_dict(),
             english: None,
         };
         let mut resolver = NoteResolver::new(Language::English);
         let first = resolver.push("cats", "", &dictionaries).unwrap();
-        // The coda stays on the word; the legato holds its last phoneme.
+        // The coda stays on the word; the legato continues the vowel.
         assert_eq!(first.phonemes, ["k", "ae", "t", "s"]);
         let legato = resolver.push("-", "", &dictionaries).unwrap();
-        assert_eq!(legato.phonemes, ["s"]);
+        assert_eq!(legato.phonemes, ["ae"]);
     }
 
     #[test]
-    fn english_legato_holds_a_sonorant_coda() {
+    fn english_legato_holds_a_sonorant_vowel() {
         let dictionaries = DictionarySet {
             local: english_dict(),
             english: None,
@@ -937,11 +938,11 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
         let first = resolver.push("smile", "", &dictionaries).unwrap();
         assert_eq!(first.phonemes, ["s", "m", "ay", "l"]);
         let legato = resolver.push("-", "", &dictionaries).unwrap();
-        assert_eq!(legato.phonemes, ["l"]);
+        assert_eq!(legato.phonemes, ["ay"]);
     }
 
     #[test]
-    fn english_legato_holds_an_explicit_coda() {
+    fn english_legato_holds_an_explicit_vowel() {
         let dictionaries = DictionarySet {
             local: english_dict(),
             english: None,
@@ -950,7 +951,44 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
         let first = resolver.push("cat", "k ae t p", &dictionaries).unwrap();
         assert_eq!(first.phonemes, ["k", "ae", "t", "p"]);
         let legato = resolver.push("-", "", &dictionaries).unwrap();
-        assert_eq!(legato.phonemes, ["p"]);
+        assert_eq!(legato.phonemes, ["ae"]);
+    }
+
+    #[test]
+    fn mixed_syllable_breaks_and_legatos_continue_vowels() {
+        let dictionaries = DictionarySet {
+            local: english_dict(),
+            english: None,
+        };
+        let mut resolver = NoteResolver::new(Language::English);
+        assert_eq!(
+            resolver
+                .push("amazing", "", &dictionaries)
+                .unwrap()
+                .phonemes,
+            ["ah"]
+        );
+        assert_eq!(
+            resolver.push("-", "", &dictionaries).unwrap().phonemes,
+            ["ah"]
+        );
+        assert_eq!(
+            resolver.push("+", "", &dictionaries).unwrap().phonemes,
+            ["m", "ey"]
+        );
+        assert_eq!(
+            resolver.push("+", "", &dictionaries).unwrap().phonemes,
+            ["z", "ih", "ng"]
+        );
+        // The third syllable's last vowel continues; its coda stays after it.
+        assert_eq!(
+            resolver.push("-", "", &dictionaries).unwrap().phonemes,
+            ["ih"]
+        );
+        assert_eq!(
+            resolver.push("-", "", &dictionaries).unwrap().phonemes,
+            ["ih"]
+        );
     }
 
     #[test]
