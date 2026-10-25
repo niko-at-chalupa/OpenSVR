@@ -612,10 +612,23 @@ mod tests {
     }
 
     #[test]
-    fn legato_marks_continuation_and_reuses_the_vowel() {
+    fn legato_marks_continuation_and_holds_the_previous_phoneme() {
         let notes = [note(0.0, 0.4, 60, "ka"), note(0.4, 0.8, 62, "-")];
         let inputs = build_phrase_inputs(&notes, Language::Japanese, &japanese_set()).unwrap();
         assert_eq!(inputs.syllables[2].phonemes, ["a"]);
+        assert!(inputs.syllables[2].is_continuation);
+        assert!(inputs.pitch_notes[1].is_continuation);
+    }
+
+    #[test]
+    fn legato_holds_a_consonant_coda() {
+        let first = crate::TimedNote {
+            phonemes: "k a s",
+            ..note(0.0, 0.4, 60, "kas")
+        };
+        let notes = [first, note(0.4, 0.8, 62, "-")];
+        let inputs = build_phrase_inputs(&notes, Language::Japanese, &japanese_set()).unwrap();
+        assert_eq!(inputs.syllables[2].phonemes, ["s"]);
         assert!(inputs.syllables[2].is_continuation);
         assert!(inputs.pitch_notes[1].is_continuation);
     }
