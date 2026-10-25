@@ -181,6 +181,11 @@ has been checked so far, not a claim of completeness.
   aborting the render, pinned by `plus_without_pending_syllables_is_silent`
   and `legato_without_a_syllable_is_silent` (`crates/opensvr-g2p/src/resolve.rs`).
 
+- **`=` is treated as an alias for `+`.** Studio renders the `expectations + = +`
+  slot in FLOP as if `=` were a syllable break (observed 2026-10-25), but `=`
+  is not a documented Studio lyric; this is a deliberate guess pending a finer
+  observation.
+
 - **`-` must only stretch the previous note's last phoneme.** The same probe
   exposes the other half of the `-` divergence: Studio never gives a `-` a
   phoneme of its own, it lets the previous syllable ring into the note. The
