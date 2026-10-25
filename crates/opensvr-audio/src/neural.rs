@@ -541,7 +541,7 @@ mod tests {
         DictionarySet {
             local: parse_generic(
                 "a vowel\nk consonant\ns consonant\nsil silence\n",
-                "ka k a\nsa s a\n",
+                "ka k a\nsa s a\nkas k a s\n",
             ),
             english: None,
         }
@@ -612,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn legato_marks_continuation_and_holds_the_previous_phoneme() {
+    fn legato_marks_continuation_and_holds_the_previous_vowel() {
         let notes = [note(0.0, 0.4, 60, "ka"), note(0.4, 0.8, 62, "-")];
         let inputs = build_phrase_inputs(&notes, Language::Japanese, &japanese_set()).unwrap();
         assert_eq!(inputs.syllables[2].phonemes, ["a"]);
@@ -621,14 +621,10 @@ mod tests {
     }
 
     #[test]
-    fn legato_holds_a_consonant_coda() {
-        let first = crate::TimedNote {
-            phonemes: "k a s",
-            ..note(0.0, 0.4, 60, "kas")
-        };
-        let notes = [first, note(0.4, 0.8, 62, "-")];
+    fn legato_holds_the_vowel_before_a_coda() {
+        let notes = [note(0.0, 0.4, 60, "kas"), note(0.4, 0.8, 62, "-")];
         let inputs = build_phrase_inputs(&notes, Language::Japanese, &japanese_set()).unwrap();
-        assert_eq!(inputs.syllables[2].phonemes, ["s"]);
+        assert_eq!(inputs.syllables[2].phonemes, ["a"]);
         assert!(inputs.syllables[2].is_continuation);
         assert!(inputs.pitch_notes[1].is_continuation);
     }

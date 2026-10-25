@@ -32,10 +32,12 @@ use crate::{BackendError, TimedNote};
 /// Merges legato continuations into the previous identical phoneme.
 ///
 /// Mirrors `mergeContinuationPhones`: when `durations[index]` belongs to a
-/// continuation (`-`) syllable and its quantized phoneme repeats the previous
-/// language and symbol, its frames extend the previous entry instead of
-/// starting a new one. A durations/phonemes length mismatch leaves the
-/// phonemes unchanged, exactly as in C++.
+/// continuation (`-`) syllable, its quantized phoneme is the previous note's
+/// last vowel, and that vowel is not always the tail when the note ended in a
+/// coda. A one-phone continuation therefore extends the last matching
+/// language/symbol in place; the coda stays after it. Multi-phone explicit
+/// continuations keep the old tail merge. A durations/phonemes length mismatch
+/// leaves the phonemes unchanged, exactly as in C++.
 pub fn merge_continuation_phones(
     durations: &[PhonemeDuration],
     syllables: &[TimingSyllable],
@@ -46,16 +48,32 @@ pub fn merge_continuation_phones(
     }
     let mut merged: Vec<TimedPhoneme> = Vec::with_capacity(phonemes.len());
     for (duration, phoneme) in durations.iter().zip(phonemes) {
-        let is_continuation = syllables
-            .get(duration.syllable_index)
-            .is_some_and(|syllable| syllable.is_continuation);
-        if is_continuation
-            && let Some(back) = merged.last_mut()
-            && back.language == phoneme.language
-            && back.symbol == phoneme.symbol
-            && let Some(sum) = back.frame_count.checked_add(phoneme.frame_count)
+        let syllable = syllables.get(duration.syllable_index);
+        let is_continuation = syllable.is_some_and(|syllable| syllable.is_continuation);
+        // A `-` continues the previous note's last vowel. When that note ended
+        // in a coda, the vowel is not the last timed phoneme, so a one-phone
+        // continuation searches back for the vowel instead of only looking at
+        // the tail. Explicit multi-phone continuations keep the old tail merge.
+        let merge_index = if is_continuation {
+            if syllable.is_some_and(|syllable| syllable.phonemes.len() <= 1) {
+                merged.iter().rposition(|back| {
+                    back.language == phoneme.language && back.symbol == phoneme.symbol
+                })
+            } else {
+                merged
+                    .last()
+                    .filter(|back| {
+                        back.language == phoneme.language && back.symbol == phoneme.symbol
+                    })
+                    .map(|_| merged.len() - 1)
+            }
+        } else {
+            None
+        };
+        if let Some(index) = merge_index
+            && let Some(sum) = merged[index].frame_count.checked_add(phoneme.frame_count)
         {
-            back.frame_count = sum;
+            merged[index].frame_count = sum;
             continue;
         }
         merged.push(phoneme.clone());
@@ -590,6 +608,48 @@ mod tests {
             merged,
             vec![timed("japanese", "a", 160), timed("japanese", "k", 40)],
             "the repeated legato vowel extends the previous frames; the new consonant does not"
+        );
+    }
+
+    #[test]
+    fn continuation_vowel_extends_before_a_coda() {
+        let syllables = vec![
+            TimingSyllable {
+                language: "english".to_owned(),
+                phonemes: vec!["z".to_owned(), "ih".to_owned(), "ng".to_owned()],
+                duration_seconds: 0.4,
+                midi_pitch: 60,
+                is_continuation: false,
+            },
+            TimingSyllable {
+                language: "english".to_owned(),
+                phonemes: vec!["ih".to_owned()],
+                duration_seconds: 0.4,
+                midi_pitch: 62,
+                is_continuation: true,
+            },
+        ];
+        let durations = vec![
+            duration("english", "z", 0, 0.05),
+            duration("english", "ih", 0, 0.2),
+            duration("english", "ng", 0, 0.15),
+            duration("english", "ih", 1, 0.4),
+        ];
+        let phonemes = vec![
+            timed("english", "z", 10),
+            timed("english", "ih", 40),
+            timed("english", "ng", 30),
+            timed("english", "ih", 80),
+        ];
+        let merged = merge_continuation_phones(&durations, &syllables, &phonemes);
+        assert_eq!(
+            merged,
+            vec![
+                timed("english", "z", 10),
+                timed("english", "ih", 120),
+                timed("english", "ng", 30),
+            ],
+            "the held vowel extends in place and the coda stays after it"
         );
     }
 
