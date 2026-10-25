@@ -204,17 +204,15 @@ has been checked so far, not a claim of completeness.
   voice and on the inferred Japanese `cl`/`ん`/`うぉ` readings. Divergent axes
   still need a per-axis mode model.
 
-- **`-` must only stretch the previous note's last phoneme.** The same probe
-  exposes the other half of the `-` divergence: Studio never gives a `-` a
-  phoneme of its own, it lets the previous syllable ring into the note. The
-  engine instead re-sings the previous note's last vowel, and moves the
-  previous note's trailing coda onto the `-` (`smile` resolves to `s m ay` and
-  its `-` to `ay l`, so the stream gains a repeated vowel; a `cat` with
-  explicit `k ae t p` resolves its `-` to `ae`). Explicit `phonemes` are not
-  affected: they already take priority on their own note and are not re-split,
-  which is what Studio does — a `hello` whose `phonemes` are `hh eh l ow`
-  followed by `+` sings `hh eh l ow` and then the lyric's next syllable
-  `l ow` in both.
+- **A `-` holds the previous note's last phoneme.** Studio never gives a `-`
+  a phoneme of its own; it lets the previous syllable ring into the note. The
+  engine now returns the previous note's last phoneme for a non-explicit `-`
+  and lets `merge_continuation_phones` extend it; the previous note keeps its
+  coda. `smile` resolves to `s m ay l` and its `-` holds `l`; a `cat` with
+  explicit `k ae t p` holds `p`; `eyes` (`ay z`) holds `z`. Explicit
+  `phonemes` still win on their own note, and a leading `-` is still `sil`.
+  The `i wish` render is 273.10 s, mean −19.7 dBFS, peak −2.0 dBFS; a Studio
+  audio A/B of the held consonant is still not done.
 
 - **`evenSyllableDuration` is parsed but never read.** `opensvr-svp`
   round-trips the per-note attribute; nothing in `opensvr-voice` or
