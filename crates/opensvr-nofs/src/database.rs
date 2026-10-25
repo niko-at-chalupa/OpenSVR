@@ -498,21 +498,34 @@ fn find_model_file(directory: &Path, id: &str) -> PathBuf {
     expected
 }
 
+/// Appends the role and flat candidates for one base directory, preserving
+/// the role-first order and dropping duplicate paths.
+fn push_model_candidates(candidates: &mut Vec<PathBuf>, directory: &Path, role: &str, id: &str) {
+    for directory in [directory.join(role), directory.to_path_buf()] {
+        let candidate = find_model_file(&directory, id);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+}
+
 /// Resolves a Flat model ID to a file: the explicit override directory
 /// first, then the document's sibling `models` directory, then the
-/// document's own directory.
+/// document's own directory. Within each directory, Studio's
+/// `<role>/<id>.dnni` layout is tried before a flat `<id>.dnni`.
 fn resolve_model(
     doc_dir: Option<&Path>,
     models_override: Option<&Path>,
+    role: &str,
     id: &str,
 ) -> Result<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(directory) = models_override {
-        candidates.push(find_model_file(directory, id));
+        push_model_candidates(&mut candidates, directory, role, id);
     }
     if let Some(directory) = doc_dir {
-        candidates.push(find_model_file(&directory.join("models"), id));
-        candidates.push(find_model_file(directory, id));
+        push_model_candidates(&mut candidates, &directory.join("models"), role, id);
+        push_model_candidates(&mut candidates, directory, role, id);
     }
     for candidate in &candidates {
         if candidate.is_file() {
@@ -523,8 +536,13 @@ fn resolve_model(
         .first()
         .cloned()
         .unwrap_or_else(|| PathBuf::from(format!("{id}.dnni")));
+    let searched = candidates
+        .iter()
+        .map(|candidate| candidate.display().to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
     Err(invalid(format!(
-        "model file is missing: {}",
+        "model file is missing: {} (searched: {searched})",
         expected.display()
     )))
 }
@@ -557,7 +575,7 @@ fn open_document(
             Some(Value::String(id)) if is_safe_model_id(id) => id.clone(),
             _ => return Err(invalid(format!("unsafe model identifier for {field}"))),
         };
-        let model_path = resolve_model(doc_dir, models_override, &id)?;
+        let model_path = resolve_model(doc_dir, models_override, field, &id)?;
         let bytes = fs::read(&model_path).map_err(|source| NofsError::Io {
             path: model_path.clone(),
             source,
@@ -1203,6 +1221,67 @@ mod tests {
                 .unwrap(),
             b"override"
         );
+    }
+
+    #[test]
+    fn document_models_resolve_in_role_directories() {
+        let (_guard, doc) = write_flat_voice(&FLAT_MODELS);
+        let parent = doc.parent().unwrap();
+        std::fs::remove_dir_all(parent.join("models")).unwrap();
+        let roles = ["acoustic", "vocoder", "duration", "f0"];
+        for (role, (id, bytes)) in roles.into_iter().zip(FLAT_MODELS) {
+            let directory = parent.join("models").join(role);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(format!("{id}.dnni")), bytes).unwrap();
+        }
+        let db = VoiceDatabase::open(&doc).unwrap();
+        for (role, (id, bytes)) in roles.into_iter().zip(FLAT_MODELS) {
+            assert_eq!(
+                db.read_entry(db.find_entry(id).unwrap()).unwrap(),
+                bytes,
+                "{role}"
+            );
+        }
+        drop(db);
+
+        // An override laid out the same way works, and the role directory is
+        // preferred over a flat file in the same base directory.
+        let studio = parent.join("studio");
+        for (role, (id, bytes)) in roles.into_iter().zip(FLAT_MODELS) {
+            let directory = studio.join(role);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(format!("{id}.dnni")), bytes).unwrap();
+        }
+        std::fs::write(studio.join("acoustic-hash.dnni"), b"flat-acoustic").unwrap();
+        let db = VoiceDatabase::open_with_models(&doc, Some(&studio)).unwrap();
+        assert_eq!(
+            db.read_entry(db.find_entry("acoustic-hash").unwrap())
+                .unwrap(),
+            b"acoustic-bytes"
+        );
+    }
+
+    #[test]
+    fn missing_model_lists_every_candidate() {
+        let (_guard, doc) = write_flat_voice(&FLAT_MODELS);
+        let parent = doc.parent().unwrap();
+        std::fs::remove_file(parent.join("models").join("f0-hash.dnni")).unwrap();
+        let error = VoiceDatabase::open(&doc).unwrap_err().to_string();
+        assert!(
+            error.starts_with("NOFS: model file is missing: "),
+            "{error}"
+        );
+        for path in [
+            parent.join("models/f0/f0-hash.dnni"),
+            parent.join("models/f0-hash.dnni"),
+            parent.join("f0/f0-hash.dnni"),
+            parent.join("f0-hash.dnni"),
+        ] {
+            assert!(
+                error.contains(&path.display().to_string()),
+                "missing {path:?} in {error}"
+            );
+        }
     }
 
     #[test]

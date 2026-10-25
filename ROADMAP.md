@@ -87,9 +87,10 @@ The decisions in the landed code that still constrain what comes next.
 - The Flat voice format is a JSON voice document beside sibling `.dnni` model
   files, with speaker and style vectors as hex-encoded little-endian floats
   and fixed architectures per role (duration `gen2a`, acoustic `dds`, vocoder
-  `nhv`). Model IDs are validated as safe file names and `--models-dir`
-  overrides the sibling directory. Packaged voices are extracted before use:
-  the engine does no archive handling.
+  `nhv`). Model IDs are validated as safe file names; `--models-dir` accepts
+  Studio's `<role>/<id>.dnni` layout as well as flat `<id>.dnni` files, and a
+  missing model lists every path searched. Packaged voices are extracted
+  before use: the engine does no archive handling.
 - The unset track language is English. Studio sings a project that names no
   voice and no language in English (real English songs saved with an all-empty
   `mainRef.database`), so `Language`'s default is English and the SVP parse
@@ -112,20 +113,6 @@ has been checked so far, not a claim of completeness.
 
 - **No note IDs.** Only needed for editing and incremental caches; add
   `NoteId(u64)` when an editor-side consumer needs it.
-
-- **`--models-dir` cannot read Studio's installed models directory.** Studio
-  keeps its model files in one subdirectory per role (`acoustic`, `duration`,
-  `f0`, `vocoder`), the same four names a Flat voice document uses for its
-  model references. The engine looks for `<directory>/<id>.dnni` only, in the
-  override, then the document's sibling `models` directory, then the
-  document's own directory, so pointing `--models-dir` at Studio's own
-  directory fails with "model file is missing" for a model that is installed
-  one level down. Resolve each model as `<directory>/<role>/<id>.dnni` first
-  and `<directory>/<id>.dnni` second, in every directory already searched, so
-  a flat directory, an extracted voice package and Studio's installed
-  directory all work without symlinks or copies. The same error names only
-  the first path tried; it should list every location searched. Tests build
-  both layouts from synthetic files, so no proprietary data is involved.
 
 - **Grapheme-to-phoneme parity, in every language.** Studio phonemizes
   whatever text sits on a note; the engine is dictionary-first, and its East
@@ -366,18 +353,14 @@ still have no IDs.
 
 The remaining gaps, in the order to take them, one branch each:
 
-1. **Models directory layout.** Resolve models under `<role>/` as well as flat
-   so `--models-dir` works on Studio's installed directory, and list every
-   searched path in the missing-model error. It is the smallest gap and
-   independent of the rest, so it goes first.
-2. **The per-language front ends, with the dictionary format that carries
+1. **The per-language front ends, with the dictionary format that carries
    them.** G2P parity is the largest gap, and everything downstream of it —
    continuation syllables, multi-mora Japanese, multi-character Mandarin —
    waits on it, so the format and the front ends land together.
-3. **Continuation rules.** A `+` or `-` that cannot advance is silence now
-   (done); the remaining half is that `-` stops re-singing its predecessor's
-   vowel, and the pending-syllable bookkeeping works in every language rather
-   than only English.
-4. **`evenSyllableDuration`.** Read the per-note attribute and redistribute
+2. **Continuation rules.** A `+` or `-` that cannot advance is silence (done),
+   and a `-` holds the previous note's last phoneme instead of re-singing its
+   vowel (done); the remaining half is pending-syllable bookkeeping in every
+   language rather than only English.
+3. **`evenSyllableDuration`.** Read the per-note attribute and redistribute
    syllable timing the way Studio does.
-5. **Note IDs.** Only when an editor-side consumer needs incremental caches.
+4. **Note IDs.** Only when an editor-side consumer needs incremental caches.
