@@ -130,7 +130,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use opensvr_core::{Extra, NoteGroup, PitchAttributes, TempoMap};
+    use opensvr_core::{Extra, GroupReference, NoteGroup, PitchAttributes, TempoMap};
 
     use super::*;
 
@@ -221,6 +221,35 @@ mod tests {
             "{error}"
         );
         assert_eq!(resolver.dictionary_loads(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn resolves_notes_from_a_placed_library_group() {
+        let directory = scratch("placed");
+        write_dictionary(&directory);
+        let mut project = project(track(Vec::new(), Some(directory.clone())));
+        project.library.push(NoteGroup {
+            id: "lib".into(),
+            name: "lib".into(),
+            notes: vec![note("か")],
+            ..NoteGroup::default()
+        });
+        project.tracks[0].groups.push(GroupReference {
+            group_id: "lib".into(),
+            ..GroupReference::default()
+        });
+
+        let mut resolver = PhonemeResolver::new();
+        let entries = resolver
+            .resolve_track(&project, &project.tracks[0])
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].result.as_ref().unwrap().phonemes,
+            ["k", "a"],
+            "the resolver must follow the renderer's placed notes"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
