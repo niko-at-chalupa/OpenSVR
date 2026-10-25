@@ -91,14 +91,11 @@ impl PhonemeResolver {
 
         let mut resolver = NoteResolver::new(language);
         let mut entries = Vec::with_capacity(placed.len());
-        for (index, placed_note) in placed.iter().enumerate() {
+        for placed_note in &placed {
             let note = placed_note.note;
-            let next_is_legato = placed
-                .get(index + 1)
-                .is_some_and(|next| next.note.lyrics == "-");
             entries.push(NotePhonemes {
                 note,
-                result: resolver.push(&note.lyrics, &note.phonemes, &dictionaries, next_is_legato),
+                result: resolver.push(&note.lyrics, &note.phonemes, &dictionaries),
             });
         }
         Ok(entries)
