@@ -1271,10 +1271,13 @@ mod tests {
             error.starts_with("NOFS: model file is missing: "),
             "{error}"
         );
+        // The candidates are formatted with the platform separator, so the
+        // expected paths must be joined rather than embedded as literals.
+        let models = parent.join("models");
         for path in [
-            parent.join("models/f0/f0-hash.dnni"),
-            parent.join("models/f0-hash.dnni"),
-            parent.join("f0/f0-hash.dnni"),
+            models.join("f0").join("f0-hash.dnni"),
+            models.join("f0-hash.dnni"),
+            parent.join("f0").join("f0-hash.dnni"),
             parent.join("f0-hash.dnni"),
         ] {
             assert!(
