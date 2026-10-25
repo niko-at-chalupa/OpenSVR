@@ -503,19 +503,31 @@ impl PhonemeDictionary {
         }
 
         let mut key = lyrics.to_owned();
+        // Romanized morae, used when a multi-mora lyric has no whole-key entry.
+        // `cl` is the geminate closure contributed by a small tsu; it is a
+        // phoneme, not a dictionary key.
+        let mut kana_moras: Option<Vec<String>> = None;
         if self.is_japanese {
+            let mut moras: Vec<String> = Vec::new();
             let mut romanized = String::new();
             let mut all_kana = true;
             for character in lyrics.chars() {
                 let kana = character.to_string();
                 if let Some(romaji) = self.kana_to_romaji.get(&kana) {
                     romanized.push_str(romaji);
+                    moras.push(romaji.clone());
                     continue;
                 }
                 let Some(small) = self.small_kana_to_romaji.get(&kana) else {
                     all_kana = false;
                     break;
                 };
+                // A small tsu is a geminate closure, not the mora "tsu".
+                if kana == "っ" || kana == "ッ" {
+                    romanized.push_str("cl");
+                    moras.push("cl".to_owned());
+                    continue;
+                }
                 // Small-kana digraph contraction: ki + ya -> kya,
                 // shi + ya -> sha, chi + ya -> cha.
                 if small.len() == 2
@@ -531,12 +543,21 @@ impl PhonemeDictionary {
                         romanized.push('y');
                     }
                     romanized.push(small.chars().last().expect("two chars"));
+                    if let Some(mora) = moras.last_mut() {
+                        mora.pop();
+                        if !digraph {
+                            mora.push('y');
+                        }
+                        mora.push(small.chars().last().expect("two chars"));
+                    }
                 } else {
                     romanized.push_str(small);
+                    moras.push(small.clone());
                 }
             }
             if all_kana {
                 key = romanized;
+                kana_moras = Some(moras);
             }
         }
 
@@ -548,6 +569,27 @@ impl PhonemeDictionary {
 
         if let Some(pronunciation) = self.entries.get(&key) {
             return Ok(pronunciation.clone());
+        }
+        // A multi-mora lyric such as `そん` is not a whole key; resolve it one
+        // mora at a time and concatenate. `cl` from a small tsu is already a
+        // phoneme.
+        if let Some(moras) = kana_moras.as_ref() {
+            let mut pronunciation = Vec::new();
+            let mut complete = true;
+            for mora in moras {
+                if mora == "cl" {
+                    pronunciation.push("cl".to_owned());
+                    continue;
+                }
+                let Some(found) = self.entries.get(mora) else {
+                    complete = false;
+                    break;
+                };
+                pronunciation.extend(found.iter().cloned());
+            }
+            if complete {
+                return Ok(pronunciation);
+            }
         }
         if self.is_mandarin {
             return Err(invalid(format!(
@@ -1171,6 +1213,44 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
         assert_eq!(dictionary.lookup("ちゅ").unwrap(), ["ch", "u"]);
         // Katakana shares the table.
         assert_eq!(dictionary.lookup("カ").unwrap(), ["k", "a"]);
+    }
+
+    #[test]
+    fn japanese_multi_mora_splits_into_moras() {
+        let dir = temp_dir_for_tests("dict-jp-mora");
+        write_test_file(
+            &dir.join("phones.txt"),
+            "a vowel\ni vowel\nu vowel\ne vowel\no vowel\n\
+             k consonant\ns consonant\nt stop\nn nasal\nr liquid\ncl stop\nsil silence\n",
+        );
+        write_test_file(
+            &dir.join("dict.txt"),
+            "so s o\nn n\nra r a\ni i\nni n i\nto t o\nke k e\nu u\no o\nta t a\nka k a\n",
+        );
+        write_test_file(
+            &dir.join("hira.txt"),
+            "そ so\nん n\nら ra\nい i\nに ni\nと to\nけ ke\nう u\nた ta\nか ka\n",
+        );
+        write_test_file(&dir.join("kata.txt"), "カ ka\n");
+        write_test_file(&dir.join("sute.txt"), "ぉ o\nっ tsu\n");
+        let dictionary = PhonemeDictionary::load_japanese(
+            &dir.join("phones.txt"),
+            &dir.join("dict.txt"),
+            &dir.join("hira.txt"),
+            &dir.join("kata.txt"),
+            &dir.join("sute.txt"),
+        )
+        .unwrap();
+        // A whole key still wins.
+        assert_eq!(dictionary.lookup("か").unwrap(), ["k", "a"]);
+        // A multi-mora lyric falls back to one lookup per mora.
+        assert_eq!(dictionary.lookup("そん").unwrap(), ["s", "o", "n"]);
+        assert_eq!(dictionary.lookup("らい").unwrap(), ["r", "a", "i"]);
+        assert_eq!(dictionary.lookup("に").unwrap(), ["n", "i"]);
+        assert_eq!(dictionary.lookup("と").unwrap(), ["t", "o"]);
+        assert_eq!(dictionary.lookup("うぉ").unwrap(), ["u", "o"]);
+        // A small tsu is a geminate closure, not the mora "tsu".
+        assert_eq!(dictionary.lookup("たっ").unwrap(), ["t", "a", "cl"]);
     }
 
     #[test]
