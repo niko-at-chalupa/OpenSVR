@@ -120,23 +120,25 @@ has been checked so far, not a claim of completeness.
   tables do not list is either invented as if it were English or aborts the
   render. What has been checked so far already spans more than one language:
 
-  - *English.* Studio's front end is not CMUDict: it writes `iy` for a final
-    `-y` (`happy` -> `hh ae p iy`, `evry` -> `eh v r iy`), a reduced `ax`
-    where CMUDict has `ah` (`and` -> `ax n d`, `hello` -> `hh ax l ow`) and
-    `ey` for `ay` (`day` -> `d ey`). Past CMUDict the engine uses 14 hardcoded
-    words, then 11 digraph patterns (`sh ch th ph ng qu ee ea oo ow ai`), then
-    a per-letter guess. A final `-y` is now the vowel `iy`, so `evry` resolves
-    to two syllables (`eh v r iy`) as Studio does; the rest of the guess still
-    differs from Studio's front end. The hardcoded words disagree with Studio
-    as well (`hello` is stored as `hh ah l ow`). For a word the tables do know
-    the damage is the symbol alone: `hello` splits `hh ah` + `l ow` where
-    Studio splits `hh ax` + `l ow`, so a following `+` still lands on the right
-    syllable. The wrong syllable count now makes a following `+` silent where
-    Studio carries the missing syllable. Punctuation is stripped before the
+  - *English.* Studio reads CMUDict and normalizes it: stress digits are
+    stripped, and an unstressed `ah0` becomes the reduced vowel `ax`
+    (`and` -> `ax n d`, `hello` -> `hh ax l ow`). The engine now does the
+    same, so `hello` splits `hh ax` + `l ow` like Studio and a following `+`
+    lands on the same syllable; the `iy` in `happy` and the `ey` in `day` were
+    always CMUDict's `iy0` / `ey1` with the digit gone. The reduction is
+    symbol-driven and needs the digit, so a pre-stripped table
+    (`english-arpabet-dict.txt`) keeps `ah` — its stress is unrecoverable —
+    and a stressed `ah1` / `ah2` stays `ah`; Studio has not been probed on a
+    stressed-`ah` word (`AH1`, as in "uh-huh") yet. Past CMUDict the engine
+    uses 14 hardcoded words, then 11 digraph patterns (`sh ch th ph ng qu ee ea
+    oo ow ai`), then a per-letter guess, and that guess layer is where the
+    remaining English difference lives: `evry` resolves to `eh v r iy` by luck
+    rather than by Studio's model, and the hardcoded words beyond the now
+    reduced `hello` are unverified. Punctuation is stripped before the
     English lookup, so a lyric `score?` or `ces?` resolves as its word, but a
-    lyric `=` strips to nothing and still misses. The engine now aliases `=` to
-    `+` as a documented guess (`885e33d`), so `FLOP ERA Base.svp` renders; the
-    phonemes for the `=` note have still not been read, and `=` may be a
+    lyric `=` strips to nothing and still misses. The engine now aliases `=`
+    to `+` as a documented guess (`885e33d`), so `FLOP ERA Base.svp` renders;
+    the phonemes for the `=` note have still not been read, and `=` may be a
     silence marker rather than a word.
   - *Japanese.* `lookup` now tries the whole romanization first and then, for
     an all-kana lyric, resolves one mora at a time (`そん` → `s o n`, `らい` →

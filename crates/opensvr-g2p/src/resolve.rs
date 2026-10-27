@@ -593,6 +593,12 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
             words(&["hh", "ah", "l", "ow"]),
             vec![vec!["hh", "ah"], vec!["l", "ow"]]
         );
+        // The reduced vowel is a nucleus like any other, so Studio's
+        // `hh ax l ow` splits exactly as the unreduced form did.
+        assert_eq!(
+            words(&["hh", "ax", "l", "ow"]),
+            vec![vec!["hh", "ax"], vec!["l", "ow"]]
+        );
         // Adjacent nuclei split between them.
         assert_eq!(words(&["ae", "ow"]), vec![vec!["ae"], vec!["ow"]]);
         // A cluster gives its last consonant onward.
@@ -779,6 +785,25 @@ sh consonant\nt consonant\nsil silence\nbr breath\n";
         let dictionaries = load_dictionaries(&dir, Language::English).unwrap();
         assert!(dictionaries.local.has_entry("cmuonly"));
         assert!(!dictionaries.local.has_entry("fallbackonly"));
+    }
+
+    #[test]
+    fn real_english_dictionary_matches_studio_readings() {
+        // Gated on the user's own `clf-data`, per the repo convention: no
+        // dictionary data is committed, and the test skips cleanly without it.
+        let Some(dir) = std::env::var_os("OPENSVR_DICT") else {
+            return;
+        };
+        let dictionaries = load_dictionaries(Path::new(&dir), Language::English).unwrap();
+        let cases: [(&str, &[&str]); 4] = [
+            ("hello", &["hh", "ax", "l", "ow"]),
+            ("and", &["ax", "n", "d"]),
+            ("day", &["d", "ey"]),
+            ("happy", &["hh", "ae", "p", "iy"]),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(dictionaries.local.lookup(word).unwrap(), expected, "{word}");
+        }
     }
 
     #[test]
