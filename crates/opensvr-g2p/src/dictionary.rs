@@ -73,10 +73,15 @@ const ENGLISH_LETTER_NAMES: [&str; 26] = [
 ];
 
 /// Hardcoded pronunciations for common English words missing from the files.
+///
+/// These are the last-guess layer behind the dictionary, not the CMUDict path.
+/// `hello` carries Studio's observed reduced vowel (`hh ax l ow`); the rest are
+/// unobserved and left as they were, and are mostly unreachable while a real
+/// CMUDict is present.
 const ENGLISH_FALLBACKS: [(&str, &[&str]); 14] = [
     ("a", &["ae"]),
     ("i", &["ay"]),
-    ("hello", &["hh", "ah", "l", "ow"]),
+    ("hello", &["hh", "ax", "l", "ow"]),
     ("chat", &["ch", "ae", "t"]),
     ("hate", &["hh", "ey", "t"]),
     ("now", &["n", "aw"]),
@@ -106,10 +111,25 @@ const ENGLISH_PATTERNS: [(&str, &str); 11] = [
 ];
 
 /// Historical CMU phone variants mapped to standard SV ARPABET symbols.
+///
+/// Studio reduces CMUDict's unstressed `ah0` to the reduced vowel `ax`
+/// (`hello` -> `hh ax l ow`, `and` -> `ax n d`). That needs the stress digit,
+/// so it is applied before the digit is dropped. The reduction is
+/// symbol-driven: `ax` is the only reduced symbol in the inventory, and
+/// `er0` / `iy0` stay as they are. A phone written without a digit is left
+/// alone — a pre-stripped table has lost the stress, and reducing every `ah`
+/// would turn a stressed `ah` into a schwa.
 fn normalize_english_phone(symbol: &mut String) {
-    if let Some(last @ ('0'..='2')) = symbol.chars().last() {
-        let _ = last;
-        symbol.pop();
+    let stress = match symbol.chars().last() {
+        Some(last @ ('0'..='2')) => {
+            symbol.pop();
+            Some(last)
+        }
+        _ => None,
+    };
+    if stress == Some('0') && symbol.as_str() == "ah" {
+        symbol.replace_range(.., "ax");
+        return;
     }
     let alias = match symbol.as_str() {
         "ax" | "ax-h" => Some("ah"),
@@ -1022,6 +1042,30 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
     }
 
     #[test]
+    fn cmu_unstressed_ah_reduces_to_ax() {
+        // Studio sings `hello` as `hh ax l ow` and `and` as `ax n d`, and the
+        // only difference from CMUDict is the reduced vowel. The reduction is
+        // symbol-driven, so a digit on another vowel changes nothing.
+        let dictionary = cmu("HELLO hh ah0 l ow1\nAND ah0 n d\nHAPPY hh ae1 p iy0\n");
+        assert_eq!(dictionary.lookup("hello").unwrap(), ["hh", "ax", "l", "ow"]);
+        assert_eq!(dictionary.lookup("and").unwrap(), ["ax", "n", "d"]);
+        assert_eq!(dictionary.lookup("happy").unwrap(), ["hh", "ae", "p", "iy"]);
+    }
+
+    #[test]
+    fn cmu_stressed_and_digitless_ah_stay_ah() {
+        // `ah` reduces only at stress 0. A stressed `ah` survives, and a phone
+        // with no digit has already lost its stress in a pre-stripped table,
+        // so it is left alone rather than reduced wholesale.
+        let dictionary = cmu("UH ah1\nUH2 ah2\nPLAIN ah\nOLD ax\n");
+        assert_eq!(dictionary.lookup("uh").unwrap(), ["ah"]);
+        assert_eq!(dictionary.lookup("uh2").unwrap(), ["ah"]);
+        assert_eq!(dictionary.lookup("plain").unwrap(), ["ah"]);
+        // The dialect alias still maps a written schwa symbol back to `ah`.
+        assert_eq!(dictionary.lookup("old").unwrap(), ["ah"]);
+    }
+
+    #[test]
     fn cmu_variant_duplicate_is_kept_silently() {
         let dictionary = cmu("HELLO hh ah l ow\nhello(2) hh eh l ow\n");
         assert_eq!(dictionary.lookup("hello").unwrap(), ["hh", "ah", "l", "ow"]);
@@ -1093,6 +1137,14 @@ ka k a\nki k i\nkya k y a\nshi sh i\nsha sh a\nchi ch i\nchu ch u\nebr-check sil
         ] {
             assert_eq!(dictionary.lookup(word).unwrap(), expected, "{word}");
         }
+    }
+
+    #[test]
+    fn hello_fallback_uses_studios_reduced_vowel() {
+        // The hardcoded layer shadows the dictionary, so it must agree with
+        // Studio's `hh ax l ow` once CMUDict misses.
+        let dictionary = english("world w er l d\n");
+        assert_eq!(dictionary.lookup("hello").unwrap(), ["hh", "ax", "l", "ow"]);
     }
 
     #[test]
